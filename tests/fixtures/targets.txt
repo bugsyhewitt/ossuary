@@ -1,0 +1,4 @@
+# ossuary test targets — three hosts in a lab subnet
+10.10.0.5
+10.10.0.6
+10.10.0.7
