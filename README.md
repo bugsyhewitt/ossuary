@@ -62,6 +62,39 @@ ossuary dump         export the full engagement state as JSON
 
 Run `ossuary <command> --help` for per-command flags.
 
+### Severity enrichment (EPSS + CISA KEV)
+
+NIST stopped enriching the large majority of new CVEs with analysed CVSS
+scores, so the raw `severity` from OSV/NVD is blank or stale for most fresh
+ids. To restore actionable signal, `match-cves` enriches every finding by
+default:
+
+- **EPSS** — FIRST's Exploit Prediction Scoring System probability (0–1):
+  "how likely is this CVE to be exploited in the next 30 days."
+- **KEV** — whether the CVE appears in CISA's
+  [Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)
+  catalog, i.e. confirmed exploited in the wild.
+
+```bash
+ossuary match-cves --db engagement-acme.db
+#   matched 5 finding(s) -> engagement-acme.db
+#     CVE-2021-23017  severity: 7.7  EPSS: 0.87 | KEV: YES
+#     CVE-2023-44487  severity: —    EPSS: 0.94 | KEV: YES
+#     ...
+```
+
+The output is sorted KEV-first, then by descending EPSS, so the CVEs that are
+actually being exploited float to the top regardless of CVSS.
+
+The CISA KEV catalog (~1 MB) is downloaded once and cached in the engagement DB
+with a 24-hour TTL, so repeated runs don't re-fetch it. EPSS is a per-CVE
+lookup. To skip enrichment entirely (no EPSS/KEV HTTP calls), use
+`--no-enrich`:
+
+```bash
+ossuary match-cves --db engagement-acme.db --no-enrich
+```
+
 ---
 
 ## Database schema
@@ -102,6 +135,8 @@ Four tables, one engagement file:
 │ service_id   FK->services│
 │ cve_id / summary         │
 │ severity / source        │
+│ epss_score   (FIRST EPSS)│  exploit-probability float [0,1], nullable
+│ kev          (0/1)       │  1 if in CISA Known Exploited Vulns catalog
 │ matched_at               │
 └──────────────────────────┘
 
@@ -112,9 +147,21 @@ Four tables, one engagement file:
 │ ran_at                   │
 │ snapshot     (JSON state)│  used to diff successive cruises
 └──────────────────────────┘
+
+┌──────────────────────────┐
+│ kev_cache                │  cached CISA KEV catalog ids (24h TTL)
+│──────────────────────────│
+│ id           PK          │
+│ ids          (JSON array)│  the KEV CVE-id set, fetched once per day
+│ fetched_at               │  used to expire the cache
+└──────────────────────────┘
 ```
 
 Foreign keys cascade: deleting an asset removes its services and their findings.
+
+The `epss_score` and `kev` columns are added automatically (via an idempotent
+migration at startup) to engagement DBs created before enrichment landed, so
+older `.db` files keep working without a manual re-init.
 
 ---
 

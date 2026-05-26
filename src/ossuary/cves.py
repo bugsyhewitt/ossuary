@@ -15,7 +15,7 @@ from pathlib import Path
 
 import httpx
 
-from . import db
+from . import db, enrich
 
 OSV_QUERY_URL = "https://api.osv.dev/v1/query"
 
@@ -63,11 +63,17 @@ def parse_osv_response(response: dict) -> list[dict]:
     return findings
 
 
-def match_cves(db_path: str | Path) -> int:
+def match_cves(db_path: str | Path, enrich_findings: bool = True) -> int:
     """Match all fingerprinted services against OSV.dev, populating `findings`.
 
     Only services with both a product and a version are queried. Returns the
     number of finding rows written/updated.
+
+    When `enrich_findings` is True (the default), each matched CVE is annotated
+    with its EPSS exploit-probability score (FIRST) and CISA KEV status. The KEV
+    catalog is fetched once per run and cached in the DB; EPSS is a per-CVE
+    lookup. When False, no enrichment HTTP calls are made and findings keep the
+    default epss_score=None / kev=0.
     """
     conn = db.require_initialised(db_path)
     try:
@@ -75,16 +81,35 @@ def match_cves(db_path: str | Path) -> int:
             "SELECT id, product, version FROM services "
             "WHERE product IS NOT NULL AND version IS NOT NULL"
         ).fetchall()
+
+        # Resolve the KEV id set once for the whole run (cached, TTL'd). Only
+        # touched when we actually have findings to enrich.
+        kev_ids: set[str] = set()
+        kev_loaded = False
+
         total = 0
         for svc in services:
             response = query_osv(svc["product"], svc["version"])
             for finding in parse_osv_response(response):
+                epss_score: float | None = None
+                kev = 0
+                if enrich_findings:
+                    if not kev_loaded:
+                        kev_ids = enrich.get_kev_ids(conn)
+                        kev_loaded = True
+                    annotation = enrich.enrich_finding(
+                        conn, finding["cve_id"], kev_ids
+                    )
+                    epss_score = annotation["epss_score"]
+                    kev = annotation["kev"]
                 db.upsert_finding(
                     conn,
                     service_id=int(svc["id"]),
                     cve_id=finding["cve_id"],
                     summary=finding["summary"],
                     severity=finding["severity"],
+                    epss_score=epss_score,
+                    kev=kev,
                 )
                 total += 1
         conn.commit()

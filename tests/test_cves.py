@@ -60,7 +60,9 @@ def test_match_cves_populates_findings(db_path, monkeypatch):
 
     monkeypatch.setattr(cves, "query_osv", fake_query)
 
-    count = cves.match_cves(db_path)
+    # This test exercises OSV matching only; enrichment is covered in
+    # test_enrich.py, so disable it here to keep the test offline.
+    count = cves.match_cves(db_path, enrich_findings=False)
     assert count == 1
 
     conn = sqlite3.connect(str(db_path))

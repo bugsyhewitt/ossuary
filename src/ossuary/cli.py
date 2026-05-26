@@ -57,6 +57,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_match = sub.add_parser("match-cves", help="query OSV.dev for service versions")
     _add_db_arg(p_match)
+    p_match.add_argument(
+        "--enrich",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "annotate findings with EPSS exploit-probability (FIRST) and CISA "
+            "KEV status (default: enabled; use --no-enrich to skip the lookups)"
+        ),
+    )
 
     p_cruise = sub.add_parser(
         "cruise", help="re-fingerprint and diff against last saved state"
@@ -95,9 +104,37 @@ def _cmd_fingerprint(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_finding(row: dict) -> str:
+    """Render one finding row as a single severity-context line.
+
+    Shows the OSV/NVD severity (often blank for fresh CVEs since NIST's
+    enrichment retreat) alongside the restored signal: EPSS exploit probability
+    and CISA KEV status.
+    """
+    severity = row["severity"] or "—"
+    epss = row["epss_score"]
+    epss_str = f"{epss:.2f}" if epss is not None else "—"
+    kev_str = "YES" if row["kev"] else "no"
+    return (
+        f"  {row['cve_id']}  severity: {severity}  "
+        f"EPSS: {epss_str} | KEV: {kev_str}"
+    )
+
+
 def _cmd_match_cves(args: argparse.Namespace) -> int:
-    count = cves.match_cves(args.db)
+    count = cves.match_cves(args.db, enrich_findings=args.enrich)
     print(f"matched {count} finding(s) -> {args.db}")
+    if count:
+        conn = db.require_initialised(args.db)
+        try:
+            rows = conn.execute(
+                "SELECT cve_id, severity, epss_score, kev FROM findings "
+                "ORDER BY kev DESC, epss_score DESC NULLS LAST, cve_id"
+            ).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            print(_format_finding(row))
     return 0
 
 

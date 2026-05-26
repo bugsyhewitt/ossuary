@@ -28,8 +28,8 @@ def build_state(conn: sqlite3.Connection) -> dict:
         ).fetchall()
         for svc in services:
             findings = conn.execute(
-                "SELECT cve_id, summary, severity, source, matched_at "
-                "FROM findings WHERE service_id = ? ORDER BY cve_id",
+                "SELECT cve_id, summary, severity, source, epss_score, kev, "
+                "matched_at FROM findings WHERE service_id = ? ORDER BY cve_id",
                 (svc["id"],),
             ).fetchall()
             services_out.append(

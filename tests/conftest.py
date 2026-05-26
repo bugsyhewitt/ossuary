@@ -1,9 +1,11 @@
 """Shared pytest fixtures and nmap / OSV.dev mock builders.
 
 No test in this suite touches the network. The nmap shell-out (in
-discover.scan_hosts / fingerprint.scan_services) and the OSV.dev HTTP call (in
-cves.query_osv) are monkeypatched to return canned, python-nmap-shaped and
-OSV-shaped structures.
+discover.scan_hosts / fingerprint.scan_services), the OSV.dev HTTP call (in
+cves.query_osv), and the enrichment HTTP calls (enrich.query_epss for FIRST
+EPSS and enrich.fetch_kev_catalog for the CISA KEV catalog) are all
+monkeypatched to return canned, python-nmap-shaped, OSV-shaped, and
+EPSS/KEV-shaped structures.
 
 The nmap-shaped builders (`host_discovery_result`, `service_scan_result`) are
 re-exported from the shared `nmap-wrapper` library so the whole necromancer

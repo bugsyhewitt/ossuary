@@ -3,12 +3,13 @@
 One engagement == one SQLite file. Self-contained, portable, single-file.
 No MongoDB, no Postgres — stdlib sqlite3 only (v0.1 constraint).
 
-Schema (four tables):
+Schema (four core tables + one enrichment cache):
 
     assets        — discovered hosts (one row per host)
     services      — fingerprinted services (one row per host:port)
     findings      — CVE matches against discovered service versions
     cruise_runs   — snapshots of service state per cruise invocation, for diffing
+    kev_cache     — cached CISA KEV catalog ids (TTL'd, for severity enrichment)
 """
 
 from __future__ import annotations
@@ -48,6 +49,8 @@ CREATE TABLE IF NOT EXISTS findings (
     summary     TEXT,
     severity    TEXT,
     source      TEXT    NOT NULL DEFAULT 'osv.dev',
+    epss_score  REAL,
+    kev         INTEGER NOT NULL DEFAULT 0,
     matched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(service_id, cve_id)
 );
@@ -57,7 +60,43 @@ CREATE TABLE IF NOT EXISTS cruise_runs (
     ran_at      TEXT    NOT NULL DEFAULT (datetime('now')),
     snapshot    TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS kev_cache (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ids         TEXT    NOT NULL,
+    fetched_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
 """
+
+# Columns added to `findings` after v0.1 for severity-context enrichment. Each
+# is (name, full ALTER ... ADD COLUMN clause). Applied idempotently at init_db
+# time so engagement DBs created before enrichment landed gain them on next run
+# without losing their existing rows.
+_FINDINGS_MIGRATIONS = (
+    ("epss_score", "ALTER TABLE findings ADD COLUMN epss_score REAL"),
+    ("kev", "ALTER TABLE findings ADD COLUMN kev INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Return the set of column names on a table."""
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply additive schema migrations idempotently.
+
+    CREATE TABLE IF NOT EXISTS only creates missing tables — it does not add
+    columns to a table that already exists with an older shape. So for DBs that
+    predate the enrichment columns we ALTER them in, guarded by a column check.
+    """
+    if "findings" not in table_names(conn):
+        return
+    existing = _column_names(conn, "findings")
+    for name, ddl in _FINDINGS_MIGRATIONS:
+        if name not in existing:
+            conn.execute(ddl)
+    conn.commit()
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -80,6 +119,7 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
     conn = connect(path)
     conn.executescript(_SCHEMA)
     conn.commit()
+    _migrate(conn)
     return conn
 
 
@@ -168,18 +208,28 @@ def upsert_finding(
     summary: str | None,
     severity: str | None,
     source: str = "osv.dev",
+    epss_score: float | None = None,
+    kev: int = 0,
 ) -> int:
-    """Insert or update a finding by (service_id, cve_id)."""
+    """Insert or update a finding by (service_id, cve_id).
+
+    `epss_score` (FIRST exploit-probability float) and `kev` (1 if the CVE is in
+    CISA's Known Exploited Vulnerabilities catalog) are enrichment fields; they
+    default to None/0 so callers that don't enrich behave exactly as before.
+    """
     conn.execute(
         """
-        INSERT INTO findings (service_id, cve_id, summary, severity, source)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO findings (service_id, cve_id, summary, severity, source,
+                              epss_score, kev)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(service_id, cve_id) DO UPDATE SET
-            summary  = excluded.summary,
-            severity = excluded.severity,
-            source   = excluded.source
+            summary    = excluded.summary,
+            severity   = excluded.severity,
+            source     = excluded.source,
+            epss_score = excluded.epss_score,
+            kev        = excluded.kev
         """,
-        (service_id, cve_id, summary, severity, source),
+        (service_id, cve_id, summary, severity, source, epss_score, kev),
     )
     row = conn.execute(
         "SELECT id FROM findings WHERE service_id = ? AND cve_id = ?",
