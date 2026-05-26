@@ -1,17 +1,19 @@
 """Host discovery for ossuary.
 
-Reads CIDR ranges / IP lists from a targets file, shells out to nmap for host
-discovery, and persists the live hosts into the `assets` table.
+Reads CIDR ranges / IP lists from a targets file, shells out to nmap (via the
+shared ``nmap-wrapper`` library) for host discovery, and persists the live
+hosts into the `assets` table.
 
 The seam we mock in tests is `scan_hosts` — it is the only function that
-touches the network. Everything below it is pure logic over its return value.
+touches the network. It delegates the actual shell-out to ``nmap-wrapper``;
+everything below it is pure logic over its return value.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import nmap
+from nmap_wrapper import parse_scan_result, raw_scan
 
 from . import db
 
@@ -35,33 +37,25 @@ def scan_hosts(targets: list[str]) -> dict:
     """Run an nmap host-discovery (ping) scan over the targets.
 
     Returns the raw python-nmap scan result dict. This is the network seam —
-    tests monkeypatch this function so no live scan is performed.
+    tests monkeypatch this function so no live scan is performed. The actual
+    shell-out is delegated to the shared ``nmap-wrapper`` library.
     """
-    scanner = nmap.PortScanner()
     # -sn: ping scan, no port scan. Discovery only; fingerprinting is separate.
-    scanner.scan(hosts=" ".join(targets), arguments="-sn")
-    return scanner._scan_result
+    return raw_scan(" ".join(targets), arguments="-sn")
 
 
 def parse_hosts(scan_result: dict) -> list[dict]:
     """Extract up hosts from a python-nmap scan result dict.
 
     Returns a list of {"ip", "hostname", "state"} dicts for hosts that nmap
-    reported as `up`.
+    reported as `up`. Parsing is delegated to ``nmap-wrapper`` and the typed
+    hosts are mapped to ossuary's persistence shape.
     """
-    hosts: list[dict] = []
-    scan = scan_result.get("scan", {})
-    for ip, host_data in scan.items():
-        status = host_data.get("status", {})
-        state = status.get("state", "unknown")
-        if state != "up":
-            continue
-        hostnames = host_data.get("hostnames", []) or []
-        hostname = None
-        if hostnames:
-            hostname = hostnames[0].get("name") or None
-        hosts.append({"ip": ip, "hostname": hostname, "state": state})
-    return hosts
+    result = parse_scan_result(scan_result)
+    return [
+        {"ip": h.ip, "hostname": h.hostname, "state": h.state}
+        for h in result.up_hosts()
+    ]
 
 
 def discover(db_path: str | Path, targets_path: str | Path) -> int:

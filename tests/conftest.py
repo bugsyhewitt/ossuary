@@ -1,9 +1,14 @@
-"""Shared pytest fixtures and python-nmap / OSV.dev mock builders.
+"""Shared pytest fixtures and nmap / OSV.dev mock builders.
 
 No test in this suite touches the network. The nmap shell-out (in
 discover.scan_hosts / fingerprint.scan_services) and the OSV.dev HTTP call (in
-cves.query_osv) are monkeypatched to return these canned, python-nmap-shaped
-and OSV-shaped structures.
+cves.query_osv) are monkeypatched to return canned, python-nmap-shaped and
+OSV-shaped structures.
+
+The nmap-shaped builders (`host_discovery_result`, `service_scan_result`) are
+re-exported from the shared `nmap-wrapper` library so the whole necromancer
+suite mocks against one canonical python-nmap dict shape rather than per-repo
+copies.
 """
 
 from __future__ import annotations
@@ -11,6 +16,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
+# Re-exported from the shared library so every consumer mocks the same shapes.
+from nmap_wrapper.testing import (  # noqa: F401  (re-exported for tests)
+    host_discovery_result,
+    service_scan_result,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 TARGETS_FILE = FIXTURES / "targets.txt"
@@ -20,49 +31,6 @@ TARGETS_FILE = FIXTURES / "targets.txt"
 def db_path(tmp_path) -> Path:
     """A path for a fresh engagement DB inside an isolated tmp dir."""
     return tmp_path / "engagement-test.db"
-
-
-# --------------------------------------------------------------------------
-# python-nmap-shaped builders
-# --------------------------------------------------------------------------
-
-def host_discovery_result(up_ips: list[str], down_ips: list[str] | None = None) -> dict:
-    """Build a python-nmap `_scan_result` for an `-sn` host-discovery scan."""
-    down_ips = down_ips or []
-    scan: dict = {}
-    for ip in up_ips:
-        scan[ip] = {
-            "hostnames": [{"name": f"host-{ip.replace('.', '-')}", "type": "PTR"}],
-            "addresses": {"ipv4": ip},
-            "status": {"state": "up", "reason": "echo-reply"},
-        }
-    for ip in down_ips:
-        scan[ip] = {
-            "hostnames": [],
-            "addresses": {"ipv4": ip},
-            "status": {"state": "down", "reason": "no-response"},
-        }
-    return {"nmap": {"command_line": "nmap -sn ...", "scaninfo": {}}, "scan": scan}
-
-
-def service_scan_result(ip: str, services: list[dict]) -> dict:
-    """Build a python-nmap `_scan_result` for an `-sV` service scan of one host.
-
-    `services` is a list of {port, name, product, version, [state]} dicts.
-    """
-    tcp: dict = {}
-    for svc in services:
-        tcp[svc["port"]] = {
-            "state": svc.get("state", "open"),
-            "name": svc.get("name", ""),
-            "product": svc.get("product", ""),
-            "version": svc.get("version", ""),
-            "cpe": svc.get("cpe", ""),
-        }
-    return {
-        "nmap": {"command_line": "nmap -sV ...", "scaninfo": {}},
-        "scan": {ip: {"tcp": tcp, "status": {"state": "up"}}},
-    }
 
 
 # --------------------------------------------------------------------------

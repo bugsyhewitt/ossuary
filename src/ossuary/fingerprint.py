@@ -1,8 +1,8 @@
 """Service fingerprinting for ossuary.
 
-For each known asset, shells out to nmap service/version detection (-sV) and
-persists the discovered services (name + product + version + cpe) into the
-`services` table.
+For each known asset, shells out to nmap service/version detection (-sV) via the
+shared ``nmap-wrapper`` library and persists the discovered services (name +
+product + version + cpe) into the `services` table.
 
 `scan_services` is the network seam mocked in tests.
 """
@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import nmap
+from nmap_wrapper import parse_services as _wrapper_parse_services
+from nmap_wrapper import raw_scan
 
 from . import db
 
@@ -20,38 +21,33 @@ def scan_services(ip: str) -> dict:
     """Run an nmap service/version-detection scan against a single host.
 
     Returns the raw python-nmap scan result dict. Network seam — mocked in
-    tests so no live scan runs.
+    tests so no live scan runs. The shell-out is delegated to the shared
+    ``nmap-wrapper`` library.
     """
-    scanner = nmap.PortScanner()
     # -sV: probe open ports to determine service/version info.
-    scanner.scan(hosts=ip, arguments="-sV")
-    return scanner._scan_result
+    return raw_scan(ip, arguments="-sV")
 
 
 def parse_services(ip: str, scan_result: dict) -> list[dict]:
     """Extract open services for one host from a python-nmap scan result.
 
     Returns a list of service dicts with keys: port, protocol, name, product,
-    version, cpe. Only ports in `open` state are returned.
+    version, cpe. Only ports in `open` state are returned. Parsing is delegated
+    to ``nmap-wrapper``; its typed services are filtered to open ports and
+    mapped to ossuary's persistence shape.
     """
-    services: list[dict] = []
-    host_data = scan_result.get("scan", {}).get(ip, {})
-    for protocol in ("tcp", "udp"):
-        ports = host_data.get(protocol, {})
-        for port, port_data in ports.items():
-            if port_data.get("state") != "open":
-                continue
-            services.append(
-                {
-                    "port": int(port),
-                    "protocol": protocol,
-                    "name": port_data.get("name") or None,
-                    "product": port_data.get("product") or None,
-                    "version": port_data.get("version") or None,
-                    "cpe": port_data.get("cpe") or None,
-                }
-            )
-    return services
+    return [
+        {
+            "port": svc.port,
+            "protocol": svc.protocol,
+            "name": svc.name,
+            "product": svc.product,
+            "version": svc.version,
+            "cpe": svc.cpe,
+        }
+        for svc in _wrapper_parse_services(ip, scan_result)
+        if svc.is_open
+    ]
 
 
 def fingerprint(db_path: str | Path) -> int:
