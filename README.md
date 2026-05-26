@@ -28,8 +28,10 @@ Requires **Python 3.13+**.
 
 ### System dependency: nmap
 
-ossuary shells out to the system `nmap` binary (via `python-nmap`) for host
-discovery and service fingerprinting. You must have nmap installed:
+ossuary shells out to the system `nmap` binary for host discovery and service
+fingerprinting, via the shared
+[`nmap-wrapper`](https://github.com/bugsyhewitt/nmap-wrapper) library (installed
+automatically as a dependency). You must have nmap installed:
 
 ```bash
 # Debian / Ubuntu
