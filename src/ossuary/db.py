@@ -66,6 +66,20 @@ CREATE TABLE IF NOT EXISTS kev_cache (
     ids         TEXT    NOT NULL,
     fetched_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS web_probes (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id          INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    port              INTEGER NOT NULL,
+    protocol          TEXT    NOT NULL DEFAULT 'https',
+    status_code       INTEGER,
+    server            TEXT,
+    title             TEXT,
+    redirect_chain    TEXT,
+    tech_fingerprints TEXT,
+    probed_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(asset_id, port, protocol)
+);
 """
 
 # Columns added to `findings` after v0.1 for severity-context enrichment. Each

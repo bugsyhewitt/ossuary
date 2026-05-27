@@ -17,7 +17,7 @@ import json
 import sys
 
 from . import __version__, cruise as cruise_mod, cves, db, discover as discover_mod
-from . import dump as dump_mod, fingerprint as fingerprint_mod
+from . import dump as dump_mod, fingerprint as fingerprint_mod, probe as probe_mod
 
 
 def _add_db_arg(parser: argparse.ArgumentParser) -> None:
@@ -102,6 +102,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="output format (v0.1: json only)",
     )
 
+    p_probe = sub.add_parser(
+        "probe", help="HTTP/web layer discovery — probe web ports on known assets"
+    )
+    _add_db_arg(p_probe)
+    p_probe.add_argument(
+        "--host",
+        default=None,
+        metavar="HOST",
+        help="limit probing to a single host (IP or hostname)",
+    )
+    p_probe.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="per-request HTTP timeout in seconds (default: 10)",
+    )
+    p_probe.add_argument(
+        "--ports",
+        default="80,443,8080,8443",
+        metavar="PORTS",
+        help="comma-separated list of ports to probe (default: 80,443,8080,8443)",
+    )
+
     return parser
 
 
@@ -181,6 +205,22 @@ def _cmd_dump(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_probe(args: argparse.Namespace) -> int:
+    try:
+        ports = {int(p.strip()) for p in args.ports.split(",") if p.strip()}
+    except ValueError as exc:
+        print(f"error: invalid --ports value: {exc}", file=sys.stderr)
+        return 1
+    count = probe_mod.probe(
+        args.db,
+        host_filter=args.host,
+        timeout=args.timeout,
+        ports=ports,
+    )
+    print(f"probed {count} web endpoint(s) -> {args.db}")
+    return 0
+
+
 _DISPATCH = {
     "init": _cmd_init,
     "discover": _cmd_discover,
@@ -188,6 +228,7 @@ _DISPATCH = {
     "match-cves": _cmd_match_cves,
     "cruise": _cmd_cruise,
     "dump": _cmd_dump,
+    "probe": _cmd_probe,
 }
 
 
