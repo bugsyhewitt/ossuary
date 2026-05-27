@@ -48,3 +48,30 @@ def osv_response(vulns: list[dict] | None = None) -> dict:
     if not vulns:
         return {}
     return {"vulns": vulns}
+
+
+# --------------------------------------------------------------------------
+# NVD CVE API v2-shaped builder
+# --------------------------------------------------------------------------
+
+def nvd_response(cves: list[dict] | None = None) -> dict:
+    """Build an NVD CVE API v2 response.
+
+    `cves` is a list of {id, summary, base_score} partials. Each is wrapped in
+    the v2 schema's `vulnerabilities[].cve` envelope with an English description
+    and (when base_score is given) a CVSS v3.1 metric. Empty/None yields the
+    NVD "no results" shape ({"vulnerabilities": []}).
+    """
+    vulnerabilities = []
+    for entry in cves or []:
+        cve: dict = {"id": entry["id"]}
+        if entry.get("summary") is not None:
+            cve["descriptions"] = [{"lang": "en", "value": entry["summary"]}]
+        if entry.get("base_score") is not None:
+            cve["metrics"] = {
+                "cvssMetricV31": [
+                    {"cvssData": {"baseScore": entry["base_score"]}}
+                ]
+            }
+        vulnerabilities.append({"cve": cve})
+    return {"vulnerabilities": vulnerabilities}

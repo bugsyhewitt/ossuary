@@ -44,8 +44,8 @@ brew install nmap
 sudo pacman -S nmap
 ```
 
-Verify with `nmap --version`. (The test suite mocks all nmap and OSV.dev calls,
-so tests run without nmap installed and without network access.)
+Verify with `nmap --version`. (The test suite mocks all nmap, OSV.dev, and NVD
+calls, so tests run without nmap installed and without network access.)
 
 ---
 
@@ -94,6 +94,45 @@ lookup. To skip enrichment entirely (no EPSS/KEV HTTP calls), use
 ```bash
 ossuary match-cves --db engagement-acme.db --no-enrich
 ```
+
+### CPE-aware matching and multi-source lookup (OSV + NVD)
+
+`fingerprint` stores nmap's CPE 2.3 URI for each service in the `services.cpe`
+column (e.g. `cpe:2.3:a:apache:http_server:2.4.49:*:...`). When a CPE is
+present, `match-cves` extracts the **product** field (index 4 of the CPE) and
+queries OSV with that precise, vendor-normalised identifier rather than the
+free-text nmap service name — so `Apache httpd` becomes `http_server`. When no
+CPE is present it falls back to the nmap product name, exactly as before.
+
+By default only OSV.dev is queried. Use `--source` to add NVD's
+[CVE API v2](https://services.nvd.nist.gov/rest/json/cves/2.0) as a second
+source:
+
+```bash
+# OSV only (default)
+ossuary match-cves --db engagement-acme.db
+
+# NVD only — queried by cpeName when a CPE exists, else keywordSearch
+ossuary match-cves --db engagement-acme.db --source nvd
+
+# Both — results deduplicated by CVE id (OSV wins ties, NVD fills gaps)
+ossuary match-cves --db engagement-acme.db --source both
+```
+
+NVD throttles unauthenticated clients to 5 requests / 30 s; `match-cves` spaces
+NVD calls ~0.6 s apart to stay under that ceiling. Supply a free
+[NVD API key](https://nvd.nist.gov/developers/request-an-api-key) with
+`--nvd-api-key` to raise the ceiling to 50 / 30 s (the call spacing tightens
+accordingly):
+
+```bash
+ossuary match-cves --db engagement-acme.db --source both --nvd-api-key "$NVD_API_KEY"
+```
+
+Each finding's `source` column records where it came from (`osv.dev`, `nvd`, or
+`osv.dev+nvd`). Why both? Given NVD's enrichment retreat the OSV+CPE path is
+more reliable for non-federal CVEs, while NVD still enriches the CISA-KEV /
+critical-software tier promptly — cross-referencing covers both.
 
 ---
 
@@ -227,8 +266,8 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The test suite is fully offline: every nmap shell-out and every OSV.dev HTTP
-call is mocked, so `pytest` needs neither nmap nor network access.
+The test suite is fully offline: every nmap shell-out and every OSV.dev / NVD
+HTTP call is mocked, so `pytest` needs neither nmap nor network access.
 
 ---
 

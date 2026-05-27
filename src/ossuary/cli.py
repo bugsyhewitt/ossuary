@@ -55,8 +55,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_fp = sub.add_parser("fingerprint", help="service/version detect known assets")
     _add_db_arg(p_fp)
 
-    p_match = sub.add_parser("match-cves", help="query OSV.dev for service versions")
+    p_match = sub.add_parser(
+        "match-cves", help="query OSV.dev (and optionally NVD) for service versions"
+    )
     _add_db_arg(p_match)
+    p_match.add_argument(
+        "--source",
+        default="osv",
+        choices=["osv", "nvd", "both"],
+        help=(
+            "vulnerability database(s) to query: osv (default), nvd, or both. "
+            "CPE-derived product names are used when a service has a CPE; NVD is "
+            "queried by cpeName/keywordSearch and results are deduplicated by CVE"
+        ),
+    )
+    p_match.add_argument(
+        "--nvd-api-key",
+        default=None,
+        metavar="KEY",
+        help=(
+            "NVD API key (raises the rate ceiling from 5 to 50 req/30s); only "
+            "used when --source is nvd or both"
+        ),
+    )
     p_match.add_argument(
         "--enrich",
         action=argparse.BooleanOptionalAction,
@@ -122,7 +143,12 @@ def _format_finding(row: dict) -> str:
 
 
 def _cmd_match_cves(args: argparse.Namespace) -> int:
-    count = cves.match_cves(args.db, enrich_findings=args.enrich)
+    count = cves.match_cves(
+        args.db,
+        enrich_findings=args.enrich,
+        source=args.source,
+        nvd_api_key=args.nvd_api_key,
+    )
     print(f"matched {count} finding(s) -> {args.db}")
     if count:
         conn = db.require_initialised(args.db)

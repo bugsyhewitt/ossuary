@@ -159,6 +159,39 @@ def test_match_cves_no_enrich_makes_no_enrichment_calls(tmp_path, monkeypatch, c
     assert "KEV: no" in out
 
 
+def test_match_cves_source_both_queries_nvd(tmp_path, monkeypatch, capsys):
+    db_file = _seed_match_pipeline(tmp_path, monkeypatch)
+    monkeypatch.setattr(cves.time, "sleep", lambda _s: None)
+
+    nvd_calls: list[str | None] = []
+
+    def fake_query_nvd(cpe, product, api_key=None):
+        nvd_calls.append(api_key)
+        return {
+            "vulnerabilities": [
+                {
+                    "cve": {
+                        "id": "CVE-2019-9511",
+                        "descriptions": [{"lang": "en", "value": "HTTP/2 flood"}],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(cves, "query_nvd", fake_query_nvd)
+
+    capsys.readouterr()
+    rc = cli.main(
+        ["match-cves", "--db", db_file, "--no-enrich", "--source", "both"]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    # OSV's CVE and the NVD-only CVE both surface under --source both.
+    assert "CVE-2021-23017" in out
+    assert "CVE-2019-9511" in out
+    assert nvd_calls == [None]
+
+
 def test_cli_cruise_runs_and_exits_zero(tmp_path, monkeypatch, capsys):
     db_file = str(tmp_path / "engagement-test.db")
     monkeypatch.setattr(
