@@ -7,6 +7,7 @@ Subcommands (v0.1):
     fingerprint  service/version detect known assets -> services table
     match-cves   query OSV.dev for service versions -> findings table
     cruise       re-fingerprint, diff against last state, report changes
+    watch        run cruise on an interval, emitting a diff summary each pass
     dump         export full engagement state as JSON
 """
 
@@ -18,7 +19,7 @@ import sys
 
 from . import __version__, cruise as cruise_mod, cves, db, discover as discover_mod
 from . import dump as dump_mod, fingerprint as fingerprint_mod, probe as probe_mod
-from . import tags as tags_mod
+from . import tags as tags_mod, watch as watch_mod
 
 
 def _add_db_arg(parser: argparse.ArgumentParser) -> None:
@@ -103,6 +104,49 @@ def build_parser() -> argparse.ArgumentParser:
         "cruise", help="re-fingerprint and diff against last saved state"
     )
     _add_db_arg(p_cruise)
+
+    p_watch = sub.add_parser(
+        "watch",
+        help="run cruise on an interval, emitting a diff summary each pass",
+    )
+    _add_db_arg(p_watch)
+    p_watch.add_argument(
+        "--interval",
+        default="4h",
+        metavar="DURATION",
+        help=(
+            "time between cruise passes — an integer (seconds) or a value with "
+            "an s/m/h/d suffix (default: 4h; e.g. 30m, 90s, 1d)"
+        ),
+    )
+    p_watch.add_argument(
+        "--notify",
+        action="append",
+        default=[],
+        metavar="SINK",
+        help=(
+            "where to send each interval's diff summary; repeatable. "
+            "file:<path> appends to a file, slack:<webhook> POSTs to a Slack "
+            "incoming webhook. Webhook URLs are never written to the DB"
+        ),
+    )
+    p_watch.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        metavar="N",
+        help="stop after N cruise passes (default: run until SIGTERM/SIGINT)",
+    )
+    p_watch.add_argument(
+        "--once",
+        action="store_true",
+        help="run exactly one cruise pass then exit (shorthand for --iterations 1)",
+    )
+    p_watch.add_argument(
+        "--quiet-when-unchanged",
+        action="store_true",
+        help="only emit a summary on passes where something actually changed",
+    )
 
     p_dump = sub.add_parser("dump", help="export full engagement state")
     _add_db_arg(p_dump)
@@ -278,6 +322,36 @@ def _cmd_cruise(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_watch(args: argparse.Namespace) -> int:
+    # Fail fast on the engagement DB and on bad flags before entering the loop.
+    db.require_initialised(args.db).close()
+    interval_seconds = watch_mod.parse_interval(args.interval)
+    sinks = [watch_mod.parse_notify(spec) for spec in args.notify]
+
+    iterations = args.iterations
+    if args.once:
+        iterations = 1
+
+    config = watch_mod.WatchConfig(
+        db_path=args.db,
+        interval_seconds=interval_seconds,
+        sinks=sinks,
+        iterations=iterations,
+        quiet_when_unchanged=args.quiet_when_unchanged,
+    )
+
+    horizon = "once" if iterations == 1 else (
+        f"{iterations} pass(es)" if iterations is not None else "until interrupted"
+    )
+    print(
+        f"watching {args.db} — cruise every {interval_seconds}s, {horizon} "
+        f"({len(sinks)} notify sink(s))"
+    )
+    completed = watch_mod.watch(config)
+    print(f"watch stopped after {completed} cruise pass(es)")
+    return 0
+
+
 def _cmd_dump(args: argparse.Namespace) -> int:
     print(dump_mod.dump(args.db, args.format, tag=args.tag))
     return 0
@@ -331,6 +405,7 @@ _DISPATCH = {
     "fingerprint": _cmd_fingerprint,
     "match-cves": _cmd_match_cves,
     "cruise": _cmd_cruise,
+    "watch": _cmd_watch,
     "dump": _cmd_dump,
     "probe": _cmd_probe,
     "tag": _cmd_tag,

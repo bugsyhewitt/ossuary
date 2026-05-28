@@ -58,6 +58,7 @@ ossuary fingerprint  service/version detect known assets -> services table
 ossuary probe        HTTP/web-layer probe of web ports -> web_probes table
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
+ossuary watch        run cruise on an interval, emitting a diff summary each pass
 ossuary dump         export the full engagement state as JSON
 ossuary tag          attach / list / remove labels on assets for grouping & filtering
 ```
@@ -345,9 +346,73 @@ ossuary cruise --db engagement-acme.db
 ```
 
 Each cruise re-fingerprints the known assets, snapshots the result into
-`cruise_runs`, and diffs it against the previous snapshot. In v0.1 this is a
-single-invocation diff — run it whenever you want a delta. (A long-running
-scheduled daemon is deferred to a later release.)
+`cruise_runs`, and diffs it against the previous snapshot. `cruise` is the
+single-invocation form — run it whenever you want a delta. For unattended,
+recurring deltas, use `watch` (below).
+
+### Continuous monitoring (`ossuary watch`)
+
+`cruise` catches what changed *since you last ran it*. On a long-running program
+the high-signal moments — a port opening on a new IP, a version bump, a service
+disappearing — happen between scans, and a one-shot tool only catches them if
+you remember to re-run it. `ossuary watch` runs cruise on a fixed interval and
+emits a diff summary each pass, turning the one-shot scan into continuous
+monitoring:
+
+```bash
+# cruise every 4 hours, printing a summary each pass (Ctrl-C / SIGTERM to stop)
+ossuary watch --db engagement-acme.db --interval 4h
+#   watching engagement-acme.db — cruise every 14400s, until interrupted (0 notify sink(s))
+#   [cruise #1 @ 2026-05-28T09:00:00] 1 added, 0 removed, 1 changed, 0 tag change(s)
+#     + 10.10.0.7:tcp/8443  nginx 1.25.0
+#     ~ 10.10.0.5:tcp/80  nginx 1.18.0 -> nginx 1.25.0
+#   [cruise #2 @ 2026-05-28T13:00:00] 0 added, 0 removed, 0 changed, 0 tag change(s)
+#     (no changes)
+```
+
+The interval accepts an integer (seconds) or a value with an `s`/`m`/`h`/`d`
+suffix — `4h`, `30m`, `90s`, `1d`, or `300`. Each pass runs a full cruise
+(re-fingerprint, snapshot into `cruise_runs`, diff against the previous
+snapshot), so the engagement's change history is built up automatically.
+
+**Bounded runs.** `--once` runs exactly one pass and exits; `--iterations N`
+runs N passes. Both are handy for cron-driven scheduling (let cron own the
+cadence, `watch --once` own the diff) or for a quick sanity check:
+
+```bash
+ossuary watch --db engagement-acme.db --once
+```
+
+**Quiet mode.** `--quiet-when-unchanged` suppresses the summary on passes where
+nothing moved, so the only output you see is an actual change — ideal when
+piping to a notification channel you don't want spammed.
+
+**Notifications (`--notify`).** Push each pass's summary to a file and/or a
+Slack incoming webhook. The flag is repeatable, so you can do both at once:
+
+```bash
+ossuary watch --db engagement-acme.db --interval 4h \
+  --notify file:/var/log/ossuary/acme-cruise.log \
+  --notify slack:https://hooks.slack.com/services/T000/B000/XXXX \
+  --quiet-when-unchanged
+```
+
+- `file:<path>` appends each summary as a newline-delimited block (the parent
+  directory is created if needed) — `tail -f` it or ship it downstream.
+- `slack:<webhook>` POSTs each summary to a Slack incoming webhook.
+
+Slack webhook URLs are accepted **only** on the command line and are **never**
+written to the engagement DB — keep secrets out of the portable `.db` file. A
+sink that fails (a down webhook, an unwritable path) is logged and skipped; one
+flaky sink never kills the watch loop, and neither does a failed cruise pass —
+the daemon logs the error and retries on the next interval. `watch` shuts down
+cleanly on `SIGTERM`/`SIGINT`, finishing the in-flight pass's snapshot first.
+
+> **Design note.** `watch` is a plain fixed-interval loop (stdlib `time` +
+> `httpx`, both already present), not a cron-grade scheduler — a single repeating
+> interval doesn't justify the extra dependency and daemon-management surface.
+> Need cron-style schedules? Run `watch --once` from cron and let cron own the
+> cadence.
 
 ---
 
