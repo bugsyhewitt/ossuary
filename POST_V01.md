@@ -283,6 +283,41 @@ dependencies, no schema change, fully offline-tested.
 
 ---
 
+## Rank 11 — Self-contained HTML report export (`dump --format html`)  ✅ IMPLEMENTED
+
+> Shipped: `dump` gains `--format html`, a fourth export format alongside
+> json / csv / markdown. It emits a single self-contained HTML document (inline
+> CSS, no external assets, no JavaScript) that groups findings under each asset
+> and service — the nested per-host view rather than the flat CSV/Markdown
+> table. KEV findings carry a red `KEV` badge and every finding row is
+> colour-coded by severity tier (critical/high/medium/low/blank, reusing the
+> `stats` tiering). All cell text is HTML-escaped. Rendering happens off the
+> same `dump.build_state`, so the report respects `--tag`, the R8 actionability
+> filters, and R9 `--sort-by-priority` identically to the other formats. An
+> empty engagement still yields a valid document with an explicit empty-state
+> notice. Pure-Python (`html.escape`), no new dependencies, no schema change, no
+> network calls, fully offline-tested. +8 tests.
+
+**What:** R6 added machine- and paste-friendly export formats (csv / markdown),
+and R8/R9/R10 made the export show the *right* findings, in the *right* order,
+with a roll-up. The missing last-mile artifact is a **shareable, human-readable
+deliverable** — a report you hand to a client or attach to an engagement
+write-up without asking them to open a spreadsheet or render Markdown. A
+self-contained HTML file opens in any browser, offline, with severity colour
+coding and KEV badges already applied.
+
+**Why now:** It closes the report-export lineage opened by R6. The JSON dump is
+for tools, CSV is for spreadsheets, Markdown is for platform submissions — but a
+formatted HTML report is the artifact a solo hunter sends as the engagement
+deliverable. Reusing `build_state` means it inherits every filter and ordering
+control for free, so it's a thin presentation layer over proven logic.
+
+**Effort:** Small. A pure-Python serialiser over the existing nested state +
+one `--format` choice; no new dependencies, no schema change, fully
+offline-tested.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |

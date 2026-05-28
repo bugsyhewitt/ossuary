@@ -1,7 +1,7 @@
 """Engagement state export for ossuary.
 
 Serialises the full engagement (assets + their services + each service's
-findings) to one of three shapes:
+findings) to one of four shapes:
 
   * ``json``     — the nested structure (assets → services → findings) suitable
                    for piping into other tools.
@@ -10,9 +10,15 @@ findings) to one of three shapes:
                    findings still emit a row so no inventory is lost.
   * ``markdown`` — the same flat table as a GitHub-Flavoured-Markdown pipe
                    table, ready to paste into a HackerOne / Bugcrowd report.
+  * ``html``     — a single self-contained HTML document (inline CSS, no
+                   external assets) grouping findings under each asset and
+                   service, with KEV badges and severity-tier colour coding —
+                   the shareable, human-readable deliverable that closes the
+                   report-export lineage. It carries the same data the other
+                   formats do and respects the same filters / priority order.
 
-The flat formats cover exactly the same fields as the JSON output, flattened
-across the asset/service/finding nesting.
+The flat (csv / markdown) formats cover exactly the same fields as the JSON
+output, flattened across the asset/service/finding nesting.
 
 Actionability filters (``min_epss`` / ``min_severity`` / ``kev_only``) trim the
 export to the findings that actually matter for a report. NIST's enrichment
@@ -32,6 +38,7 @@ historical alphabetical-by-CVE-id ordering byte-for-byte unchanged.
 from __future__ import annotations
 
 import csv
+import html
 import io
 import json
 import sqlite3
@@ -39,7 +46,7 @@ from pathlib import Path
 
 from . import db, tags
 
-SUPPORTED_FORMATS = ("json", "csv", "markdown")
+SUPPORTED_FORMATS = ("json", "csv", "markdown", "html")
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
 # the asset-, service-, and finding-level fields the JSON dump exposes.
@@ -306,6 +313,140 @@ def to_markdown(state: dict) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# HTML report export (POST_V01 Rank 11)
+# --------------------------------------------------------------------------
+
+# Inline stylesheet for the self-contained report. Kept deliberately small and
+# dependency-free: no web fonts, no external CSS, no JavaScript — the document
+# renders identically offline and is safe to hand to a client.
+_HTML_STYLE = """
+  body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+         margin: 2rem; color: #1a1a1a; background: #fafafa; }
+  h1 { margin-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.5rem; }
+  .asset { background: #fff; border: 1px solid #ddd; border-radius: 6px;
+           padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
+  .asset h2 { margin: 0 0 0.25rem; font-size: 1.15rem; }
+  .asset .tags { color: #555; font-size: 0.85rem; }
+  .service { margin: 0.75rem 0 0.25rem; font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; margin: 0.25rem 0 0.75rem; }
+  th, td { border: 1px solid #e2e2e2; padding: 0.35rem 0.5rem;
+           text-align: left; font-size: 0.88rem; vertical-align: top; }
+  th { background: #f0f0f0; }
+  .badge { display: inline-block; padding: 0.05rem 0.4rem; border-radius: 4px;
+           font-size: 0.72rem; font-weight: 700; color: #fff; }
+  .kev { background: #b30000; }
+  .sev-critical { background: #ffd6d6; }
+  .sev-high { background: #ffe6cc; }
+  .sev-medium { background: #fff5cc; }
+  .sev-low { background: #e6f0ff; }
+  .sev-blank { background: #f2f2f2; color: #888; }
+  .empty { color: #888; font-style: italic; }
+"""
+
+
+def _severity_tier_class(value) -> str:
+    """Map a finding's severity to a CSS tier class (mirrors stats tiering)."""
+    sev = _parse_severity(value)
+    if sev is None:
+        return "sev-blank"
+    if sev >= 9.0:
+        return "sev-critical"
+    if sev >= 7.0:
+        return "sev-high"
+    if sev >= 4.0:
+        return "sev-medium"
+    return "sev-low"
+
+
+def _h(value) -> str:
+    """HTML-escape a value, rendering ``None`` as an empty string."""
+    return html.escape(_cell(value))
+
+
+def to_html(state: dict) -> str:
+    """Serialise the engagement state as a single self-contained HTML document.
+
+    Findings are grouped under each asset and service (matching the nested JSON
+    shape rather than the flat CSV/Markdown one), so the report reads as a
+    per-host walk-through. KEV findings carry a red ``KEV`` badge and every
+    finding row is colour-coded by severity tier. The document inlines all CSS
+    and references no external assets, so it renders offline and is safe to hand
+    to a client. An empty engagement still yields a valid document with an
+    explicit empty-state notice.
+    """
+    asset_count = len(state["assets"])
+    finding_count = sum(
+        len(svc["findings"]) for a in state["assets"] for svc in a["services"]
+    )
+    parts: list[str] = [
+        "<!DOCTYPE html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        "<title>ossuary engagement report</title>",
+        f"<style>{_HTML_STYLE}</style>",
+        "</head>",
+        "<body>",
+        "<h1>ossuary engagement report</h1>",
+        f'<p class="meta">{asset_count} asset(s), {finding_count} finding(s)</p>',
+    ]
+
+    if not state["assets"]:
+        parts.append('<p class="empty">No assets in this engagement.</p>')
+    for asset in state["assets"]:
+        host = _h(asset["hostname"]) if asset["hostname"] else ""
+        heading = _h(asset["ip"]) + (f" <small>({host})</small>" if host else "")
+        parts.append('<section class="asset">')
+        parts.append(f"<h2>{heading}</h2>")
+        asset_tags = asset.get("tags") or []
+        if asset_tags:
+            tag_str = ", ".join(_h(t) for t in asset_tags)
+            parts.append(f'<div class="tags">tags: {tag_str}</div>')
+        if not asset["services"]:
+            parts.append('<p class="empty">No services.</p>')
+        for svc in asset["services"]:
+            label = f"{_h(svc['port'])}/{_h(svc['protocol'])}"
+            svc_name = _h(svc["name"]) or "?"
+            product = _h(svc["product"])
+            version = _h(svc["version"])
+            detail = " ".join(p for p in (product, version) if p)
+            svc_line = f"{label} — {svc_name}" + (f" ({detail})" if detail else "")
+            parts.append(f'<div class="service">{svc_line}</div>')
+            findings = svc["findings"]
+            if not findings:
+                parts.append('<p class="empty">No findings.</p>')
+                continue
+            parts.append("<table>")
+            parts.append(
+                "<tr><th>CVE</th><th>severity</th><th>EPSS</th><th>KEV</th>"
+                "<th>summary</th></tr>"
+            )
+            for f in findings:
+                tier = _severity_tier_class(f.get("severity"))
+                sev = _h(f.get("severity")) or "—"
+                epss = f.get("epss_score")
+                epss_cell = f"{epss:.2f}" if isinstance(epss, (int, float)) else "—"
+                kev_cell = '<span class="badge kev">KEV</span>' if f.get("kev") else ""
+                parts.append(
+                    f'<tr class="{tier}">'
+                    f"<td>{_h(f.get('cve_id'))}</td>"
+                    f"<td>{sev}</td>"
+                    f"<td>{epss_cell}</td>"
+                    f"<td>{kev_cell}</td>"
+                    f"<td>{_h(f.get('summary'))}</td>"
+                    "</tr>"
+                )
+            parts.append("</table>")
+        parts.append("</section>")
+
+    parts.append("</body>")
+    parts.append("</html>")
+    return "\n".join(parts)
+
+
 def dump(
     db_path: str | Path,
     fmt: str = "json",
@@ -318,7 +459,7 @@ def dump(
 ) -> str:
     """Return the engagement state as a serialised string in the given format.
 
-    `fmt` is one of ``json``, ``csv``, or ``markdown``. `tag`, when set,
+    `fmt` is one of ``json``, ``csv``, ``markdown``, or ``html``. `tag`, when set,
     restricts the export to assets carrying that tag label. `min_epss`,
     `min_severity`, and `kev_only` are actionability filters: each restricts the
     export to findings clearing that threshold, pruning services and assets left
@@ -348,4 +489,6 @@ def dump(
         return to_csv(state)
     if fmt == "markdown":
         return to_markdown(state)
+    if fmt == "html":
+        return to_html(state)
     return json.dumps(state, indent=2, sort_keys=False)

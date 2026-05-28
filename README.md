@@ -59,7 +59,7 @@ ossuary probe        HTTP/web-layer probe of web ports -> web_probes table
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
-ossuary dump         export engagement state as JSON/CSV/Markdown (filterable by KEV/EPSS/severity)
+ossuary dump         export engagement state as JSON/CSV/Markdown/HTML (filterable by KEV/EPSS/severity)
 ossuary stats        print an at-a-glance engagement summary (counts + top hits)
 ossuary tag          attach / list / remove labels on assets for grouping & filtering
 ossuary profiles     list the named scan profiles and their nmap flags
@@ -374,12 +374,13 @@ ossuary dump --db engagement-acme.db --format json > acme-state.json
 
 ### Export formats
 
-`dump` speaks three formats via `--format`:
+`dump` speaks four formats via `--format`:
 
 ```bash
 ossuary dump --db engagement-acme.db --format json     > acme-state.json
 ossuary dump --db engagement-acme.db --format csv      > acme-findings.csv
 ossuary dump --db engagement-acme.db --format markdown > acme-findings.md
+ossuary dump --db engagement-acme.db --format html     > acme-report.html
 ```
 
 - **`json`** (default) — the nested `assets → services → findings` structure,
@@ -390,12 +391,19 @@ ossuary dump --db engagement-acme.db --format markdown > acme-findings.md
   in a spreadsheet to sort/filter findings across the whole engagement.
 - **`markdown`** — the same flat table as a GitHub-Flavoured-Markdown pipe
   table, ready to paste straight into a HackerOne / Bugcrowd submission.
+- **`html`** — a single **self-contained HTML report** (inline CSS, no external
+  assets, no JavaScript) grouping findings under each asset and service, with a
+  red **KEV** badge on confirmed-exploited CVEs and severity-tier colour coding
+  on every finding row. It renders offline and is safe to hand to a client as a
+  deliverable — open it in a browser or attach it to an engagement write-up.
 
-All three cover the same fields; CSV and Markdown flatten the JSON nesting into
-these columns: `ip, hostname, asset_state, discovered_at, tags, port, protocol,
-service_name, product, version, cpe, fingerprinted_at, cve_id, summary,
-severity, source, epss_score, kev, matched_at`. `--tag LABEL` filters every
-format to the assets carrying that label.
+The `json`, `csv`, and `markdown` formats cover the same fields; CSV and
+Markdown flatten the JSON nesting into these columns: `ip, hostname,
+asset_state, discovered_at, tags, port, protocol, service_name, product,
+version, cpe, fingerprinted_at, cve_id, summary, severity, source, epss_score,
+kev, matched_at`. The `html` report carries the same underlying data, presented
+per-host rather than as a flat table. `--tag LABEL` filters every format to the
+assets carrying that label.
 
 #### Actionability filters — `--kev-only`, `--min-epss`, `--min-severity`
 
@@ -427,7 +435,7 @@ Semantics:
 
 The flags **compose** (a finding must clear every threshold given) and combine
 with `--tag` (e.g. `--tag in-scope --kev-only`). They apply identically to
-`json`, `csv`, and `markdown`. When a filter is active, services and assets left
+`json`, `csv`, `markdown`, and `html`. When a filter is active, services and assets left
 with no surviving findings are pruned, so the output collapses to a clean list
 of actionable hits. With no filter flags, `dump` returns the full inventory
 exactly as before (services with no findings still appear).
@@ -453,7 +461,7 @@ ossuary dump --db engagement-acme.db --kev-only --sort-by-priority
 
 Findings with no EPSS score or a blank/non-numeric severity sink to the bottom
 of their tier rather than being dropped (use the filters above to drop them).
-The flag applies identically to `json`, `csv`, and `markdown`, and composes with
+The flag applies identically to `json`, `csv`, `markdown`, and `html`, and composes with
 `--tag` and the actionability filters. Without it, ordering is the historical
 alphabetical-by-CVE-id, byte-for-byte unchanged.
 
