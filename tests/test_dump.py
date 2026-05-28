@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import io
 import json
 
@@ -463,3 +464,83 @@ def test_dump_sort_by_priority_applies_to_csv_export(db_path):
         "CVE-2020-WARM",
         "CVE-2020-COLD",
     ]
+
+
+# --------------------------------------------------------------------------
+# HTML report export (POST_V01 Rank 11 — `--format html`)
+# --------------------------------------------------------------------------
+
+def test_dump_html_is_a_self_contained_document(db_path):
+    _seed_one_finding(db_path)
+    out = dump.dump(db_path, "html")
+    # A standalone document: doctype, inline styles, no external asset refs.
+    assert out.lstrip().startswith("<!DOCTYPE html>")
+    assert "</html>" in out
+    assert "<style>" in out
+    assert "src=" not in out
+    assert "href=" not in out
+
+
+def test_dump_html_lists_assets_services_and_findings(db_path):
+    _seed_one_finding(db_path)
+    out = dump.dump(db_path, "html")
+    assert "10.10.0.5" in out
+    assert "host-a" in out
+    assert "nginx" in out
+    assert "CVE-2021-23017" in out
+    assert "off-by-one" in out
+
+
+def test_dump_html_escapes_html_in_finding_text(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(
+            conn, sid, "CVE-XSS", "<script>alert(1)</script> & friends", "5.0"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = dump.dump(db_path, "html")
+    # The raw script tag must never appear unescaped in the report.
+    assert "<script>alert(1)</script>" not in out
+    assert html.escape("<script>alert(1)</script> & friends") in out
+
+
+def test_dump_html_empty_db_is_still_valid_document(db_path):
+    db.init_db(db_path).close()
+    out = dump.dump(db_path, "html")
+    assert out.lstrip().startswith("<!DOCTYPE html>")
+    assert "</html>" in out
+    # An explicit empty-state marker rather than a silent blank page.
+    assert "No assets" in out
+
+
+def test_dump_html_flags_kev_findings(db_path):
+    _seed_mixed_findings(db_path)
+    out = dump.dump(db_path, "html")
+    # The KEV finding carries a visible KEV badge; the cold one does not gain one.
+    assert "KEV" in out
+    # Severity tiering classes are emitted so findings are colour-coded.
+    assert "sev-" in out
+
+
+def test_dump_html_filters_apply(db_path):
+    _seed_mixed_findings(db_path)
+    out = dump.dump(db_path, "html", kev_only=True)
+    assert "CVE-HOT" in out
+    assert "CVE-COLD" not in out
+    assert "CVE-MID" not in out
+
+
+def test_dump_html_sort_by_priority_orders_findings(db_path):
+    _seed_one_service_many_findings(db_path)
+    out = dump.dump(db_path, "html", sort_by_priority=True)
+    # The hottest KEV finding must appear before the cold non-KEV one.
+    assert out.index("CVE-2020-KEVHI") < out.index("CVE-2020-COLD")
+
+
+def test_dump_html_is_listed_as_supported_format():
+    assert "html" in dump.SUPPORTED_FORMATS
