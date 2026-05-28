@@ -212,6 +212,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="only export findings in CISA's Known Exploited Vulnerabilities catalog",
     )
+    p_dump.add_argument(
+        "--sort-by-priority",
+        action="store_true",
+        help=(
+            "order each service's findings KEV-first, then by descending EPSS, "
+            "severity, and CVE id (the `match-cves` triage order) instead of "
+            "alphabetically by CVE id"
+        ),
+    )
 
     p_probe = sub.add_parser(
         "probe", help="HTTP/web layer discovery — probe web ports on known assets"
@@ -422,6 +431,7 @@ def _cmd_dump(args: argparse.Namespace) -> int:
             min_epss=args.min_epss,
             min_severity=args.min_severity,
             kev_only=args.kev_only,
+            sort_by_priority=args.sort_by_priority,
         )
     )
     return 0

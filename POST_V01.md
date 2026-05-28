@@ -226,6 +226,33 @@ flags; the format serialisers are untouched.
 
 ---
 
+## Rank 9 — Priority ordering for `dump` (`--sort-by-priority`)  ✅ IMPLEMENTED
+
+> Shipped: `dump` gains `--sort-by-priority`, which reorders each service's
+> findings into the same triage order `match-cves` prints — KEV-first, then
+> descending EPSS, then descending numeric severity, then CVE id as a stable
+> tiebreaker. Off by default (historical alphabetical-by-CVE-id ordering is
+> byte-for-byte unchanged). Sorting happens in `dump.build_state`, so it applies
+> uniformly to json / csv / markdown and composes with `--tag` and the R8
+> actionability filters. Findings with no EPSS / blank severity sink to the
+> bottom of their tier rather than being dropped. +8 tests.
+
+**What:** The R1 enrichment and R8 filters made `dump` show the *right*
+findings; this makes it show them in the *right order*. A report's most
+important line should be its first, not whichever CVE id sorts earliest in the
+alphabet.
+
+**Why now:** `match-cves` already computes and prints KEV-first / EPSS-desc
+ordering to the console, but the report-export artifact (`dump`) emitted findings
+alphabetically — the last-mile inconsistency. With NIST's enrichment retreat the
+EPSS+KEV signal is the only reliable prioritisation axis; surfacing it in the
+exported order closes the loop opened by R1/R6/R8.
+
+**Effort:** Small. A pure-Python sort key in `build_state` + one argparse flag;
+the format serialisers are untouched. No new dependencies, no schema change.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |
