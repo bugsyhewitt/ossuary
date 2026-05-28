@@ -87,6 +87,16 @@ def build_parser() -> argparse.ArgumentParser:
             "KEV status (default: enabled; use --no-enrich to skip the lookups)"
         ),
     )
+    p_match.add_argument(
+        "--web",
+        action="store_true",
+        help=(
+            "also match versioned web tech fingerprints from the web_probes "
+            "table (e.g. a Server: nginx/1.24.0 banner) against the selected "
+            "source(s); findings attach to the owning TCP service. Run `ossuary "
+            "probe` first to populate web_probes"
+        ),
+    )
 
     p_cruise = sub.add_parser(
         "cruise", help="re-fingerprint and diff against last saved state"
@@ -173,6 +183,15 @@ def _cmd_match_cves(args: argparse.Namespace) -> int:
         source=args.source,
         nvd_api_key=args.nvd_api_key,
     )
+    if args.web:
+        web_count = cves.match_web_cves(
+            args.db,
+            enrich_findings=args.enrich,
+            source=args.source,
+            nvd_api_key=args.nvd_api_key,
+        )
+        print(f"matched {web_count} web finding(s) -> {args.db}")
+        count += web_count
     print(f"matched {count} finding(s) -> {args.db}")
     if count:
         conn = db.require_initialised(args.db)

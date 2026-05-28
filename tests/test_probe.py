@@ -12,7 +12,13 @@ import sqlite3
 import pytest
 
 from ossuary import db, probe as probe_mod
-from ossuary.probe import ProbeResult, _extract_title, _fingerprint_headers, _fingerprint_html
+from ossuary.probe import (
+    ProbeResult,
+    _extract_title,
+    _fingerprint_headers,
+    _fingerprint_html,
+    extract_versioned_techs,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +83,56 @@ def test_extract_title_missing():
 def test_extract_title_empty():
     title = _extract_title("<title></title>")
     assert title is None
+
+
+# ---------------------------------------------------------------------------
+# Versioned tech extraction (feeds web-probe CVE matching)
+# ---------------------------------------------------------------------------
+
+def test_extract_versioned_techs_nginx():
+    assert extract_versioned_techs("nginx/1.24.0") == [("nginx", "1.24.0")]
+
+
+def test_extract_versioned_techs_apache_maps_to_http_server():
+    # Apache's CPE/NVD product name is "http_server", and trailing OS tags drop.
+    assert extract_versioned_techs("Apache/2.4.51 (Ubuntu)") == [("http_server", "2.4.51")]
+
+
+def test_extract_versioned_techs_php_from_x_powered_by():
+    assert extract_versioned_techs("PHP/8.1.2") == [("php", "8.1.2")]
+
+
+def test_extract_versioned_techs_multiple_fragments_in_one_banner():
+    # A combined banner like "Apache/2.4.51 OpenSSL/3.0.2 PHP/8.1.2".
+    pairs = extract_versioned_techs("Apache/2.4.51 (Ubuntu) OpenSSL/3.0.2 PHP/8.1.2")
+    assert ("http_server", "2.4.51") in pairs
+    assert ("openssl", "3.0.2") in pairs
+    assert ("php", "8.1.2") in pairs
+
+
+def test_extract_versioned_techs_accepts_multiple_banner_args():
+    pairs = extract_versioned_techs("nginx/1.24.0", "PHP/8.1.2")
+    assert pairs == [("nginx", "1.24.0"), ("php", "8.1.2")]
+
+
+def test_extract_versioned_techs_ignores_versionless_banner():
+    assert extract_versioned_techs("nginx") == []
+    assert extract_versioned_techs("cloudflare") == []
+
+
+def test_extract_versioned_techs_ignores_unknown_product():
+    # A product not in the banner map yields nothing even with a version.
+    assert extract_versioned_techs("SomeRandomServer/9.9.9") == []
+
+
+def test_extract_versioned_techs_handles_none_and_empty():
+    assert extract_versioned_techs(None) == []
+    assert extract_versioned_techs("") == []
+    assert extract_versioned_techs(None, "") == []
+
+
+def test_extract_versioned_techs_deduplicates():
+    assert extract_versioned_techs("nginx/1.24.0", "nginx/1.24.0") == [("nginx", "1.24.0")]
 
 
 # ---------------------------------------------------------------------------
