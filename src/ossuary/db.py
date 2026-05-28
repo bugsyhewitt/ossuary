@@ -80,6 +80,15 @@ CREATE TABLE IF NOT EXISTS web_probes (
     probed_at         TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(asset_id, port, protocol)
 );
+
+CREATE TABLE IF NOT EXISTS tags (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity    TEXT    NOT NULL,
+    entity_id INTEGER NOT NULL,
+    tag       TEXT    NOT NULL,
+    tagged_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(entity, entity_id, tag)
+);
 """
 
 # Columns added to `findings` after v0.1 for severity-context enrichment. Each
@@ -89,6 +98,14 @@ CREATE TABLE IF NOT EXISTS web_probes (
 _FINDINGS_MIGRATIONS = (
     ("epss_score", "ALTER TABLE findings ADD COLUMN epss_score REAL"),
     ("kev", "ALTER TABLE findings ADD COLUMN kev INTEGER NOT NULL DEFAULT 0"),
+)
+
+# Columns added to `cruise_runs` after v0.1. The `tag_snapshot` column stores a
+# JSON map of {asset_ip: [tag, ...]} captured at cruise time so successive
+# cruises can diff tag state (the `tag_changes` diff section) without disturbing
+# the existing service `snapshot` column.
+_CRUISE_RUNS_MIGRATIONS = (
+    ("tag_snapshot", "ALTER TABLE cruise_runs ADD COLUMN tag_snapshot TEXT"),
 )
 
 
@@ -104,12 +121,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     columns to a table that already exists with an older shape. So for DBs that
     predate the enrichment columns we ALTER them in, guarded by a column check.
     """
-    if "findings" not in table_names(conn):
-        return
-    existing = _column_names(conn, "findings")
-    for name, ddl in _FINDINGS_MIGRATIONS:
-        if name not in existing:
-            conn.execute(ddl)
+    names = table_names(conn)
+    if "findings" in names:
+        existing = _column_names(conn, "findings")
+        for name, ddl in _FINDINGS_MIGRATIONS:
+            if name not in existing:
+                conn.execute(ddl)
+    if "cruise_runs" in names:
+        existing = _column_names(conn, "cruise_runs")
+        for name, ddl in _CRUISE_RUNS_MIGRATIONS:
+            if name not in existing:
+                conn.execute(ddl)
     conn.commit()
 
 

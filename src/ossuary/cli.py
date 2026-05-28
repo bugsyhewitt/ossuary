@@ -18,6 +18,7 @@ import sys
 
 from . import __version__, cruise as cruise_mod, cves, db, discover as discover_mod
 from . import dump as dump_mod, fingerprint as fingerprint_mod, probe as probe_mod
+from . import tags as tags_mod
 
 
 def _add_db_arg(parser: argparse.ArgumentParser) -> None:
@@ -111,6 +112,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["json"],
         help="output format (v0.1: json only)",
     )
+    p_dump.add_argument(
+        "--tag",
+        default=None,
+        metavar="LABEL",
+        help="only export assets carrying this tag (see `ossuary tag`)",
+    )
 
     p_probe = sub.add_parser(
         "probe", help="HTTP/web layer discovery — probe web ports on known assets"
@@ -134,6 +141,56 @@ def build_parser() -> argparse.ArgumentParser:
         default="80,443,8080,8443",
         metavar="PORTS",
         help="comma-separated list of ports to probe (default: 80,443,8080,8443)",
+    )
+
+    p_tag = sub.add_parser(
+        "tag", help="attach / list / remove labels on assets for grouping & filtering"
+    )
+    tag_sub = p_tag.add_subparsers(dest="tag_action", required=True, metavar="ACTION")
+
+    p_tag_add = tag_sub.add_parser("add", help="attach a tag to an asset")
+    _add_db_arg(p_tag_add)
+    p_tag_add.add_argument(
+        "--asset",
+        required=True,
+        metavar="IP",
+        help="asset IP (or hostname) to tag — must already be discovered",
+    )
+    p_tag_add.add_argument(
+        "--tag",
+        required=True,
+        metavar="LABEL",
+        help='the label to attach (e.g. "in-scope", "vip", "env:prod")',
+    )
+
+    p_tag_list = tag_sub.add_parser("list", help="list tags, optionally filtered")
+    _add_db_arg(p_tag_list)
+    p_tag_list.add_argument(
+        "--entity",
+        default=None,
+        choices=["asset", "service", "finding"],
+        help="restrict to one entity kind (default: all)",
+    )
+    p_tag_list.add_argument(
+        "--asset",
+        default=None,
+        metavar="IP",
+        help="restrict to a single asset's tags (IP or hostname)",
+    )
+
+    p_tag_rm = tag_sub.add_parser("rm", help="remove a tag from an asset")
+    _add_db_arg(p_tag_rm)
+    p_tag_rm.add_argument(
+        "--asset",
+        required=True,
+        metavar="IP",
+        help="asset IP (or hostname) to untag",
+    )
+    p_tag_rm.add_argument(
+        "--tag",
+        required=True,
+        metavar="LABEL",
+        help="the label to remove",
     )
 
     return parser
@@ -212,15 +269,17 @@ def _cmd_cruise(args: argparse.Namespace) -> int:
     n_added = len(diff["added"])
     n_removed = len(diff["removed"])
     n_changed = len(diff["changed"])
+    n_tags = len(diff.get("tag_changes", []))
     print(
-        f"cruise diff: {n_added} added, {n_removed} removed, {n_changed} changed"
+        f"cruise diff: {n_added} added, {n_removed} removed, "
+        f"{n_changed} changed, {n_tags} tag change(s)"
     )
     print(json.dumps(diff, indent=2))
     return 0
 
 
 def _cmd_dump(args: argparse.Namespace) -> int:
-    print(dump_mod.dump(args.db, args.format))
+    print(dump_mod.dump(args.db, args.format, tag=args.tag))
     return 0
 
 
@@ -240,6 +299,32 @@ def _cmd_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_tag(args: argparse.Namespace) -> int:
+    if args.tag_action == "add":
+        created = tags_mod.add_tag(args.db, args.asset, args.tag)
+        if created:
+            print(f"tagged {args.asset} with {args.tag!r} -> {args.db}")
+        else:
+            print(f"{args.asset} already carries {args.tag!r} (no change)")
+        return 0
+    if args.tag_action == "rm":
+        removed = tags_mod.remove_tag(args.db, args.asset, args.tag)
+        if removed:
+            print(f"removed {args.tag!r} from {args.asset} -> {args.db}")
+        else:
+            print(f"{args.asset} had no tag {args.tag!r} (no change)")
+        return 0
+    # list
+    rows = tags_mod.list_tags(args.db, entity=args.entity, asset=args.asset)
+    if not rows:
+        print("no tags")
+        return 0
+    for row in rows:
+        selector = row["asset_ip"] or f"{row['entity']}#{row['entity_id']}"
+        print(f"  {selector}\t{row['tag']}")
+    return 0
+
+
 _DISPATCH = {
     "init": _cmd_init,
     "discover": _cmd_discover,
@@ -248,6 +333,7 @@ _DISPATCH = {
     "cruise": _cmd_cruise,
     "dump": _cmd_dump,
     "probe": _cmd_probe,
+    "tag": _cmd_tag,
 }
 
 

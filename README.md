@@ -59,6 +59,7 @@ ossuary probe        HTTP/web-layer probe of web ports -> web_probes table
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary dump         export the full engagement state as JSON
+ossuary tag          attach / list / remove labels on assets for grouping & filtering
 ```
 
 Run `ossuary <command> --help` for per-command flags.
@@ -165,6 +166,54 @@ findings — no new table, no schema change. `--web` honours the same `--source`
 Without `--web`, `match-cves` behaves exactly as before and never touches the
 `web_probes` table.
 
+### Asset tagging (`ossuary tag`)
+
+Large engagements mean hundreds of hosts: some in scope, some out, a handful of
+VIP targets, and plenty of noise to ignore. `ossuary tag` is the workflow glue
+for grouping and filtering assets by **engagement, environment, scope, or
+severity tier** — a free-text label layer over the assets you've discovered.
+
+```bash
+# attach a label to a discovered asset (by IP or hostname)
+ossuary tag add  --db engagement-acme.db --asset 10.10.0.5 --tag in-scope
+ossuary tag add  --db engagement-acme.db --asset 10.10.0.5 --tag vip
+ossuary tag add  --db engagement-acme.db --asset 10.10.0.6 --tag out-of-scope
+
+# list every tag, or filter by entity kind / single asset
+ossuary tag list --db engagement-acme.db
+#     10.10.0.5    in-scope
+#     10.10.0.5    vip
+#     10.10.0.6    out-of-scope
+ossuary tag list --db engagement-acme.db --asset 10.10.0.5
+ossuary tag list --db engagement-acme.db --entity asset
+
+# remove a label
+ossuary tag rm   --db engagement-acme.db --asset 10.10.0.5 --tag vip
+```
+
+Tags are free-text, so any scheme works — flat labels (`in-scope`, `noise`) or
+namespaced ones (`env:prod`, `tier:critical`). Re-adding an existing tag is an
+idempotent no-op, and `--asset` accepts either the asset's IP or its hostname.
+
+Tags surface in two places automatically:
+
+- **`dump`** carries a `tags` array on every asset, and `--tag LABEL` filters
+  the export to just the assets carrying that label:
+
+  ```bash
+  # export only the in-scope hosts (and their services + findings)
+  ossuary dump --db engagement-acme.db --tag in-scope > acme-in-scope.json
+  ```
+
+- **`cruise`** gains a `tag_changes` section in its diff, reporting tags added
+  or removed on each asset since the previous cruise — so re-scoping decisions
+  show up in the engagement's change history alongside service changes.
+
+The tagging layer is purely additive: a single `tags` table, no change to the
+four core tables. The table is entity-polymorphic (`asset` | `service` |
+`finding`) so service- and finding-level tagging can be added later without a
+migration; the CLI surfaces the dominant asset workflow today.
+
 ---
 
 ## Database schema
@@ -225,13 +274,25 @@ Four tables, one engagement file:
 │ ids          (JSON array)│  the KEV CVE-id set, fetched once per day
 │ fetched_at               │  used to expire the cache
 └──────────────────────────┘
+
+┌──────────────────────────┐
+│ tags                     │  free-text labels for grouping/filtering assets
+│──────────────────────────│
+│ id           PK          │
+│ entity       (asset|...)  │  entity-polymorphic: asset / service / finding
+│ entity_id                │  id of the row in that entity's table
+│ tag          (label)     │  e.g. in-scope / vip / env:prod (UNIQUE per entity)
+│ tagged_at                │
+└──────────────────────────┘
 ```
 
 Foreign keys cascade: deleting an asset removes its services and their findings.
 
 The `epss_score` and `kev` columns are added automatically (via an idempotent
 migration at startup) to engagement DBs created before enrichment landed, so
-older `.db` files keep working without a manual re-init.
+older `.db` files keep working without a manual re-init. The `tags` table and
+`cruise_runs.tag_snapshot` column are added by the same migration mechanism, so
+pre-tagging engagement files gain tagging support on their next `ossuary` run.
 
 ---
 
