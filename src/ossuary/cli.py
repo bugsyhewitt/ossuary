@@ -8,7 +8,7 @@ Subcommands (v0.1):
     match-cves   query OSV.dev for service versions -> findings table
     cruise       re-fingerprint, diff against last state, report changes
     watch        run cruise on an interval, emitting a diff summary each pass
-    dump         export full engagement state as JSON
+    dump         export full engagement state as JSON, CSV, or Markdown
 """
 
 from __future__ import annotations
@@ -153,8 +153,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_dump.add_argument(
         "--format",
         default="json",
-        choices=["json"],
-        help="output format (v0.1: json only)",
+        choices=["json", "csv", "markdown"],
+        help="output format: json (nested), csv or markdown (flat, one finding per row)",
     )
     p_dump.add_argument(
         "--tag",

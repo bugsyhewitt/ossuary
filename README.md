@@ -59,7 +59,7 @@ ossuary probe        HTTP/web-layer probe of web ports -> web_probes table
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
-ossuary dump         export the full engagement state as JSON
+ossuary dump         export the full engagement state as JSON, CSV, or Markdown
 ossuary tag          attach / list / remove labels on assets for grouping & filtering
 ```
 
@@ -328,6 +328,31 @@ ossuary match-cves --db engagement-acme.db
 # 5. export the full engagement state as JSON
 ossuary dump --db engagement-acme.db --format json > acme-state.json
 ```
+
+### Export formats
+
+`dump` speaks three formats via `--format`:
+
+```bash
+ossuary dump --db engagement-acme.db --format json     > acme-state.json
+ossuary dump --db engagement-acme.db --format csv      > acme-findings.csv
+ossuary dump --db engagement-acme.db --format markdown > acme-findings.md
+```
+
+- **`json`** (default) — the nested `assets → services → findings` structure,
+  for piping into other tools.
+- **`csv`** — a flat table with a header row and **one finding per row**,
+  joining the asset, service, and finding columns. A service with no findings
+  still emits a row (empty finding columns) so no inventory is dropped. Open it
+  in a spreadsheet to sort/filter findings across the whole engagement.
+- **`markdown`** — the same flat table as a GitHub-Flavoured-Markdown pipe
+  table, ready to paste straight into a HackerOne / Bugcrowd submission.
+
+All three cover the same fields; CSV and Markdown flatten the JSON nesting into
+these columns: `ip, hostname, asset_state, discovered_at, tags, port, protocol,
+service_name, product, version, cpe, fingerprinted_at, cve_id, summary,
+severity, source, epss_score, kev, matched_at`. `--tag LABEL` filters every
+format to the assets carrying that label.
 
 ### Cruise mode
 
