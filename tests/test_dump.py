@@ -327,3 +327,139 @@ def test_dump_filters_apply_to_markdown_export(db_path):
     assert "CVE-HOT" in lines[2]
     assert "CVE-COLD" not in out
     assert "CVE-MID" not in out
+
+
+# --------------------------------------------------------------------------
+# Priority ordering (POST_V01 Rank 9 — `--sort-by-priority`)
+# --------------------------------------------------------------------------
+
+def _ordered_cve_ids(state, port):
+    """The CVE ids of the findings on the given port, in emitted order."""
+    for asset in state["assets"]:
+        for svc in asset["services"]:
+            if svc["port"] == port:
+                return [f["cve_id"] for f in svc["findings"]]
+    return []
+
+
+def _seed_one_service_many_findings(db_path):
+    """One service carrying findings that span every signal tier.
+
+    Insertion order is deliberately NOT priority order, so a passing test
+    proves the sort happened (and isn't an accident of insert/CVE-id order).
+    """
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.18.0", None)
+        # cold non-KEV, low EPSS
+        db.upsert_finding(conn, sid, "CVE-2020-COLD", "x", "3.1",
+                          epss_score=0.02, kev=0)
+        # KEV but lower EPSS than the other KEV
+        db.upsert_finding(conn, sid, "CVE-2020-KEVLO", "x", "7.0",
+                          epss_score=0.40, kev=1)
+        # non-KEV, high EPSS
+        db.upsert_finding(conn, sid, "CVE-2020-WARM", "x", "8.8",
+                          epss_score=0.75, kev=0)
+        # KEV, highest EPSS -> should lead
+        db.upsert_finding(conn, sid, "CVE-2020-KEVHI", "x", "9.8",
+                          epss_score=0.94, kev=1)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_dump_default_order_is_alphabetical_by_cve_id(db_path):
+    _seed_one_service_many_findings(db_path)
+    state = json.loads(dump.dump(db_path, "json"))
+    # Unchanged historical behaviour: findings sorted by cve_id ascending.
+    assert _ordered_cve_ids(state, 80) == [
+        "CVE-2020-COLD",
+        "CVE-2020-KEVHI",
+        "CVE-2020-KEVLO",
+        "CVE-2020-WARM",
+    ]
+
+
+def test_dump_sort_by_priority_orders_kev_then_epss(db_path):
+    _seed_one_service_many_findings(db_path)
+    state = json.loads(dump.dump(db_path, "json", sort_by_priority=True))
+    # KEV findings first (highest EPSS within KEV leads), then non-KEV by EPSS.
+    assert _ordered_cve_ids(state, 80) == [
+        "CVE-2020-KEVHI",  # KEV, EPSS 0.94
+        "CVE-2020-KEVLO",  # KEV, EPSS 0.40
+        "CVE-2020-WARM",   # non-KEV, EPSS 0.75
+        "CVE-2020-COLD",   # non-KEV, EPSS 0.02
+    ]
+
+
+def test_dump_sort_by_priority_severity_breaks_epss_ties(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        # Same KEV + same EPSS: higher numeric severity must lead.
+        db.upsert_finding(conn, sid, "CVE-LOWSEV", "x", "5.0",
+                          epss_score=0.50, kev=0)
+        db.upsert_finding(conn, sid, "CVE-HIGHSEV", "x", "9.0",
+                          epss_score=0.50, kev=0)
+        conn.commit()
+    finally:
+        conn.close()
+    state = json.loads(dump.dump(db_path, "json", sort_by_priority=True))
+    assert _ordered_cve_ids(state, 80) == ["CVE-HIGHSEV", "CVE-LOWSEV"]
+
+
+def test_dump_sort_by_priority_cve_id_breaks_full_ties(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        # Identical signal across the board -> deterministic cve_id ascending.
+        db.upsert_finding(conn, sid, "CVE-BBB", "x", "5.0", epss_score=0.5, kev=0)
+        db.upsert_finding(conn, sid, "CVE-AAA", "x", "5.0", epss_score=0.5, kev=0)
+        conn.commit()
+    finally:
+        conn.close()
+    state = json.loads(dump.dump(db_path, "json", sort_by_priority=True))
+    assert _ordered_cve_ids(state, 80) == ["CVE-AAA", "CVE-BBB"]
+
+
+def test_dump_sort_by_priority_missing_signals_sink_to_bottom(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-SIGNAL", "x", "7.0",
+                          epss_score=0.30, kev=0)
+        # No EPSS, blank severity -> ranks below any scored finding.
+        db.upsert_finding(conn, sid, "CVE-BLANK", "x", None,
+                          epss_score=None, kev=0)
+        conn.commit()
+    finally:
+        conn.close()
+    state = json.loads(dump.dump(db_path, "json", sort_by_priority=True))
+    assert _ordered_cve_ids(state, 80) == ["CVE-SIGNAL", "CVE-BLANK"]
+
+
+def test_dump_sort_by_priority_composes_with_filters(db_path):
+    _seed_one_service_many_findings(db_path)
+    # KEV-only filter leaves the two KEV findings, sorted by EPSS desc.
+    state = json.loads(
+        dump.dump(db_path, "json", kev_only=True, sort_by_priority=True)
+    )
+    assert _ordered_cve_ids(state, 80) == ["CVE-2020-KEVHI", "CVE-2020-KEVLO"]
+
+
+def test_dump_sort_by_priority_applies_to_csv_export(db_path):
+    _seed_one_service_many_findings(db_path)
+    out = dump.dump(db_path, "csv", sort_by_priority=True)
+    rows = list(csv.reader(io.StringIO(out)))
+    cve_col = FLAT_COLUMNS.index("cve_id")
+    emitted = [r[cve_col] for r in rows[1:]]
+    assert emitted == [
+        "CVE-2020-KEVHI",
+        "CVE-2020-KEVLO",
+        "CVE-2020-WARM",
+        "CVE-2020-COLD",
+    ]

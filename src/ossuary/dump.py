@@ -21,6 +21,12 @@ signal lives in EPSS (exploit probability) and CISA KEV (confirmed exploited).
 These filters let a hunter close an engagement with "only the findings worth
 writing up." A finding survives the filters when it clears *every* threshold
 given; when no filters are given, the export is unchanged (full inventory).
+
+Priority ordering (``sort_by_priority``) reorders each service's findings to
+match the triage order ``match-cves`` already prints to the console — KEV-first,
+then descending EPSS, then descending numeric severity, then CVE id — so the
+most-exploited findings lead every report. It is off by default, leaving the
+historical alphabetical-by-CVE-id ordering byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -102,6 +108,26 @@ def _finding_is_actionable(
     return True
 
 
+def _priority_key(finding: dict) -> tuple:
+    """Sort key ranking a finding by exploitation signal, highest-priority first.
+
+    Mirrors the triage order ``match-cves`` prints to the console:
+    KEV-first, then descending EPSS, then descending numeric severity, then
+    CVE id (ascending) as a stable final tiebreaker. Missing EPSS / severity
+    sink to the bottom of their tier. Built for use with ``sorted`` (ascending),
+    so the signal fields are negated and absent values map to the lowest rank.
+    """
+    kev = 1 if finding.get("kev") else 0
+    epss = finding.get("epss_score")
+    epss = epss if epss is not None else -1.0
+    sev = _parse_severity(finding.get("severity"))
+    sev = sev if sev is not None else -1.0
+    cve_id = finding.get("cve_id") or ""
+    # Negate the three signal fields so larger = earlier under ascending sort;
+    # cve_id stays ascending as the deterministic final tiebreaker.
+    return (-kev, -epss, -sev, cve_id)
+
+
 def build_state(
     conn: sqlite3.Connection,
     tag: str | None = None,
@@ -109,6 +135,7 @@ def build_state(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    sort_by_priority: bool = False,
 ) -> dict:
     """Assemble the full engagement state as a nested dict.
 
@@ -121,6 +148,11 @@ def build_state(
     findings are pruned from the output — so the export collapses to just the
     findings worth reporting. With none set, the full inventory is returned
     (services with no findings still appear), preserving the prior behaviour.
+
+    When `sort_by_priority` is set, each service's findings are reordered
+    KEV-first, then by descending EPSS, descending numeric severity, and finally
+    CVE id — the same triage order `match-cves` prints — so the highest-signal
+    findings lead. When unset, findings keep their alphabetical-by-CVE-id order.
     """
     filtering = min_epss is not None or min_severity is not None or kev_only
     assets_out: list[dict] = []
@@ -163,6 +195,8 @@ def build_state(
                 # left carries no signal — drop it so the report shows only hits.
                 if not findings_out:
                     continue
+            if sort_by_priority:
+                findings_out.sort(key=_priority_key)
             services_out.append(
                 {
                     "port": svc["port"],
@@ -280,6 +314,7 @@ def dump(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    sort_by_priority: bool = False,
 ) -> str:
     """Return the engagement state as a serialised string in the given format.
 
@@ -288,6 +323,9 @@ def dump(
     `min_severity`, and `kev_only` are actionability filters: each restricts the
     export to findings clearing that threshold, pruning services and assets left
     with no surviving findings. They compose with `tag` and with each other.
+    `sort_by_priority`, when set, orders each service's findings KEV-first /
+    descending-EPSS / descending-severity / CVE-id (the `match-cves` triage
+    order) instead of the default alphabetical-by-CVE-id ordering.
     """
     if fmt not in SUPPORTED_FORMATS:
         supported = ", ".join(SUPPORTED_FORMATS)
@@ -302,6 +340,7 @@ def dump(
             min_epss=min_epss,
             min_severity=min_severity,
             kev_only=kev_only,
+            sort_by_priority=sort_by_priority,
         )
     finally:
         conn.close()

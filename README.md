@@ -431,6 +431,31 @@ with no surviving findings are pruned, so the output collapses to a clean list
 of actionable hits. With no filter flags, `dump` returns the full inventory
 exactly as before (services with no findings still appear).
 
+#### Priority ordering — `--sort-by-priority`
+
+The actionability filters decide *which* findings make the report; the order
+they appear in still matters when you're writing it up. By default `dump` emits
+each service's findings alphabetically by CVE id — which buries the exploited
+CVEs among the cold ones. `--sort-by-priority` reorders each service's findings
+into the same triage order `match-cves` prints to the console: **KEV-first,
+then descending EPSS, then descending numeric severity**, with CVE id as a
+deterministic final tiebreaker. The findings actually being exploited lead every
+service in the report:
+
+```bash
+# the report, highest-signal findings first
+ossuary dump --db engagement-acme.db --format markdown --sort-by-priority
+
+# combine with filters: only the KEV hits, hottest first
+ossuary dump --db engagement-acme.db --kev-only --sort-by-priority
+```
+
+Findings with no EPSS score or a blank/non-numeric severity sink to the bottom
+of their tier rather than being dropped (use the filters above to drop them).
+The flag applies identically to `json`, `csv`, and `markdown`, and composes with
+`--tag` and the actionability filters. Without it, ordering is the historical
+alphabetical-by-CVE-id, byte-for-byte unchanged.
+
 ### Cruise mode
 
 Later in the engagement, re-scan and see what moved:
