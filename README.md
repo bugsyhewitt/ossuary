@@ -55,6 +55,7 @@ calls, so tests run without nmap installed and without network access.)
 ossuary init         create the engagement DB and its tables
 ossuary discover     ping/host-discover targets -> assets table
 ossuary fingerprint  service/version detect known assets -> services table
+ossuary probe        HTTP/web-layer probe of web ports -> web_probes table
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary dump         export the full engagement state as JSON
@@ -133,6 +134,36 @@ Each finding's `source` column records where it came from (`osv.dev`, `nvd`, or
 `osv.dev+nvd`). Why both? Given NVD's enrichment retreat the OSV+CPE path is
 more reliable for non-federal CVEs, while NVD still enriches the CISA-KEV /
 critical-software tier promptly — cross-referencing covers both.
+
+### Matching web tech fingerprints (`--web`)
+
+`ossuary probe` records each web endpoint's `Server` banner in the `web_probes`
+table. Banners like `nginx/1.24.0`, `Apache/2.4.49 (Ubuntu)`, or `PHP/8.1.2`
+carry a product *and* a version that nmap's layer-4 service scan often misses —
+so they're a distinct CVE-matching surface. Pass `--web` to `match-cves` to
+additionally feed those versioned web fingerprints through the same OSV/NVD
+lookup as nmap service versions:
+
+```bash
+# 1. probe web ports first to populate web_probes
+ossuary probe --db engagement-acme.db
+
+# 2. match nmap services AND web banners against OSV
+ossuary match-cves --db engagement-acme.db --web
+#   matched 5 finding(s) -> engagement-acme.db
+#   matched 2 web finding(s) -> engagement-acme.db
+#   matched 7 finding(s) -> engagement-acme.db
+```
+
+Each `<product>/<version>` fragment in a `Server` banner is parsed (Apache is
+normalised to its CPE/NVD product name `http_server`); version-less banners and
+unrecognised products are ignored. Web-derived findings attach to the owning
+TCP service row, so they surface in `dump` and `cruise` exactly like nmap
+findings — no new table, no schema change. `--web` honours the same `--source`,
+`--nvd-api-key`, and `--enrich`/`--no-enrich` options as the default scan.
+
+Without `--web`, `match-cves` behaves exactly as before and never touches the
+`web_probes` table.
 
 ---
 

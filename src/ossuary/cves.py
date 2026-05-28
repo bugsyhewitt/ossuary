@@ -32,7 +32,7 @@ from pathlib import Path
 
 import httpx
 
-from . import db, enrich
+from . import db, enrich, probe
 
 OSV_QUERY_URL = "https://api.osv.dev/v1/query"
 NVD_QUERY_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -201,6 +201,153 @@ def _merge_findings(*sources: list[dict]) -> list[dict]:
                     if existing.get(field) is None and finding.get(field) is not None:
                         existing[field] = finding[field]
     return list(merged.values())
+
+
+def _query_sources(
+    *,
+    product: str | None,
+    version: str,
+    cpe: str | None,
+    use_osv: bool,
+    use_nvd: bool,
+    nvd_api_key: str | None,
+    nvd_sleep: float,
+) -> list[dict]:
+    """Query the selected source(s) for product@version and merge results.
+
+    Shared by both the nmap-service and web-probe matching paths so a CVE id is
+    resolved identically regardless of where the version came from.
+    """
+    osv_findings: list[dict] = []
+    nvd_findings: list[dict] = []
+    if use_osv and product:
+        osv_findings = parse_osv_response(query_osv(product, version))
+    if use_nvd:
+        nvd_findings = parse_nvd_response(query_nvd(cpe, product, api_key=nvd_api_key))
+        time.sleep(nvd_sleep)
+    return _merge_findings(osv_findings, nvd_findings)
+
+
+def _persist_findings(
+    conn,
+    *,
+    service_id: int,
+    findings: list[dict],
+    source_label: str,
+    enrich_findings: bool,
+    kev_state: dict,
+) -> int:
+    """Enrich (optionally) and upsert a list of findings against a service row.
+
+    ``kev_state`` is a tiny mutable cache ({"ids": set, "loaded": bool}) so the
+    KEV id set is fetched at most once across the whole match run. Returns the
+    number of findings written.
+    """
+    written = 0
+    for finding in findings:
+        epss_score: float | None = None
+        kev = 0
+        if enrich_findings:
+            if not kev_state["loaded"]:
+                kev_state["ids"] = enrich.get_kev_ids(conn)
+                kev_state["loaded"] = True
+            annotation = enrich.enrich_finding(conn, finding["cve_id"], kev_state["ids"])
+            epss_score = annotation["epss_score"]
+            kev = annotation["kev"]
+        db.upsert_finding(
+            conn,
+            service_id=service_id,
+            cve_id=finding["cve_id"],
+            summary=finding["summary"],
+            severity=finding["severity"],
+            source=source_label,
+            epss_score=epss_score,
+            kev=kev,
+        )
+        written += 1
+    return written
+
+
+def _resolve_service_id(conn, asset_id: int, port: int) -> int | None:
+    """Find the TCP service row a web probe belongs to (asset_id + port).
+
+    A web probe is only ever recorded for an asset:port that already carries a
+    TCP service row (``probe`` selects from the services table), so this should
+    normally resolve. Returns None if no matching service row exists, in which
+    case the web-probe findings are skipped rather than orphaned.
+    """
+    row = conn.execute(
+        "SELECT id FROM services WHERE asset_id = ? AND port = ? AND protocol = 'tcp'",
+        (asset_id, port),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def match_web_cves(
+    db_path: str | Path,
+    enrich_findings: bool = True,
+    source: str = "osv",
+    nvd_api_key: str | None = None,
+) -> int:
+    """Match versioned web-probe tech fingerprints against OSV.dev (and NVD).
+
+    The ``probe`` subcommand records each endpoint's ``Server`` banner in the
+    ``web_probes`` table. Banners like ``nginx/1.24.0`` or ``PHP/8.1.2`` carry a
+    product *and* a version that nmap's layer-4 service scan may have missed, so
+    they're a distinct CVE-matching surface. For each web probe we parse every
+    ``<product>/<version>`` banner fragment, query the selected source(s) for
+    each pair, and persist any findings against the owning TCP service row (so
+    they flow through ``dump`` and ``cruise`` like every other finding — no new
+    table, no schema change). Returns the number of finding rows written.
+
+    ``source``/``nvd_api_key``/``enrich_findings`` behave exactly as in
+    :func:`match_cves`.
+    """
+    if source not in ("osv", "nvd", "both"):
+        raise ValueError(f"unknown source {source!r}; expected osv, nvd, or both")
+    use_osv = source in ("osv", "both")
+    use_nvd = source in ("nvd", "both")
+    nvd_sleep = NVD_SLEEP_WITH_KEY if nvd_api_key else NVD_SLEEP_NO_KEY
+    source_label = {"osv": "osv.dev", "nvd": "nvd", "both": "osv.dev+nvd"}[source]
+
+    conn = db.require_initialised(db_path)
+    try:
+        probes = conn.execute(
+            "SELECT asset_id, port, server FROM web_probes "
+            "WHERE server IS NOT NULL AND server != ''"
+        ).fetchall()
+
+        kev_state: dict = {"ids": set(), "loaded": False}
+        total = 0
+        for wp in probes:
+            techs = probe.extract_versioned_techs(wp["server"])
+            if not techs:
+                continue
+            service_id = _resolve_service_id(conn, int(wp["asset_id"]), int(wp["port"]))
+            if service_id is None:
+                continue
+            for product, version in techs:
+                findings = _query_sources(
+                    product=product,
+                    version=version,
+                    cpe=None,  # web banners carry no CPE
+                    use_osv=use_osv,
+                    use_nvd=use_nvd,
+                    nvd_api_key=nvd_api_key,
+                    nvd_sleep=nvd_sleep,
+                )
+                total += _persist_findings(
+                    conn,
+                    service_id=service_id,
+                    findings=findings,
+                    source_label=source_label,
+                    enrich_findings=enrich_findings,
+                    kev_state=kev_state,
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    return total
 
 
 def match_cves(

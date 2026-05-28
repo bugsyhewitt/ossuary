@@ -192,6 +192,88 @@ def test_match_cves_source_both_queries_nvd(tmp_path, monkeypatch, capsys):
     assert nvd_calls == [None]
 
 
+def test_match_cves_web_flag_matches_web_probe_banner(tmp_path, monkeypatch, capsys):
+    """--web additionally matches versioned web_probes Server banners."""
+    import sqlite3
+
+    db_file = _seed_match_pipeline(tmp_path, monkeypatch)
+
+    # Add a web_probes row whose Server banner advertises a versioned product
+    # that nmap (port 80, version 1.18.0) did not surface.
+    conn = sqlite3.connect(db_file)
+    try:
+        aid = conn.execute("SELECT id FROM assets LIMIT 1").fetchone()[0]
+        conn.execute(
+            "INSERT INTO web_probes (asset_id, port, protocol, status_code, "
+            "server, tech_fingerprints) VALUES (?, 80, 'http', 200, "
+            "'Apache/2.4.49 (Ubuntu)', '[]')",
+            (aid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    web_queries: list[tuple[str, str]] = []
+
+    def fake_query_osv(product, version):
+        web_queries.append((product, version))
+        # nmap nginx path returns the known CVE; web Apache path returns its own.
+        if product == "http_server":
+            return osv_response(
+                [{"id": "GHSA-y", "aliases": ["CVE-2021-41773"], "summary": "trav",
+                  "severity": []}]
+            )
+        return osv_response(
+            [{"id": "GHSA-x", "aliases": ["CVE-2021-23017"], "summary": "x",
+              "severity": []}]
+        )
+
+    monkeypatch.setattr(cves, "query_osv", fake_query_osv)
+
+    capsys.readouterr()
+    rc = cli.main(["match-cves", "--db", db_file, "--no-enrich", "--web"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Both the nmap-service CVE and the web-banner CVE are reported.
+    assert "CVE-2021-23017" in out  # nmap nginx
+    assert "CVE-2021-41773" in out  # web Apache banner
+    assert "web finding" in out
+    assert ("http_server", "2.4.49") in web_queries
+
+
+def test_match_cves_without_web_flag_ignores_web_probes(tmp_path, monkeypatch, capsys):
+    """Default match-cves (no --web) must not query web_probes banners."""
+    import sqlite3
+
+    db_file = _seed_match_pipeline(tmp_path, monkeypatch)
+    conn = sqlite3.connect(db_file)
+    try:
+        aid = conn.execute("SELECT id FROM assets LIMIT 1").fetchone()[0]
+        conn.execute(
+            "INSERT INTO web_probes (asset_id, port, protocol, status_code, "
+            "server, tech_fingerprints) VALUES (?, 80, 'http', 200, "
+            "'Apache/2.4.49', '[]')",
+            (aid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    queried_products: list[str] = []
+    monkeypatch.setattr(
+        cves,
+        "query_osv",
+        lambda product, version: queried_products.append(product)
+        or osv_response([]),
+    )
+
+    capsys.readouterr()
+    rc = cli.main(["match-cves", "--db", db_file, "--no-enrich"])
+    assert rc == 0
+    # Only the nmap service product is queried; the Apache web banner is ignored.
+    assert "http_server" not in queried_products
+
+
 def test_cli_cruise_runs_and_exits_zero(tmp_path, monkeypatch, capsys):
     db_file = str(tmp_path / "engagement-test.db")
     monkeypatch.setattr(

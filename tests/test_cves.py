@@ -317,3 +317,172 @@ def test_match_cves_rejects_unknown_source(db_path):
         assert "bogus" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected ValueError for unknown source")
+
+
+# --------------------------------------------------------------------------
+# Web-probe tech-fingerprint CVE matching (match_web_cves)
+# --------------------------------------------------------------------------
+
+def _seed_web_probe(db_path, server, port=443, ip="10.10.0.5"):
+    """Init db, add an asset + its TCP service + a web_probes row, return ids."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, ip, None, "up")
+        sid = db.upsert_service(conn, aid, port, "tcp", "http", None, None, None)
+        conn.execute(
+            "INSERT INTO web_probes (asset_id, port, protocol, status_code, "
+            "server, tech_fingerprints) VALUES (?, ?, 'https', 200, ?, '[]')",
+            (aid, port, server),
+        )
+        conn.commit()
+        return aid, sid
+    finally:
+        conn.close()
+
+
+def test_match_web_cves_matches_versioned_server_banner(db_path, monkeypatch):
+    _aid, sid = _seed_web_probe(db_path, "nginx/1.24.0")
+
+    seen = {}
+
+    def fake_query(product, version):
+        seen["product"] = product
+        seen["version"] = version
+        return osv_response(
+            [
+                {
+                    "id": "GHSA-xxxx",
+                    "aliases": ["CVE-2024-7347"],
+                    "summary": "nginx mp4 module bug",
+                    "severity": [{"type": "CVSS_V3", "score": "5.7"}],
+                }
+            ]
+        )
+
+    monkeypatch.setattr(cves, "query_osv", fake_query)
+    count = cves.match_web_cves(db_path, enrich_findings=False)
+
+    assert count == 1
+    assert seen == {"product": "nginx", "version": "1.24.0"}
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT cve_id, service_id FROM findings").fetchone()
+    finally:
+        conn.close()
+    # The finding attaches to the owning TCP service row (no orphan, no new table).
+    assert row["cve_id"] == "CVE-2024-7347"
+    assert row["service_id"] == sid
+
+
+def test_match_web_cves_skips_versionless_banner(db_path, monkeypatch):
+    _seed_web_probe(db_path, "cloudflare")
+
+    called = False
+
+    def fake_query(product, version):  # pragma: no cover - must not run
+        nonlocal called
+        called = True
+        return osv_response([])
+
+    monkeypatch.setattr(cves, "query_osv", fake_query)
+    count = cves.match_web_cves(db_path, enrich_findings=False)
+    assert count == 0
+    assert called is False
+
+
+def test_match_web_cves_skips_unknown_product(db_path, monkeypatch):
+    _seed_web_probe(db_path, "SomeRandomServer/9.9.9")
+    monkeypatch.setattr(
+        cves,
+        "query_osv",
+        lambda p, v: (_ for _ in ()).throw(AssertionError("should not query")),
+    )
+    assert cves.match_web_cves(db_path, enrich_findings=False) == 0
+
+
+def test_match_web_cves_apache_uses_http_server_product(db_path, monkeypatch):
+    _seed_web_probe(db_path, "Apache/2.4.51 (Ubuntu)", port=80)
+    seen = {}
+
+    def fake_query(product, version):
+        seen["product"] = product
+        return osv_response([])
+
+    monkeypatch.setattr(cves, "query_osv", fake_query)
+    cves.match_web_cves(db_path, enrich_findings=False)
+    assert seen["product"] == "http_server"
+
+
+def test_match_web_cves_nvd_source(db_path, monkeypatch):
+    _seed_web_probe(db_path, "nginx/1.24.0")
+    monkeypatch.setattr(
+        cves,
+        "query_osv",
+        lambda p, v: (_ for _ in ()).throw(AssertionError("OSV should not run")),
+    )
+
+    def fake_query_nvd(cpe, product, api_key=None):
+        # Web banners carry no CPE; NVD must be queried by keywordSearch.
+        assert cpe is None
+        assert product == "nginx"
+        return nvd_response(
+            [{"id": "CVE-2024-7347", "summary": "nginx bug", "base_score": 5.7}]
+        )
+
+    monkeypatch.setattr(cves, "query_nvd", fake_query_nvd)
+    monkeypatch.setattr(cves.time, "sleep", lambda _s: None)
+
+    count = cves.match_web_cves(db_path, enrich_findings=False, source="nvd")
+    assert count == 1
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT cve_id, source FROM findings").fetchone()
+    finally:
+        conn.close()
+    assert row["cve_id"] == "CVE-2024-7347"
+    assert row["source"] == "nvd"
+
+
+def test_match_web_cves_rejects_unknown_source(db_path):
+    _seed_web_probe(db_path, "nginx/1.24.0")
+    try:
+        cves.match_web_cves(db_path, source="bogus")
+    except ValueError as exc:
+        assert "bogus" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ValueError for unknown source")
+
+
+def test_match_web_cves_no_probes_returns_zero(db_path, monkeypatch):
+    db.init_db(db_path).close()
+    monkeypatch.setattr(
+        cves,
+        "query_osv",
+        lambda p, v: (_ for _ in ()).throw(AssertionError("should not query")),
+    )
+    assert cves.match_web_cves(db_path, enrich_findings=False) == 0
+
+
+def test_match_web_cves_findings_surface_in_dump(db_path, monkeypatch):
+    """A web-derived finding flows through dump like any service finding."""
+    from ossuary import dump as dump_mod
+
+    _seed_web_probe(db_path, "nginx/1.24.0", port=443)
+    monkeypatch.setattr(
+        cves,
+        "query_osv",
+        lambda p, v: osv_response(
+            [{"id": "x", "aliases": ["CVE-2024-7347"], "summary": "bug"}]
+        ),
+    )
+    cves.match_web_cves(db_path, enrich_findings=False)
+
+    import json as _json
+
+    state = _json.loads(dump_mod.dump(db_path))
+    findings = state["assets"][0]["services"][0]["findings"]
+    assert any(f["cve_id"] == "CVE-2024-7347" for f in findings)

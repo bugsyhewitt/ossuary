@@ -142,6 +142,74 @@ def _extract_title(html: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Versioned tech extraction (for CVE matching)
+# ---------------------------------------------------------------------------
+
+# Maps the lowercased product token a server / x-powered-by banner uses to the
+# OSV/NVD-friendly product identifier ossuary should query CVEs against. Keys
+# are matched case-insensitively against the leading token of a "name/version"
+# banner fragment (e.g. "Apache/2.4.51" -> token "apache").
+_BANNER_PRODUCT_MAP = {
+    "nginx": "nginx",
+    "apache": "http_server",   # NVD/CPE call Apache httpd "http_server"
+    "openssl": "openssl",
+    "php": "php",
+    "iis": "iis",
+    "microsoft-iis": "iis",
+    "lighttpd": "lighttpd",
+    "caddy": "caddy",
+    "tomcat": "tomcat",
+    "jetty": "jetty",
+    "express": "express",
+    "werkzeug": "werkzeug",
+    "gunicorn": "gunicorn",
+    "node.js": "node.js",
+    "nodejs": "node.js",
+}
+
+# A "<product>/<version>" banner fragment, e.g. "nginx/1.24.0" or "PHP/8.1.2".
+# Version must start with a digit; we keep dotted numerics and trailing build
+# tags up to the first whitespace / parenthesis.
+_BANNER_FRAGMENT = re.compile(
+    r"(?P<product>[A-Za-z][A-Za-z0-9._+-]*)/(?P<version>\d[\w.+-]*)"
+)
+
+
+def extract_versioned_techs(*banners: str | None) -> list[tuple[str, str]]:
+    """Parse ``(product, version)`` pairs from HTTP banner header values.
+
+    Accepts one or more banner strings (typically the ``Server`` and
+    ``X-Powered-By`` header values). Each ``<name>/<version>`` fragment whose
+    name maps to a known product in :data:`_BANNER_PRODUCT_MAP` yields a
+    ``(osv_product, version)`` tuple. Unknown names and version-less banners are
+    ignored. Duplicate pairs are collapsed; first-seen order is preserved.
+
+    Examples::
+
+        extract_versioned_techs("nginx/1.24.0")            -> [("nginx", "1.24.0")]
+        extract_versioned_techs("Apache/2.4.51 (Ubuntu)")  -> [("http_server", "2.4.51")]
+        extract_versioned_techs("PHP/8.1.2")               -> [("php", "8.1.2")]
+        extract_versioned_techs("nginx")                   -> []   (no version)
+    """
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for banner in banners:
+        if not banner:
+            continue
+        for m in _BANNER_FRAGMENT.finditer(banner):
+            token = m.group("product").lower()
+            product = _BANNER_PRODUCT_MAP.get(token)
+            if not product:
+                continue
+            version = m.group("version")
+            pair = (product, version)
+            if pair not in seen:
+                seen.add(pair)
+                pairs.append(pair)
+    return pairs
+
+
+# ---------------------------------------------------------------------------
 # HTTP probe (network seam)
 # ---------------------------------------------------------------------------
 
