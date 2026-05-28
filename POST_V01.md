@@ -168,7 +168,13 @@ can be pasted into a HackerOne or Bugcrowd submission is the last-mile piece.
 
 ---
 
-## Rank 7 — Scan profile presets (`--profile stealth | aggressive | web`)
+## Rank 7 — Scan profile presets (`--profile stealth | aggressive | web`)  ✅ IMPLEMENTED
+
+> Shipped: `ossuary.profiles` module + `--profile NAME` flag on `discover`,
+> `fingerprint`, and `cruise`; new `ossuary profiles` listing command; the
+> chosen profile is recorded in new `assets.scan_profile` / `services.scan_profile`
+> columns (additive migration, defaults to `default`), and `cruise` reports a
+> `profile_changes` section flagging services re-scanned under a different profile.
 
 **What:** Named nmap argument profiles so hunters don't need to remember flags:
 

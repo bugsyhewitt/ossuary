@@ -16,6 +16,7 @@ from pathlib import Path
 from nmap_wrapper import parse_scan_result, raw_scan
 
 from . import db
+from .profiles import DEFAULT_PROFILE, get_profile
 
 
 def read_targets(targets_path: str | Path) -> list[str]:
@@ -33,15 +34,17 @@ def read_targets(targets_path: str | Path) -> list[str]:
     return targets
 
 
-def scan_hosts(targets: list[str]) -> dict:
+def scan_hosts(targets: list[str], arguments: str = "-sn") -> dict:
     """Run an nmap host-discovery (ping) scan over the targets.
 
     Returns the raw python-nmap scan result dict. This is the network seam —
     tests monkeypatch this function so no live scan is performed. The actual
     shell-out is delegated to the shared ``nmap-wrapper`` library.
+
+    `arguments` is the nmap flag string. It defaults to ``-sn`` (ping scan, no
+    port scan — discovery only) but a named scan profile can override it.
     """
-    # -sn: ping scan, no port scan. Discovery only; fingerprinting is separate.
-    return raw_scan(" ".join(targets), arguments="-sn")
+    return raw_scan(" ".join(targets), arguments=arguments)
 
 
 def parse_hosts(scan_result: dict) -> list[dict]:
@@ -58,21 +61,36 @@ def parse_hosts(scan_result: dict) -> list[dict]:
     ]
 
 
-def discover(db_path: str | Path, targets_path: str | Path) -> int:
+def discover(
+    db_path: str | Path,
+    targets_path: str | Path,
+    profile: str = DEFAULT_PROFILE,
+) -> int:
     """Discover hosts and populate the `assets` table.
+
+    `profile` selects a named scan profile (see ossuary.profiles) whose
+    `discover` flags drive the nmap scan; the profile name is recorded on each
+    asset row so a later rediscovery under a different profile can be flagged.
 
     Returns the number of live assets persisted.
     """
+    prof = get_profile(profile)
     targets = read_targets(targets_path)
     if not targets:
         return 0
-    scan_result = scan_hosts(targets)
+    scan_result = scan_hosts(targets, arguments=prof.discover)
     hosts = parse_hosts(scan_result)
 
     conn = db.require_initialised(db_path)
     try:
         for host in hosts:
-            db.upsert_asset(conn, host["ip"], host["hostname"], host["state"])
+            db.upsert_asset(
+                conn,
+                host["ip"],
+                host["hostname"],
+                host["state"],
+                scan_profile=prof.name,
+            )
         conn.commit()
     finally:
         conn.close()

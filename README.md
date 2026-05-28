@@ -61,6 +61,7 @@ ossuary cruise       re-fingerprint, diff against last saved state, report chang
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
 ossuary dump         export the full engagement state as JSON, CSV, or Markdown
 ossuary tag          attach / list / remove labels on assets for grouping & filtering
+ossuary profiles     list the named scan profiles and their nmap flags
 ```
 
 Run `ossuary <command> --help` for per-command flags.
@@ -217,6 +218,45 @@ migration; the CLI surfaces the dominant asset workflow today.
 
 ---
 
+### Scan profiles (`--profile`)
+
+Solo hunters keep reconstructing nmap flag combinations from memory. ossuary
+ships named **scan profiles** — tested flag presets behind a memorable name —
+so repeatable scans are trivial. List them with:
+
+```bash
+ossuary profiles
+```
+
+| Profile      | discover flags  | fingerprint flags                  | when to use |
+|--------------|-----------------|------------------------------------|-------------|
+| `default`    | `-sn`           | `-sV`                              | ossuary's original behaviour |
+| `stealth`    | `-sn -T2 -Pn`   | `-sS -sV -T2 -Pn`                  | slow & quiet, evades basic IDS |
+| `aggressive` | `-sn -T4`       | `-sV -O -T4 --script=banner`       | loud & thorough: OS + banners |
+| `web`        | `-sn`           | `-sV -p 80,443,8080,8443,8888 -T3` | web-port-focused recon |
+
+`discover`, `fingerprint`, and `cruise` all accept `--profile NAME` (default:
+`default`, which reproduces the pre-profile flags exactly):
+
+```bash
+ossuary discover    --db engagement-acme.db --targets targets.txt --profile stealth
+ossuary fingerprint --db engagement-acme.db --profile web
+```
+
+The chosen profile is recorded on each `assets.scan_profile` and
+`services.scan_profile` row. Because the profile travels with the data, `cruise`
+gains a `profile_changes` section: when a service is re-scanned under a different
+profile than it was last fingerprinted with, the diff flags the mismatch
+(`{"service": ..., "from": "default", "to": "web"}`). This is an audit aid — you
+always know which flag set produced which row, and whether a re-scan changed the
+methodology under your feet.
+
+Profiles are additive: two `scan_profile TEXT` columns (defaulting to
+`'default'`) migrated onto `assets` and `services`. Engagement DBs created before
+profiles gain the columns automatically on the next command, with no data loss.
+
+---
+
 ## Database schema
 
 Four tables, one engagement file:
@@ -229,6 +269,7 @@ Four tables, one engagement file:
 │ ip           UNIQUE      │
 │ hostname                 │
 │ state        (up/down)   │
+│ scan_profile (preset)    │  named scan profile that discovered this host
 │ discovered_at            │
 └────────────┬─────────────┘
              │ 1
@@ -243,6 +284,7 @@ Four tables, one engagement file:
 │ protocol     (tcp/udp)   │
 │ name / product / version │
 │ cpe                      │
+│ scan_profile (preset)    │  named scan profile that fingerprinted this service
 │ fingerprinted_at         │
 └────────────┬─────────────┘
              │ 1

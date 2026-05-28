@@ -39,7 +39,7 @@ def test_parse_services_returns_open_ports_with_versions():
 def test_fingerprint_populates_services_with_version_metadata(db_path, monkeypatch):
     _seed_assets(db_path, ["10.10.0.5"])
 
-    def fake_scan_services(ip):
+    def fake_scan_services(ip, arguments="-sV"):
         return service_scan_result(
             ip,
             [
@@ -72,7 +72,7 @@ def test_fingerprint_does_not_duplicate_unchanged_service(db_path, monkeypatch):
     monkeypatch.setattr(
         fingerprint,
         "scan_services",
-        lambda ip: service_scan_result(
+        lambda ip, arguments="-sV": service_scan_result(
             ip, [{"port": 22, "name": "ssh", "product": "OpenSSH", "version": "8.9p1"}]
         ),
     )
@@ -101,7 +101,9 @@ def test_fingerprint_drops_services_that_disappear(db_path, monkeypatch):
             ],
         )
     }
-    monkeypatch.setattr(fingerprint, "scan_services", lambda ip: state["value"])
+    monkeypatch.setattr(
+        fingerprint, "scan_services", lambda ip, arguments="-sV": state["value"]
+    )
     fingerprint.fingerprint(db_path)
 
     # second scan: port 22 gone

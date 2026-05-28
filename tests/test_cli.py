@@ -54,12 +54,14 @@ def test_full_pipeline_offline(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         discover,
         "scan_hosts",
-        lambda targets: host_discovery_result(up_ips=["10.10.0.5", "10.10.0.6"]),
+        lambda targets, arguments="-sn": host_discovery_result(
+            up_ips=["10.10.0.5", "10.10.0.6"]
+        ),
     )
     monkeypatch.setattr(
         fingerprint,
         "scan_services",
-        lambda ip: service_scan_result(
+        lambda ip, arguments="-sV": service_scan_result(
             ip, [{"port": 80, "name": "http", "product": "nginx", "version": "1.18.0"}]
         ),
     )
@@ -101,12 +103,12 @@ def _seed_match_pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(
         discover,
         "scan_hosts",
-        lambda targets: host_discovery_result(up_ips=["10.10.0.5"]),
+        lambda targets, arguments="-sn": host_discovery_result(up_ips=["10.10.0.5"]),
     )
     monkeypatch.setattr(
         fingerprint,
         "scan_services",
-        lambda ip: service_scan_result(
+        lambda ip, arguments="-sV": service_scan_result(
             ip, [{"port": 80, "name": "http", "product": "nginx", "version": "1.18.0"}]
         ),
     )
@@ -280,7 +282,7 @@ def _seed_one_asset_db(tmp_path, monkeypatch):
     monkeypatch.setattr(
         discover,
         "scan_hosts",
-        lambda targets: host_discovery_result(up_ips=["10.10.0.5"]),
+        lambda targets, arguments="-sn": host_discovery_result(up_ips=["10.10.0.5"]),
     )
     cli.main(["init", "--db", db_file])
     cli.main(["discover", "--db", db_file, "--targets", str(TARGETS_FILE)])
@@ -353,12 +355,12 @@ def test_cli_cruise_reports_tag_changes(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         discover,
         "scan_hosts",
-        lambda targets: host_discovery_result(up_ips=["10.10.0.5"]),
+        lambda targets, arguments="-sn": host_discovery_result(up_ips=["10.10.0.5"]),
     )
     monkeypatch.setattr(
         fingerprint,
         "scan_services",
-        lambda ip: service_scan_result(
+        lambda ip, arguments="-sV": service_scan_result(
             ip, [{"port": 22, "name": "ssh", "product": "OpenSSH", "version": "8.9p1"}]
         ),
     )
@@ -385,12 +387,12 @@ def test_cli_cruise_runs_and_exits_zero(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         discover,
         "scan_hosts",
-        lambda targets: host_discovery_result(up_ips=["10.10.0.5"]),
+        lambda targets, arguments="-sn": host_discovery_result(up_ips=["10.10.0.5"]),
     )
     monkeypatch.setattr(
         fingerprint,
         "scan_services",
-        lambda ip: service_scan_result(
+        lambda ip, arguments="-sV": service_scan_result(
             ip, [{"port": 22, "name": "ssh", "product": "OpenSSH", "version": "8.9p1"}]
         ),
     )

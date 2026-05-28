@@ -15,17 +15,20 @@ from nmap_wrapper import parse_services as _wrapper_parse_services
 from nmap_wrapper import raw_scan
 
 from . import db
+from .profiles import DEFAULT_PROFILE, get_profile
 
 
-def scan_services(ip: str) -> dict:
+def scan_services(ip: str, arguments: str = "-sV") -> dict:
     """Run an nmap service/version-detection scan against a single host.
 
     Returns the raw python-nmap scan result dict. Network seam — mocked in
     tests so no live scan runs. The shell-out is delegated to the shared
     ``nmap-wrapper`` library.
+
+    `arguments` is the nmap flag string. It defaults to ``-sV`` (probe open
+    ports for service/version info) but a named scan profile can override it.
     """
-    # -sV: probe open ports to determine service/version info.
-    return raw_scan(ip, arguments="-sV")
+    return raw_scan(ip, arguments=arguments)
 
 
 def parse_services(ip: str, scan_result: dict) -> list[dict]:
@@ -50,17 +53,23 @@ def parse_services(ip: str, scan_result: dict) -> list[dict]:
     ]
 
 
-def fingerprint(db_path: str | Path) -> int:
+def fingerprint(db_path: str | Path, profile: str = DEFAULT_PROFILE) -> int:
     """Fingerprint every known asset, populating the `services` table.
+
+    `profile` selects a named scan profile (see ossuary.profiles) whose
+    `fingerprint` flags drive the nmap scan; the profile name is recorded on
+    each service row so cruise can flag a service re-fingerprinted under a
+    different profile than before.
 
     Returns the number of service rows written/updated across all assets.
     """
+    prof = get_profile(profile)
     conn = db.require_initialised(db_path)
     try:
         assets = conn.execute("SELECT id, ip FROM assets WHERE state = 'up'").fetchall()
         total = 0
         for asset in assets:
-            scan_result = scan_services(asset["ip"])
+            scan_result = scan_services(asset["ip"], arguments=prof.fingerprint)
             # [Worker decision: fingerprint reflects the *current* live state of
             # an asset, not an append-only union. We delete this asset's prior
             # services before re-inserting so a port that closed between scans
@@ -79,6 +88,7 @@ def fingerprint(db_path: str | Path) -> int:
                     product=svc["product"],
                     version=svc["version"],
                     cpe=svc["cpe"],
+                    scan_profile=prof.name,
                 )
                 total += 1
         conn.commit()
