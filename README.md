@@ -60,6 +60,7 @@ ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
 ossuary dump         export engagement state as JSON/CSV/Markdown (filterable by KEV/EPSS/severity)
+ossuary stats        print an at-a-glance engagement summary (counts + top hits)
 ossuary tag          attach / list / remove labels on assets for grouping & filtering
 ossuary profiles     list the named scan profiles and their nmap flags
 ```
@@ -455,6 +456,56 @@ of their tier rather than being dropped (use the filters above to drop them).
 The flag applies identically to `json`, `csv`, and `markdown`, and composes with
 `--tag` and the actionability filters. Without it, ordering is the historical
 alphabetical-by-CVE-id, byte-for-byte unchanged.
+
+### Engagement summary (`ossuary stats`)
+
+`dump` emits the full per-finding inventory; `stats` gives the top-of-funnel
+view — a single at-a-glance triage snapshot answering "how big is this
+engagement and where's the live risk?" without scrolling a 500-row dump. It is
+computed from the same `assets` / `services` / `findings` data, so the numbers
+always agree with `dump`. No network calls, no schema change.
+
+```bash
+ossuary stats --db engagement-acme.db
+```
+
+```
+engagement summary
+  assets:   1
+  services: 1
+  findings: 2
+  KEV (actively exploited): 1
+  EPSS tiers:
+    high (>=0.50):   1
+    medium (>=0.10): 0
+    low (<0.10):     1
+    unscored:        0
+  severity tiers:
+    critical (>=9.0): 1
+    high (>=7.0):     0
+    medium (>=4.0):   0
+    low (<4.0):       1
+    blank:            0
+  top 2 finding(s) by priority:
+    CVE-HOT  severity: 9.8  EPSS: 0.94 | KEV: YES
+    CVE-COLD  severity: 3.1  EPSS: 0.02 | KEV: no
+```
+
+The breakdowns use the live prioritisation signal restored by `match-cves`
+enrichment: **KEV** (CISA Known Exploited Vulnerabilities — confirmed
+exploited), **EPSS** tiers (exploit probability), and numeric-**severity**
+(CVSS) tiers, with un-enriched findings counted in their `unscored` / `blank`
+buckets. The `top findings` list is ordered KEV-first / descending-EPSS /
+descending-severity / CVE-id — the same triage order `dump --sort-by-priority`
+and `match-cves` use.
+
+```bash
+# the same numbers as JSON, for piping into other tools
+ossuary stats --db engagement-acme.db --format json
+
+# show the top 20 hits (or 0 to omit the list entirely)
+ossuary stats --db engagement-acme.db --top 20
+```
 
 ### Cruise mode
 
