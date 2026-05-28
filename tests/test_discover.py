@@ -25,7 +25,7 @@ def test_discover_populates_assets_table(db_path, monkeypatch):
     db.init_db(db_path).close()
 
     # Mock the network seam: two of three targets are up.
-    def fake_scan_hosts(targets):
+    def fake_scan_hosts(targets, arguments="-sn"):
         assert targets == ["10.10.0.5", "10.10.0.6", "10.10.0.7"]
         return host_discovery_result(
             up_ips=["10.10.0.5", "10.10.0.6"], down_ips=["10.10.0.7"]
@@ -46,7 +46,9 @@ def test_discover_populates_assets_table(db_path, monkeypatch):
 
 
 def test_discover_requires_initialised_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(discover, "scan_hosts", lambda t: host_discovery_result(["10.10.0.5"]))
+    monkeypatch.setattr(
+        discover, "scan_hosts", lambda t, arguments="-sn": host_discovery_result(["10.10.0.5"])
+    )
     import pytest
 
     with pytest.raises(RuntimeError, match="not initialised"):

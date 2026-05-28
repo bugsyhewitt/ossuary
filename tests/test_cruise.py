@@ -50,7 +50,7 @@ def test_first_cruise_treats_everything_as_added(db_path, monkeypatch):
     monkeypatch.setattr(
         fingerprint,
         "scan_services",
-        lambda ip: service_scan_result(
+        lambda ip, arguments="-sV": service_scan_result(
             ip, [{"port": 22, "name": "ssh", "product": "OpenSSH", "version": "8.9p1"}]
         ),
     )
@@ -89,7 +89,9 @@ def test_second_cruise_diffs_against_first(db_path, monkeypatch):
     )
 
     state = {"value": snapshot_one}
-    monkeypatch.setattr(fingerprint, "scan_services", lambda ip: state["value"])
+    monkeypatch.setattr(
+        fingerprint, "scan_services", lambda ip, arguments="-sV": state["value"]
+    )
 
     first = cruise.cruise(db_path)
     assert len(first["added"]) == 2  # initial baseline

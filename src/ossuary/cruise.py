@@ -16,6 +16,7 @@ import sqlite3
 from pathlib import Path
 
 from . import db, fingerprint, tags
+from .profiles import DEFAULT_PROFILE
 
 
 def snapshot_services(conn: sqlite3.Connection) -> dict[str, dict]:
@@ -28,7 +29,8 @@ def snapshot_services(conn: sqlite3.Connection) -> dict[str, dict]:
     rows = conn.execute(
         """
         SELECT a.ip AS ip, s.port AS port, s.protocol AS protocol,
-               s.name AS name, s.product AS product, s.version AS version
+               s.name AS name, s.product AS product, s.version AS version,
+               s.scan_profile AS scan_profile
         FROM services s
         JOIN assets a ON a.id = s.asset_id
         ORDER BY a.ip, s.port
@@ -41,6 +43,7 @@ def snapshot_services(conn: sqlite3.Connection) -> dict[str, dict]:
             "name": r["name"],
             "product": r["product"],
             "version": r["version"],
+            "scan_profile": r["scan_profile"],
         }
     return snapshot
 
@@ -59,16 +62,27 @@ def diff_snapshots(previous: dict[str, dict], current: dict[str, dict]) -> dict:
     removed = sorted(prev_keys - cur_keys)
 
     changed: list[dict] = []
+    profile_changes: list[dict] = []
     for key in sorted(prev_keys & cur_keys):
         if previous[key] != current[key]:
             changed.append(
                 {"service": key, "from": previous[key], "to": current[key]}
+            )
+        # Independently flag a scan-profile mismatch — a service re-scanned under
+        # a different named profile than last time. Older snapshots predate the
+        # column; treat a missing profile as the implicit "default".
+        prev_profile = previous[key].get("scan_profile", DEFAULT_PROFILE)
+        cur_profile = current[key].get("scan_profile", DEFAULT_PROFILE)
+        if prev_profile != cur_profile:
+            profile_changes.append(
+                {"service": key, "from": prev_profile, "to": cur_profile}
             )
 
     return {
         "added": [{"service": k, "detail": current[k]} for k in added],
         "removed": [{"service": k, "detail": previous[k]} for k in removed],
         "changed": changed,
+        "profile_changes": profile_changes,
     }
 
 
@@ -137,8 +151,12 @@ def save_snapshot(
     )
 
 
-def cruise(db_path: str | Path) -> dict:
+def cruise(db_path: str | Path, profile: str = DEFAULT_PROFILE) -> dict:
     """Run one cruise iteration: re-fingerprint, snapshot, diff, persist.
+
+    `profile` selects the named scan profile used for the re-fingerprint; when
+    it differs from the profile that produced the prior services, the resulting
+    diff's `profile_changes` section flags the affected services.
 
     Returns the diff dict. The previous snapshot is whatever was last saved in
     `cruise_runs`; if this is the first cruise, the diff treats every current
@@ -146,7 +164,7 @@ def cruise(db_path: str | Path) -> dict:
     """
     # Re-fingerprint first so the snapshot reflects the live state. The nmap
     # seam inside fingerprint is what tests mock to simulate state changes.
-    fingerprint.fingerprint(db_path)
+    fingerprint.fingerprint(db_path, profile=profile)
 
     conn = db.require_initialised(db_path)
     try:

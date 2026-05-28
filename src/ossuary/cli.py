@@ -9,6 +9,10 @@ Subcommands (v0.1):
     cruise       re-fingerprint, diff against last state, report changes
     watch        run cruise on an interval, emitting a diff summary each pass
     dump         export full engagement state as JSON, CSV, or Markdown
+    profiles     list the named scan profiles (stealth/aggressive/web/default)
+
+Discover, fingerprint, and cruise accept a `--profile NAME` flag selecting a
+named nmap flag preset; the chosen profile is recorded on each asset/service row.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ import sys
 
 from . import __version__, cruise as cruise_mod, cves, db, discover as discover_mod
 from . import dump as dump_mod, fingerprint as fingerprint_mod, probe as probe_mod
-from . import tags as tags_mod, watch as watch_mod
+from . import profiles as profiles_mod, tags as tags_mod, watch as watch_mod
 
 
 def _add_db_arg(parser: argparse.ArgumentParser) -> None:
@@ -28,6 +32,20 @@ def _add_db_arg(parser: argparse.ArgumentParser) -> None:
         required=True,
         metavar="PATH",
         help="path to the engagement SQLite database file",
+    )
+
+
+def _add_profile_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--profile",
+        default=profiles_mod.DEFAULT_PROFILE,
+        choices=profiles_mod.profile_names(),
+        metavar="NAME",
+        help=(
+            "named nmap flag preset to scan with (see `ossuary profiles`): "
+            + ", ".join(profiles_mod.profile_names())
+            + f" (default: {profiles_mod.DEFAULT_PROFILE})"
+        ),
     )
 
 
@@ -53,9 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="path to a targets file (one IP/CIDR/hostname per line)",
     )
+    _add_profile_arg(p_discover)
 
     p_fp = sub.add_parser("fingerprint", help="service/version detect known assets")
     _add_db_arg(p_fp)
+    _add_profile_arg(p_fp)
 
     p_match = sub.add_parser(
         "match-cves", help="query OSV.dev (and optionally NVD) for service versions"
@@ -104,6 +124,11 @@ def build_parser() -> argparse.ArgumentParser:
         "cruise", help="re-fingerprint and diff against last saved state"
     )
     _add_db_arg(p_cruise)
+    _add_profile_arg(p_cruise)
+
+    sub.add_parser(
+        "profiles", help="list the available named scan profiles and their nmap flags"
+    )
 
     p_watch = sub.add_parser(
         "watch",
@@ -249,14 +274,14 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_discover(args: argparse.Namespace) -> int:
-    count = discover_mod.discover(args.db, args.targets)
-    print(f"discovered {count} live asset(s) -> {args.db}")
+    count = discover_mod.discover(args.db, args.targets, profile=args.profile)
+    print(f"discovered {count} live asset(s) [profile: {args.profile}] -> {args.db}")
     return 0
 
 
 def _cmd_fingerprint(args: argparse.Namespace) -> int:
-    count = fingerprint_mod.fingerprint(args.db)
-    print(f"fingerprinted {count} service(s) -> {args.db}")
+    count = fingerprint_mod.fingerprint(args.db, profile=args.profile)
+    print(f"fingerprinted {count} service(s) [profile: {args.profile}] -> {args.db}")
     return 0
 
 
@@ -309,16 +334,27 @@ def _cmd_match_cves(args: argparse.Namespace) -> int:
 
 
 def _cmd_cruise(args: argparse.Namespace) -> int:
-    diff = cruise_mod.cruise(args.db)
+    diff = cruise_mod.cruise(args.db, profile=args.profile)
     n_added = len(diff["added"])
     n_removed = len(diff["removed"])
     n_changed = len(diff["changed"])
     n_tags = len(diff.get("tag_changes", []))
+    n_profile = len(diff.get("profile_changes", []))
     print(
         f"cruise diff: {n_added} added, {n_removed} removed, "
-        f"{n_changed} changed, {n_tags} tag change(s)"
+        f"{n_changed} changed, {n_tags} tag change(s), "
+        f"{n_profile} profile change(s)"
     )
     print(json.dumps(diff, indent=2))
+    return 0
+
+
+def _cmd_profiles(args: argparse.Namespace) -> int:
+    for prof in profiles_mod.list_profiles():
+        print(f"{prof.name}")
+        print(f"  {prof.description}")
+        print(f"  discover:    nmap {prof.discover}")
+        print(f"  fingerprint: nmap {prof.fingerprint}")
     return 0
 
 
@@ -409,6 +445,7 @@ _DISPATCH = {
     "dump": _cmd_dump,
     "probe": _cmd_probe,
     "tag": _cmd_tag,
+    "profiles": _cmd_profiles,
 }
 
 

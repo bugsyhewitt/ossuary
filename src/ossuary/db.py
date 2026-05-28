@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS assets (
     ip          TEXT    NOT NULL UNIQUE,
     hostname    TEXT,
     state       TEXT    NOT NULL DEFAULT 'up',
+    scan_profile TEXT   NOT NULL DEFAULT 'default',
     discovered_at TEXT  NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS services (
     product     TEXT,
     version     TEXT,
     cpe         TEXT,
+    scan_profile TEXT   NOT NULL DEFAULT 'default',
     fingerprinted_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(asset_id, port, protocol)
 );
@@ -108,6 +110,21 @@ _CRUISE_RUNS_MIGRATIONS = (
     ("tag_snapshot", "ALTER TABLE cruise_runs ADD COLUMN tag_snapshot TEXT"),
 )
 
+# Columns added to `assets` after v0.1. `scan_profile` records the named scan
+# profile (see ossuary.profiles) that produced the row, so an asset rediscovered
+# under a different profile can be flagged. Defaults to 'default' for rows that
+# predate the column.
+_ASSETS_MIGRATIONS = (
+    ("scan_profile", "ALTER TABLE assets ADD COLUMN scan_profile TEXT NOT NULL DEFAULT 'default'"),
+)
+
+# Columns added to `services` after v0.1. `scan_profile` records which named
+# profile fingerprinted the service, letting cruise flag profile mismatches when
+# a service is re-fingerprinted under a different profile than before.
+_SERVICES_MIGRATIONS = (
+    ("scan_profile", "ALTER TABLE services ADD COLUMN scan_profile TEXT NOT NULL DEFAULT 'default'"),
+)
+
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
     """Return the set of column names on a table."""
@@ -122,16 +139,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     predate the enrichment columns we ALTER them in, guarded by a column check.
     """
     names = table_names(conn)
-    if "findings" in names:
-        existing = _column_names(conn, "findings")
-        for name, ddl in _FINDINGS_MIGRATIONS:
-            if name not in existing:
-                conn.execute(ddl)
-    if "cruise_runs" in names:
-        existing = _column_names(conn, "cruise_runs")
-        for name, ddl in _CRUISE_RUNS_MIGRATIONS:
-            if name not in existing:
-                conn.execute(ddl)
+    for table, migrations in (
+        ("findings", _FINDINGS_MIGRATIONS),
+        ("cruise_runs", _CRUISE_RUNS_MIGRATIONS),
+        ("assets", _ASSETS_MIGRATIONS),
+        ("services", _SERVICES_MIGRATIONS),
+    ):
+        if table in names:
+            existing = _column_names(conn, table)
+            for name, ddl in migrations:
+                if name not in existing:
+                    conn.execute(ddl)
     conn.commit()
 
 
@@ -191,16 +209,28 @@ def require_initialised(db_path: str | Path) -> sqlite3.Connection:
     return connect(db_path)
 
 
-def upsert_asset(conn: sqlite3.Connection, ip: str, hostname: str | None, state: str) -> int:
-    """Insert or update an asset by IP, returning its row id."""
+def upsert_asset(
+    conn: sqlite3.Connection,
+    ip: str,
+    hostname: str | None,
+    state: str,
+    scan_profile: str = "default",
+) -> int:
+    """Insert or update an asset by IP, returning its row id.
+
+    `scan_profile` records the named scan profile (see ossuary.profiles) that
+    discovered the asset; it defaults to "default" so callers that don't pass a
+    profile preserve the historical behaviour.
+    """
     conn.execute(
         """
-        INSERT INTO assets (ip, hostname, state) VALUES (?, ?, ?)
+        INSERT INTO assets (ip, hostname, state, scan_profile) VALUES (?, ?, ?, ?)
         ON CONFLICT(ip) DO UPDATE SET
-            hostname = excluded.hostname,
-            state    = excluded.state
+            hostname     = excluded.hostname,
+            state        = excluded.state,
+            scan_profile = excluded.scan_profile
         """,
-        (ip, hostname, state),
+        (ip, hostname, state, scan_profile),
     )
     row = conn.execute("SELECT id FROM assets WHERE ip = ?", (ip,)).fetchone()
     return int(row["id"])
@@ -215,20 +245,28 @@ def upsert_service(
     product: str | None,
     version: str | None,
     cpe: str | None,
+    scan_profile: str = "default",
 ) -> int:
-    """Insert or update a service by (asset_id, port, protocol)."""
+    """Insert or update a service by (asset_id, port, protocol).
+
+    `scan_profile` records which named profile (see ossuary.profiles)
+    fingerprinted the service; it defaults to "default" so existing callers are
+    unaffected.
+    """
     conn.execute(
         """
-        INSERT INTO services (asset_id, port, protocol, name, product, version, cpe)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO services
+            (asset_id, port, protocol, name, product, version, cpe, scan_profile)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(asset_id, port, protocol) DO UPDATE SET
-            name    = excluded.name,
-            product = excluded.product,
-            version = excluded.version,
-            cpe     = excluded.cpe,
+            name         = excluded.name,
+            product      = excluded.product,
+            version      = excluded.version,
+            cpe          = excluded.cpe,
+            scan_profile = excluded.scan_profile,
             fingerprinted_at = datetime('now')
         """,
-        (asset_id, port, protocol, name, product, version, cpe),
+        (asset_id, port, protocol, name, product, version, cpe, scan_profile),
     )
     row = conn.execute(
         "SELECT id FROM services WHERE asset_id = ? AND port = ? AND protocol = ?",
