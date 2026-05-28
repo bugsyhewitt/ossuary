@@ -15,7 +15,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from . import db, fingerprint
+from . import db, fingerprint, tags
 
 
 def snapshot_services(conn: sqlite3.Connection) -> dict[str, dict]:
@@ -72,8 +72,33 @@ def diff_snapshots(previous: dict[str, dict], current: dict[str, dict]) -> dict:
     }
 
 
+def diff_tags(
+    previous: dict[str, list[str]], current: dict[str, list[str]]
+) -> list[dict]:
+    """Diff two per-asset tag snapshots.
+
+    Each input maps an asset IP to its sorted tag list. Returns one entry per
+    asset whose tag set changed, naming the tags added and removed since the
+    previous cruise. Assets with no change are omitted. Ordered by asset IP.
+    """
+    changes: list[dict] = []
+    for ip in sorted(set(previous) | set(current)):
+        before = set(previous.get(ip, []))
+        after = set(current.get(ip, []))
+        if before == after:
+            continue
+        changes.append(
+            {
+                "asset": ip,
+                "added": sorted(after - before),
+                "removed": sorted(before - after),
+            }
+        )
+    return changes
+
+
 def last_snapshot(conn: sqlite3.Connection) -> dict[str, dict]:
-    """Load the most recent saved cruise snapshot, or {} if none exist."""
+    """Load the most recent saved cruise service snapshot, or {} if none exist."""
     row = conn.execute(
         "SELECT snapshot FROM cruise_runs ORDER BY id DESC LIMIT 1"
     ).fetchone()
@@ -82,11 +107,33 @@ def last_snapshot(conn: sqlite3.Connection) -> dict[str, dict]:
     return json.loads(row["snapshot"])
 
 
-def save_snapshot(conn: sqlite3.Connection, snapshot: dict[str, dict]) -> None:
-    """Persist a snapshot as a new cruise_runs row."""
+def last_tag_snapshot(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Load the most recent saved tag snapshot, or {} if none exist.
+
+    Older cruise_runs rows predate the `tag_snapshot` column (migrated in) and
+    carry NULL there — treated as "no tags then" so the first post-upgrade
+    cruise reports current tags as additions rather than crashing.
+    """
+    row = conn.execute(
+        "SELECT tag_snapshot FROM cruise_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is None or row["tag_snapshot"] is None:
+        return {}
+    return json.loads(row["tag_snapshot"])
+
+
+def save_snapshot(
+    conn: sqlite3.Connection,
+    snapshot: dict[str, dict],
+    tag_snapshot: dict[str, list[str]],
+) -> None:
+    """Persist a service + tag snapshot as a new cruise_runs row."""
     conn.execute(
-        "INSERT INTO cruise_runs (snapshot) VALUES (?)",
-        (json.dumps(snapshot, sort_keys=True),),
+        "INSERT INTO cruise_runs (snapshot, tag_snapshot) VALUES (?, ?)",
+        (
+            json.dumps(snapshot, sort_keys=True),
+            json.dumps(tag_snapshot, sort_keys=True),
+        ),
     )
 
 
@@ -106,7 +153,12 @@ def cruise(db_path: str | Path) -> dict:
         previous = last_snapshot(conn)
         current = snapshot_services(conn)
         result = diff_snapshots(previous, current)
-        save_snapshot(conn, current)
+
+        prev_tags = last_tag_snapshot(conn)
+        cur_tags = tags.asset_tag_map(conn)
+        result["tag_changes"] = diff_tags(prev_tags, cur_tags)
+
+        save_snapshot(conn, current, cur_tags)
         conn.commit()
     finally:
         conn.close()

@@ -10,15 +10,31 @@ import json
 import sqlite3
 from pathlib import Path
 
-from . import db
+from . import db, tags
 
 
-def build_state(conn: sqlite3.Connection) -> dict:
-    """Assemble the full engagement state as a nested dict."""
+def build_state(conn: sqlite3.Connection, tag: str | None = None) -> dict:
+    """Assemble the full engagement state as a nested dict.
+
+    When `tag` is given, only assets carrying that tag label are included — the
+    workflow filter for "show me just my in-scope / VIP / priority hosts."
+    """
     assets_out: list[dict] = []
-    assets = conn.execute(
-        "SELECT id, ip, hostname, state, discovered_at FROM assets ORDER BY ip"
-    ).fetchall()
+    if tag is not None:
+        assets = conn.execute(
+            """
+            SELECT a.id, a.ip, a.hostname, a.state, a.discovered_at
+            FROM assets a
+            JOIN tags t ON t.entity = 'asset' AND t.entity_id = a.id
+            WHERE t.tag = ?
+            ORDER BY a.ip
+            """,
+            (tag,),
+        ).fetchall()
+    else:
+        assets = conn.execute(
+            "SELECT id, ip, hostname, state, discovered_at FROM assets ORDER BY ip"
+        ).fetchall()
     for asset in assets:
         services_out: list[dict] = []
         services = conn.execute(
@@ -50,19 +66,23 @@ def build_state(conn: sqlite3.Connection) -> dict:
                 "hostname": asset["hostname"],
                 "state": asset["state"],
                 "discovered_at": asset["discovered_at"],
+                "tags": tags.asset_tags(conn, asset["id"]),
                 "services": services_out,
             }
         )
     return {"assets": assets_out}
 
 
-def dump(db_path: str | Path, fmt: str = "json") -> str:
-    """Return the engagement state as a serialised string in the given format."""
+def dump(db_path: str | Path, fmt: str = "json", tag: str | None = None) -> str:
+    """Return the engagement state as a serialised string in the given format.
+
+    `tag`, when set, restricts the export to assets carrying that tag label.
+    """
     if fmt != "json":
         raise ValueError(f"unsupported dump format {fmt!r} (v0.1 supports: json)")
     conn = db.require_initialised(db_path)
     try:
-        state = build_state(conn)
+        state = build_state(conn, tag=tag)
     finally:
         conn.close()
     return json.dumps(state, indent=2, sort_keys=False)

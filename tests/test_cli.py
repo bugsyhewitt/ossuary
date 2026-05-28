@@ -274,6 +274,112 @@ def test_match_cves_without_web_flag_ignores_web_probes(tmp_path, monkeypatch, c
     assert "http_server" not in queried_products
 
 
+def _seed_one_asset_db(tmp_path, monkeypatch):
+    """init + discover one asset (10.10.0.5), no fingerprint, returns db path."""
+    db_file = str(tmp_path / "engagement-test.db")
+    monkeypatch.setattr(
+        discover,
+        "scan_hosts",
+        lambda targets: host_discovery_result(up_ips=["10.10.0.5"]),
+    )
+    cli.main(["init", "--db", db_file])
+    cli.main(["discover", "--db", db_file, "--targets", str(TARGETS_FILE)])
+    return db_file
+
+
+def test_help_lists_tag_subcommand(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    out = capsys.readouterr().out
+    assert "tag" in out
+
+
+def test_cli_tag_add_list_rm_roundtrip(tmp_path, monkeypatch, capsys):
+    db_file = _seed_one_asset_db(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    rc = cli.main(["tag", "add", "--db", db_file, "--asset", "10.10.0.5", "--tag", "in-scope"])
+    assert rc == 0
+    assert "tagged 10.10.0.5" in capsys.readouterr().out
+
+    # adding the same tag again is reported as no-change
+    cli.main(["tag", "add", "--db", db_file, "--asset", "10.10.0.5", "--tag", "in-scope"])
+    assert "no change" in capsys.readouterr().out
+
+    rc = cli.main(["tag", "list", "--db", db_file])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "10.10.0.5" in out and "in-scope" in out
+
+    rc = cli.main(["tag", "rm", "--db", db_file, "--asset", "10.10.0.5", "--tag", "in-scope"])
+    assert rc == 0
+    assert "removed 'in-scope'" in capsys.readouterr().out
+
+    cli.main(["tag", "list", "--db", db_file])
+    assert "no tags" in capsys.readouterr().out
+
+
+def test_cli_tag_add_unknown_asset_errors(tmp_path, monkeypatch, capsys):
+    db_file = _seed_one_asset_db(tmp_path, monkeypatch)
+    capsys.readouterr()
+    rc = cli.main(["tag", "add", "--db", db_file, "--asset", "10.10.9.9", "--tag", "x"])
+    assert rc == 1
+    assert "no asset matching" in capsys.readouterr().err
+
+
+def test_cli_dump_tag_filter(tmp_path, monkeypatch, capsys):
+    db_file = _seed_one_asset_db(tmp_path, monkeypatch)
+    # add a second asset directly so we have something to filter out
+    import sqlite3
+
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("INSERT INTO assets (ip, state) VALUES ('10.10.0.6', 'up')")
+        conn.commit()
+    finally:
+        conn.close()
+    cli.main(["tag", "add", "--db", db_file, "--asset", "10.10.0.5", "--tag", "vip"])
+    capsys.readouterr()
+
+    rc = cli.main(["dump", "--db", db_file, "--tag", "vip"])
+    assert rc == 0
+    state = json.loads(capsys.readouterr().out)
+    assert [a["ip"] for a in state["assets"]] == ["10.10.0.5"]
+    assert state["assets"][0]["tags"] == ["vip"]
+
+
+def test_cli_cruise_reports_tag_changes(tmp_path, monkeypatch, capsys):
+    db_file = str(tmp_path / "engagement-test.db")
+    monkeypatch.setattr(
+        discover,
+        "scan_hosts",
+        lambda targets: host_discovery_result(up_ips=["10.10.0.5"]),
+    )
+    monkeypatch.setattr(
+        fingerprint,
+        "scan_services",
+        lambda ip: service_scan_result(
+            ip, [{"port": 22, "name": "ssh", "product": "OpenSSH", "version": "8.9p1"}]
+        ),
+    )
+    cli.main(["init", "--db", db_file])
+    cli.main(["discover", "--db", db_file, "--targets", str(TARGETS_FILE)])
+
+    # first cruise establishes a baseline (no tags yet)
+    cli.main(["cruise", "--db", db_file])
+    # add a tag, then cruise again — the tag should appear as a change
+    cli.main(["tag", "add", "--db", db_file, "--asset", "10.10.0.5", "--tag", "vip"])
+    capsys.readouterr()
+
+    rc = cli.main(["cruise", "--db", db_file])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "tag change" in out
+    diff = json.loads(out[out.index("{") :])
+    assert diff["tag_changes"][0]["asset"] == "10.10.0.5"
+    assert diff["tag_changes"][0]["added"] == ["vip"]
+
+
 def test_cli_cruise_runs_and_exits_zero(tmp_path, monkeypatch, capsys):
     db_file = str(tmp_path / "engagement-test.db")
     monkeypatch.setattr(
