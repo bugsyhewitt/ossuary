@@ -187,6 +187,31 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="LABEL",
         help="only export assets carrying this tag (see `ossuary tag`)",
     )
+    p_dump.add_argument(
+        "--min-epss",
+        type=float,
+        default=None,
+        metavar="P",
+        help=(
+            "only export findings with an EPSS exploit-probability >= P (0-1); "
+            "findings without an EPSS score are excluded"
+        ),
+    )
+    p_dump.add_argument(
+        "--min-severity",
+        type=float,
+        default=None,
+        metavar="SCORE",
+        help=(
+            "only export findings with a numeric severity (CVSS) >= SCORE; "
+            "blank/non-numeric severities are excluded"
+        ),
+    )
+    p_dump.add_argument(
+        "--kev-only",
+        action="store_true",
+        help="only export findings in CISA's Known Exploited Vulnerabilities catalog",
+    )
 
     p_probe = sub.add_parser(
         "probe", help="HTTP/web layer discovery — probe web ports on known assets"
@@ -389,7 +414,16 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_dump(args: argparse.Namespace) -> int:
-    print(dump_mod.dump(args.db, args.format, tag=args.tag))
+    print(
+        dump_mod.dump(
+            args.db,
+            args.format,
+            tag=args.tag,
+            min_epss=args.min_epss,
+            min_severity=args.min_severity,
+            kev_only=args.kev_only,
+        )
+    )
     return 0
 
 

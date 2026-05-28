@@ -59,7 +59,7 @@ ossuary probe        HTTP/web-layer probe of web ports -> web_probes table
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
-ossuary dump         export the full engagement state as JSON, CSV, or Markdown
+ossuary dump         export engagement state as JSON/CSV/Markdown (filterable by KEV/EPSS/severity)
 ossuary tag          attach / list / remove labels on assets for grouping & filtering
 ossuary profiles     list the named scan profiles and their nmap flags
 ```
@@ -395,6 +395,41 @@ these columns: `ip, hostname, asset_state, discovered_at, tags, port, protocol,
 service_name, product, version, cpe, fingerprinted_at, cve_id, summary,
 severity, source, epss_score, kev, matched_at`. `--tag LABEL` filters every
 format to the assets carrying that label.
+
+#### Actionability filters — `--kev-only`, `--min-epss`, `--min-severity`
+
+NIST's 2026 enrichment retreat left raw CVSS `severity` blank on most fresh
+CVEs, so a full `dump` of a large engagement buries the few findings that matter
+under the noise. The live prioritisation signal lives in the EPSS exploit
+probability and CISA KEV status that `match-cves` already records — these three
+flags trim the export to just the findings worth writing up in a report:
+
+```bash
+# only CVEs CISA has confirmed exploited in the wild
+ossuary dump --db engagement-acme.db --format markdown --kev-only
+
+# only CVEs with >= 50% exploit probability in the next 30 days (EPSS)
+ossuary dump --db engagement-acme.db --format markdown --min-epss 0.5
+
+# only CVEs with a numeric CVSS severity >= 7.0
+ossuary dump --db engagement-acme.db --format csv --min-severity 7.0
+```
+
+Semantics:
+
+- `--kev-only` keeps findings where `kev = 1`.
+- `--min-epss P` keeps findings whose EPSS score is present **and** `>= P`;
+  a finding with no EPSS score is dropped once an EPSS floor is set.
+- `--min-severity SCORE` keeps findings whose `severity` parses as a number
+  **and** is `>= SCORE`; blank / non-numeric severities are dropped once a
+  severity floor is set.
+
+The flags **compose** (a finding must clear every threshold given) and combine
+with `--tag` (e.g. `--tag in-scope --kev-only`). They apply identically to
+`json`, `csv`, and `markdown`. When a filter is active, services and assets left
+with no surviving findings are pruned, so the output collapses to a clean list
+of actionable hits. With no filter flags, `dump` returns the full inventory
+exactly as before (services with no findings still appear).
 
 ### Cruise mode
 

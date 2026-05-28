@@ -13,6 +13,14 @@ findings) to one of three shapes:
 
 The flat formats cover exactly the same fields as the JSON output, flattened
 across the asset/service/finding nesting.
+
+Actionability filters (``min_epss`` / ``min_severity`` / ``kev_only``) trim the
+export to the findings that actually matter for a report. NIST's enrichment
+retreat left raw CVSS blank on most fresh CVEs, so the live prioritisation
+signal lives in EPSS (exploit probability) and CISA KEV (confirmed exploited).
+These filters let a hunter close an engagement with "only the findings worth
+writing up." A finding survives the filters when it clears *every* threshold
+given; when no filters are given, the export is unchanged (full inventory).
 """
 
 from __future__ import annotations
@@ -52,12 +60,69 @@ FLAT_COLUMNS = [
 ]
 
 
-def build_state(conn: sqlite3.Connection, tag: str | None = None) -> dict:
+def _parse_severity(value) -> float | None:
+    """Best-effort parse of a finding's free-text severity into a float.
+
+    Severity is stored as text (it may be a CVSS base score like ``7.7`` or a
+    blank for un-enriched CVEs). A value that doesn't parse as a number — or a
+    blank — is treated as "unknown" and returns ``None``.
+    """
+    if value is None:
+        return None
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _finding_is_actionable(
+    finding: dict,
+    min_epss: float | None,
+    min_severity: float | None,
+    kev_only: bool,
+) -> bool:
+    """Return True when a finding clears every supplied actionability threshold.
+
+    With no thresholds the finding always passes. ``kev_only`` requires KEV=1.
+    ``min_epss`` requires a present EPSS score >= the floor (a finding with no
+    EPSS score is excluded once an EPSS floor is set). ``min_severity`` requires
+    a parseable severity >= the floor (un-parseable / blank severities are
+    excluded once a severity floor is set).
+    """
+    if kev_only and not finding.get("kev"):
+        return False
+    if min_epss is not None:
+        epss = finding.get("epss_score")
+        if epss is None or epss < min_epss:
+            return False
+    if min_severity is not None:
+        sev = _parse_severity(finding.get("severity"))
+        if sev is None or sev < min_severity:
+            return False
+    return True
+
+
+def build_state(
+    conn: sqlite3.Connection,
+    tag: str | None = None,
+    *,
+    min_epss: float | None = None,
+    min_severity: float | None = None,
+    kev_only: bool = False,
+) -> dict:
     """Assemble the full engagement state as a nested dict.
 
     When `tag` is given, only assets carrying that tag label are included — the
     workflow filter for "show me just my in-scope / VIP / priority hosts."
+
+    `min_epss`, `min_severity`, and `kev_only` are actionability filters applied
+    at the finding level. When any is set, findings that don't clear the
+    threshold(s) are dropped, and services / assets left with no surviving
+    findings are pruned from the output — so the export collapses to just the
+    findings worth reporting. With none set, the full inventory is returned
+    (services with no findings still appear), preserving the prior behaviour.
     """
+    filtering = min_epss is not None or min_severity is not None or kev_only
     assets_out: list[dict] = []
     if tag is not None:
         assets = conn.execute(
@@ -87,6 +152,17 @@ def build_state(conn: sqlite3.Connection, tag: str | None = None) -> dict:
                 "matched_at FROM findings WHERE service_id = ? ORDER BY cve_id",
                 (svc["id"],),
             ).fetchall()
+            findings_out = [dict(f) for f in findings]
+            if filtering:
+                findings_out = [
+                    f
+                    for f in findings_out
+                    if _finding_is_actionable(f, min_epss, min_severity, kev_only)
+                ]
+                # When filtering for actionable findings, a service with none
+                # left carries no signal — drop it so the report shows only hits.
+                if not findings_out:
+                    continue
             services_out.append(
                 {
                     "port": svc["port"],
@@ -96,9 +172,12 @@ def build_state(conn: sqlite3.Connection, tag: str | None = None) -> dict:
                     "version": svc["version"],
                     "cpe": svc["cpe"],
                     "fingerprinted_at": svc["fingerprinted_at"],
-                    "findings": [dict(f) for f in findings],
+                    "findings": findings_out,
                 }
             )
+        # Likewise prune assets with no surviving services when filtering.
+        if filtering and not services_out:
+            continue
         assets_out.append(
             {
                 "ip": asset["ip"],
@@ -193,11 +272,22 @@ def to_markdown(state: dict) -> str:
     return "\n".join(lines)
 
 
-def dump(db_path: str | Path, fmt: str = "json", tag: str | None = None) -> str:
+def dump(
+    db_path: str | Path,
+    fmt: str = "json",
+    tag: str | None = None,
+    *,
+    min_epss: float | None = None,
+    min_severity: float | None = None,
+    kev_only: bool = False,
+) -> str:
     """Return the engagement state as a serialised string in the given format.
 
     `fmt` is one of ``json``, ``csv``, or ``markdown``. `tag`, when set,
-    restricts the export to assets carrying that tag label.
+    restricts the export to assets carrying that tag label. `min_epss`,
+    `min_severity`, and `kev_only` are actionability filters: each restricts the
+    export to findings clearing that threshold, pruning services and assets left
+    with no surviving findings. They compose with `tag` and with each other.
     """
     if fmt not in SUPPORTED_FORMATS:
         supported = ", ".join(SUPPORTED_FORMATS)
@@ -206,7 +296,13 @@ def dump(db_path: str | Path, fmt: str = "json", tag: str | None = None) -> str:
         )
     conn = db.require_initialised(db_path)
     try:
-        state = build_state(conn, tag=tag)
+        state = build_state(
+            conn,
+            tag=tag,
+            min_epss=min_epss,
+            min_severity=min_severity,
+            kev_only=kev_only,
+        )
     finally:
         conn.close()
     if fmt == "csv":
