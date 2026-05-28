@@ -194,6 +194,38 @@ which service row.
 
 ---
 
+## Rank 8 — Actionability filters on `dump` (KEV / EPSS / severity)  ✅ IMPLEMENTED
+
+> Shipped: `dump` gains `--kev-only`, `--min-epss P`, and `--min-severity SCORE`
+> flags. Filtering happens in `dump.build_state`, so it applies uniformly to the
+> json / csv / markdown formats and composes with the existing `--tag` filter.
+> A finding survives only when it clears *every* threshold given; services and
+> assets left with no surviving findings are pruned, so the export collapses to
+> a clean list of actionable hits. With no filter flags, output is byte-for-byte
+> the prior full-inventory behaviour (services with no findings still appear).
+> +10 tests.
+
+**What:** Let a hunter trim a `dump` to the findings that actually matter for a
+report, using the prioritisation signal `match-cves` already records:
+
+- `--kev-only` — only CVEs in CISA's Known Exploited Vulnerabilities catalog.
+- `--min-epss P` — only findings with EPSS exploit-probability ≥ P (0–1);
+  findings with no EPSS score are excluded.
+- `--min-severity SCORE` — only findings whose numeric CVSS severity ≥ SCORE;
+  blank / non-numeric severities are excluded.
+
+**Why now:** This is the missing last-mile companion to Rank 1 (EPSS+KEV
+enrichment) and Rank 6 (CSV/Markdown export). With NIST's enrichment retreat, a
+full dump of a large engagement buries the handful of exploited / high-EPSS
+CVEs under hundreds of blank-severity rows. EPSS + KEV are the live signals;
+filtering on them turns the report-export from "everything" into "the part worth
+submitting." Pure-Python, no new dependencies, no API keys, fully offline-tested.
+
+**Effort:** Small. A finding-level predicate in `build_state` + three argparse
+flags; the format serialisers are untouched.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |
