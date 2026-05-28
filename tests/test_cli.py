@@ -22,7 +22,7 @@ def test_help_lists_all_subcommands(capsys):
     with pytest.raises(SystemExit):
         cli.main(["--help"])
     out = capsys.readouterr().out
-    for sub in ("init", "discover", "fingerprint", "match-cves", "cruise", "dump"):
+    for sub in ("init", "discover", "fingerprint", "match-cves", "cruise", "dump", "stats"):
         assert sub in out
 
 
@@ -481,3 +481,37 @@ def test_cli_cruise_runs_and_exits_zero(tmp_path, monkeypatch, capsys):
     assert "cruise diff" in out
     diff = json.loads(out[out.index("{") :])
     assert len(diff["added"]) == 1
+
+
+def test_cli_stats_text_summary(tmp_path, capsys):
+    """`stats` prints a headline summary against a seeded DB (POST_V01 Rank 10)."""
+    from ossuary import db
+
+    db_file = str(tmp_path / "engagement-test.db")
+    conn = db.init_db(db_file)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.18.0", None)
+        db.upsert_finding(conn, sid, "CVE-HOT", "exploited", "9.8",
+                          epss_score=0.94, kev=1)
+        conn.commit()
+    finally:
+        conn.close()
+
+    rc = cli.main(["stats", "--db", db_file])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "assets:   1" in out
+    assert "KEV (actively exploited): 1" in out
+    assert "CVE-HOT" in out
+
+
+def test_cli_stats_json_format(tmp_path, capsys):
+    db_file = str(tmp_path / "engagement-test.db")
+    cli.main(["init", "--db", db_file])
+    capsys.readouterr()
+    rc = cli.main(["stats", "--db", db_file, "--format", "json"])
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["assets"] == 0
+    assert summary["top_findings"] == []

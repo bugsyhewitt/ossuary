@@ -253,6 +253,36 @@ the format serialisers are untouched. No new dependencies, no schema change.
 
 ---
 
+## Rank 10 — Engagement summary command (`ossuary stats`)  ✅ IMPLEMENTED
+
+> Shipped: new `ossuary.stats` module + `ossuary stats` subcommand with
+> `--format text|json` and `--top N`. Reports engagement totals (assets /
+> services / findings), the KEV count, EPSS exploit-probability tiers
+> (high/medium/low/unscored), numeric-severity (CVSS) tiers
+> (critical/high/medium/low/blank), and the top-N findings in the `match-cves`
+> triage order (KEV-first / descending EPSS / descending severity / CVE id).
+> Computed from the same assets/services/findings data `dump` reads, so the
+> numbers always agree. Pure-Python, no new dependencies, no schema change, no
+> network calls. +16 tests.
+
+**What:** R1 restored the EPSS/KEV signal, R6 added report formats, R8 added
+filters, and R9 added ordering — all operating on `dump`'s per-finding detail.
+The missing companion is the top-of-funnel roll-up: a single at-a-glance triage
+snapshot of the whole engagement, so a hunter can see "how big is this and where
+is the live risk?" without scrolling a 500-row dump. `dump` answers "give me the
+rows"; `stats` answers "give me the shape."
+
+**Why now:** With NIST's enrichment retreat, raw CVSS is blank on most fresh
+CVEs and the live prioritisation axis is EPSS + KEV. A per-tier count of those
+signals turns a large engagement's findings into an immediately legible risk
+posture — the natural front page for the report the R6/R8/R9 work produces.
+
+**Effort:** Small. A pure-Python aggregation over the existing tables + two
+argparse flags; reuses the `dump` severity-parse and priority-sort logic. No new
+dependencies, no schema change, fully offline-tested.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |

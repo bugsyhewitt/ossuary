@@ -9,6 +9,7 @@ Subcommands (v0.1):
     cruise       re-fingerprint, diff against last state, report changes
     watch        run cruise on an interval, emitting a diff summary each pass
     dump         export full engagement state as JSON, CSV, or Markdown
+    stats        print a top-of-funnel engagement summary (counts + top hits)
     profiles     list the named scan profiles (stealth/aggressive/web/default)
 
 Discover, fingerprint, and cruise accept a `--profile NAME` flag selecting a
@@ -23,7 +24,8 @@ import sys
 
 from . import __version__, cruise as cruise_mod, cves, db, discover as discover_mod
 from . import dump as dump_mod, fingerprint as fingerprint_mod, probe as probe_mod
-from . import profiles as profiles_mod, tags as tags_mod, watch as watch_mod
+from . import profiles as profiles_mod, stats as stats_mod, tags as tags_mod
+from . import watch as watch_mod
 
 
 def _add_db_arg(parser: argparse.ArgumentParser) -> None:
@@ -219,6 +221,27 @@ def build_parser() -> argparse.ArgumentParser:
             "order each service's findings KEV-first, then by descending EPSS, "
             "severity, and CVE id (the `match-cves` triage order) instead of "
             "alphabetically by CVE id"
+        ),
+    )
+
+    p_stats = sub.add_parser(
+        "stats", help="print an at-a-glance engagement summary (counts + top hits)"
+    )
+    _add_db_arg(p_stats)
+    p_stats.add_argument(
+        "--format",
+        default="text",
+        choices=["text", "json"],
+        help="output format: text (human-readable) or json (same numbers)",
+    )
+    p_stats.add_argument(
+        "--top",
+        type=int,
+        default=stats_mod.DEFAULT_TOP,
+        metavar="N",
+        help=(
+            "how many leading findings to list, in match-cves triage order "
+            f"(default: {stats_mod.DEFAULT_TOP}; 0 to omit the list)"
         ),
     )
 
@@ -437,6 +460,11 @@ def _cmd_dump(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_stats(args: argparse.Namespace) -> int:
+    print(stats_mod.stats(args.db, args.format, top=args.top))
+    return 0
+
+
 def _cmd_probe(args: argparse.Namespace) -> int:
     try:
         ports = {int(p.strip()) for p in args.ports.split(",") if p.strip()}
@@ -487,6 +515,7 @@ _DISPATCH = {
     "cruise": _cmd_cruise,
     "watch": _cmd_watch,
     "dump": _cmd_dump,
+    "stats": _cmd_stats,
     "probe": _cmd_probe,
     "tag": _cmd_tag,
     "profiles": _cmd_profiles,
