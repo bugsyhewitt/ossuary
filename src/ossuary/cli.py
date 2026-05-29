@@ -253,6 +253,18 @@ def build_parser() -> argparse.ArgumentParser:
             "alphabetically by CVE id"
         ),
     )
+    p_dump.add_argument(
+        "--vex",
+        default=None,
+        metavar="PATH",
+        help=(
+            "path to an OpenVEX JSON document; suppress findings whose CVE has "
+            "been ruled not_affected / fixed (triage-cleared rows are hidden "
+            "from the export but kept in the DB). A statement with no products "
+            "suppresses the CVE everywhere; a scoped statement suppresses only "
+            "findings whose ip / ip:proto/port / CPE matches a listed product"
+        ),
+    )
 
     p_stats = sub.add_parser(
         "stats", help="print an at-a-glance engagement summary (counts + top hits)"
@@ -679,6 +691,7 @@ def _cmd_dump(args: argparse.Namespace) -> int:
             since=args.since,
             until=args.until,
             sort_by_priority=args.sort_by_priority,
+            vex_path=args.vex,
         )
     )
     return 0
