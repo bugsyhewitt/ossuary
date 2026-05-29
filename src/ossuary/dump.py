@@ -41,6 +41,17 @@ match the triage order ``match-cves`` already prints to the console — KEV-firs
 then descending EPSS, then descending numeric severity, then CVE id — so the
 most-exploited findings lead every report. It is off by default, leaving the
 historical alphabetical-by-CVE-id ordering byte-for-byte unchanged.
+
+Recency filtering (``since`` / ``until``) trims the export to the findings whose
+``matched_at`` timestamp falls inside a scan-time window. ``cruise`` / ``watch``
+re-scan the same engagement over time, so after a fresh pass a hunter wants
+"only the findings recorded since DATE" — the vulnerability-surface slice for a
+window rather than the whole history. Both bounds are inclusive and either may
+be given alone (open-ended on the other side). A bare ``YYYY-MM-DD`` ``until`` is
+extended to end-of-day so a calendar day includes that day's timestamps. Like
+the actionability filters, recency filtering drops findings with no recorded
+``matched_at`` once a bound is set and prunes services / assets left empty; with
+neither bound set the export is unchanged.
 """
 
 from __future__ import annotations
@@ -96,11 +107,55 @@ def _parse_severity(value) -> float | None:
         return None
 
 
+def _normalise_until(value: str | None) -> str | None:
+    """Normalise an ``until`` bound so a bare calendar day is inclusive.
+
+    ``matched_at`` is stored as ``YYYY-MM-DD HH:MM:SS`` (sqlite ``datetime('now')``).
+    A bare ``YYYY-MM-DD`` upper bound would, under a plain lexicographic compare,
+    exclude that same day's timestamps (``"2026-05-29 12:00:00" > "2026-05-29"``).
+    Extend such a bound to that day's last second so ``--until DATE`` includes all
+    of DATE. A value that already carries a time component is returned unchanged.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    # A bare date is exactly 10 chars (YYYY-MM-DD) with no time/space component.
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        return text + " 23:59:59"
+    return text
+
+
+def _finding_in_window(
+    finding: dict,
+    since: str | None,
+    until: str | None,
+) -> bool:
+    """Return True when a finding's ``matched_at`` falls inside [since, until].
+
+    Both bounds are inclusive and optional. ``matched_at`` is an ISO-8601-ish
+    ``YYYY-MM-DD HH:MM:SS`` string, so lexicographic comparison orders it
+    correctly. A finding with no ``matched_at`` is excluded once either bound is
+    set (consistent with the actionability filters excluding missing signal).
+    """
+    if since is None and until is None:
+        return True
+    matched_at = finding.get("matched_at")
+    if not matched_at:
+        return False
+    if since is not None and matched_at < since:
+        return False
+    if until is not None and matched_at > until:
+        return False
+    return True
+
+
 def _finding_is_actionable(
     finding: dict,
     min_epss: float | None,
     min_severity: float | None,
     kev_only: bool,
+    since: str | None = None,
+    until: str | None = None,
 ) -> bool:
     """Return True when a finding clears every supplied actionability threshold.
 
@@ -108,7 +163,9 @@ def _finding_is_actionable(
     ``min_epss`` requires a present EPSS score >= the floor (a finding with no
     EPSS score is excluded once an EPSS floor is set). ``min_severity`` requires
     a parseable severity >= the floor (un-parseable / blank severities are
-    excluded once a severity floor is set).
+    excluded once a severity floor is set). ``since`` / ``until`` bound the
+    finding's ``matched_at`` recency window (both inclusive; a finding with no
+    ``matched_at`` is excluded once either bound is set).
     """
     if kev_only and not finding.get("kev"):
         return False
@@ -120,6 +177,8 @@ def _finding_is_actionable(
         sev = _parse_severity(finding.get("severity"))
         if sev is None or sev < min_severity:
             return False
+    if not _finding_in_window(finding, since, until):
+        return False
     return True
 
 
@@ -150,6 +209,8 @@ def build_state(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    since: str | None = None,
+    until: str | None = None,
     sort_by_priority: bool = False,
 ) -> dict:
     """Assemble the full engagement state as a nested dict.
@@ -164,12 +225,26 @@ def build_state(
     findings worth reporting. With none set, the full inventory is returned
     (services with no findings still appear), preserving the prior behaviour.
 
+    `since` / `until` are recency bounds on each finding's `matched_at`
+    timestamp (both inclusive; either may be given alone). When either is set,
+    findings recorded outside the window — and those with no `matched_at` — are
+    dropped, and empty services / assets are pruned, exactly like the
+    actionability filters. A bare `YYYY-MM-DD` `until` covers all of that day.
+
     When `sort_by_priority` is set, each service's findings are reordered
     KEV-first, then by descending EPSS, descending numeric severity, and finally
     CVE id — the same triage order `match-cves` prints — so the highest-signal
     findings lead. When unset, findings keep their alphabetical-by-CVE-id order.
     """
-    filtering = min_epss is not None or min_severity is not None or kev_only
+    until = _normalise_until(until)
+    since = since.strip() if since is not None else None
+    filtering = (
+        min_epss is not None
+        or min_severity is not None
+        or kev_only
+        or since is not None
+        or until is not None
+    )
     assets_out: list[dict] = []
     if tag is not None:
         assets = conn.execute(
@@ -204,7 +279,9 @@ def build_state(
                 findings_out = [
                     f
                     for f in findings_out
-                    if _finding_is_actionable(f, min_epss, min_severity, kev_only)
+                    if _finding_is_actionable(
+                        f, min_epss, min_severity, kev_only, since, until
+                    )
                 ]
                 # When filtering for actionable findings, a service with none
                 # left carries no signal — drop it so the report shows only hits.
@@ -618,6 +695,8 @@ def dump(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    since: str | None = None,
+    until: str | None = None,
     sort_by_priority: bool = False,
 ) -> str:
     """Return the engagement state as a serialised string in the given format.
@@ -628,6 +707,8 @@ def dump(
     `min_severity`, and `kev_only` are actionability filters: each restricts the
     export to findings clearing that threshold, pruning services and assets left
     with no surviving findings. They compose with `tag` and with each other.
+    `since` / `until` restrict the export to findings whose `matched_at` falls
+    inside the (inclusive) recency window; they compose with the other filters.
     `sort_by_priority`, when set, orders each service's findings KEV-first /
     descending-EPSS / descending-severity / CVE-id (the `match-cves` triage
     order) instead of the default alphabetical-by-CVE-id ordering.
@@ -645,6 +726,8 @@ def dump(
             min_epss=min_epss,
             min_severity=min_severity,
             kev_only=kev_only,
+            since=since,
+            until=until,
             sort_by_priority=sort_by_priority,
         )
     finally:

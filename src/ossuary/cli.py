@@ -220,6 +220,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="only export findings in CISA's Known Exploited Vulnerabilities catalog",
     )
     p_dump.add_argument(
+        "--since",
+        default=None,
+        metavar="DATE",
+        help=(
+            "only export findings recorded (matched_at) on or after DATE "
+            "(YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'); inclusive"
+        ),
+    )
+    p_dump.add_argument(
+        "--until",
+        default=None,
+        metavar="DATE",
+        help=(
+            "only export findings recorded (matched_at) on or before DATE "
+            "(YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'); inclusive — a bare date "
+            "covers the whole day"
+        ),
+    )
+    p_dump.add_argument(
         "--sort-by-priority",
         action="store_true",
         help=(
@@ -551,6 +570,8 @@ def _cmd_dump(args: argparse.Namespace) -> int:
             min_epss=args.min_epss,
             min_severity=args.min_severity,
             kev_only=args.kev_only,
+            since=args.since,
+            until=args.until,
             sort_by_priority=args.sort_by_priority,
         )
     )
