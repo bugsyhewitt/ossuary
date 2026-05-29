@@ -544,3 +544,160 @@ def test_dump_html_sort_by_priority_orders_findings(db_path):
 
 def test_dump_html_is_listed_as_supported_format():
     assert "html" in dump.SUPPORTED_FORMATS
+
+
+# --------------------------------------------------------------------------
+# SARIF v2.1.0 export (POST_V01 Rank 14 — `--format sarif`)
+# --------------------------------------------------------------------------
+
+def _sarif_run(out):
+    """Parse a SARIF dump and return its single run object."""
+    doc = json.loads(out)
+    assert doc["version"] == "2.1.0"
+    assert "$schema" in doc
+    assert len(doc["runs"]) == 1
+    return doc["runs"][0]
+
+
+def test_dump_sarif_is_listed_as_supported_format():
+    assert "sarif" in dump.SUPPORTED_FORMATS
+
+
+def test_dump_sarif_is_valid_2_1_0_document(db_path):
+    _seed_one_finding(db_path)
+    run = _sarif_run(dump.dump(db_path, "sarif"))
+    driver = run["tool"]["driver"]
+    assert driver["name"] == "ossuary"
+    assert "version" in driver
+    # One result per finding, one rule per distinct CVE.
+    assert len(run["results"]) == 1
+    assert len(driver["rules"]) == 1
+
+
+def test_dump_sarif_empty_db_has_empty_results(db_path):
+    db.init_db(db_path).close()
+    run = _sarif_run(dump.dump(db_path, "sarif"))
+    assert run["results"] == []
+    assert run["tool"]["driver"]["rules"] == []
+
+
+def test_dump_sarif_result_carries_location_and_rule(db_path):
+    _seed_one_finding(db_path)
+    run = _sarif_run(dump.dump(db_path, "sarif"))
+    result = run["results"][0]
+    assert result["ruleId"] == "CVE-2021-23017"
+    # The host:proto/port locates the finding.
+    uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+    assert uri == "10.10.0.5:tcp/80"
+    # ruleIndex points at the matching rule entry.
+    rule = run["tool"]["driver"]["rules"][result["ruleIndex"]]
+    assert rule["id"] == "CVE-2021-23017"
+
+
+def test_dump_sarif_carries_epss_kev_severity_in_properties(db_path):
+    _seed_mixed_findings(db_path)
+    run = _sarif_run(dump.dump(db_path, "sarif"))
+    by_cve = {r["ruleId"]: r for r in run["results"]}
+    hot = by_cve["CVE-HOT"]["properties"]
+    assert hot["kev"] is True
+    assert hot["epss_score"] == 0.94
+    assert hot["severity"] == "9.8"
+
+
+def test_dump_sarif_kev_finding_is_error_level(db_path):
+    _seed_mixed_findings(db_path)
+    run = _sarif_run(dump.dump(db_path, "sarif"))
+    by_cve = {r["ruleId"]: r for r in run["results"]}
+    # KEV -> error regardless of CVSS; cold low-severity -> note; mid -> warning.
+    assert by_cve["CVE-HOT"]["level"] == "error"
+    assert by_cve["CVE-COLD"]["level"] == "note"
+    assert by_cve["CVE-MID"]["level"] == "warning"
+
+
+def test_dump_sarif_blank_severity_non_kev_is_warning(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-BLANK", "x", None, epss_score=None, kev=0)
+        conn.commit()
+    finally:
+        conn.close()
+    run = _sarif_run(dump.dump(db_path, "sarif"))
+    assert run["results"][0]["level"] == "warning"
+
+
+def test_dump_sarif_deduplicates_rules_across_hosts(db_path):
+    conn = db.init_db(db_path)
+    try:
+        # Same CVE matched on two different hosts -> one rule, two results.
+        a1 = db.upsert_asset(conn, "10.10.0.5", "h1", "up")
+        s1 = db.upsert_service(conn, a1, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s1, "CVE-SHARED", "x", "7.0")
+        a2 = db.upsert_asset(conn, "10.10.0.6", "h2", "up")
+        s2 = db.upsert_service(conn, a2, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s2, "CVE-SHARED", "x", "7.0")
+        conn.commit()
+    finally:
+        conn.close()
+    run = _sarif_run(dump.dump(db_path, "sarif"))
+    assert len(run["results"]) == 2
+    assert len(run["tool"]["driver"]["rules"]) == 1
+    # Both results reference the single rule.
+    assert {r["ruleIndex"] for r in run["results"]} == {0}
+
+
+def test_dump_sarif_escapes_nothing_but_keeps_text_intact(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-TXT", "heap overflow & RCE", "9.0")
+        conn.commit()
+    finally:
+        conn.close()
+    run = _sarif_run(dump.dump(db_path, "sarif"))
+    # JSON carries the raw text safely; the summary survives round-trip.
+    assert "heap overflow & RCE" in run["results"][0]["message"]["text"]
+    rule = run["tool"]["driver"]["rules"][0]
+    assert rule["fullDescription"]["text"] == "heap overflow & RCE"
+
+
+def test_dump_sarif_cve_rule_has_nvd_help_uri(db_path):
+    _seed_one_finding(db_path)
+    run = _sarif_run(dump.dump(db_path, "sarif"))
+    rule = run["tool"]["driver"]["rules"][0]
+    assert rule["helpUri"] == "https://nvd.nist.gov/vuln/detail/CVE-2021-23017"
+
+
+def test_dump_sarif_filters_apply(db_path):
+    _seed_mixed_findings(db_path)
+    run = _sarif_run(dump.dump(db_path, "sarif", kev_only=True))
+    cves = {r["ruleId"] for r in run["results"]}
+    assert cves == {"CVE-HOT"}
+
+
+def test_dump_sarif_sort_by_priority_orders_results(db_path):
+    _seed_one_service_many_findings(db_path)
+    run = _sarif_run(dump.dump(db_path, "sarif", sort_by_priority=True))
+    emitted = [r["ruleId"] for r in run["results"]]
+    assert emitted == [
+        "CVE-2020-KEVHI",
+        "CVE-2020-KEVLO",
+        "CVE-2020-WARM",
+        "CVE-2020-COLD",
+    ]
+
+
+def test_dump_sarif_omits_service_with_no_findings(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.9", None, "up")
+        db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        conn.commit()
+    finally:
+        conn.close()
+    # Unlike CSV (which emits a service row), SARIF is finding-centric:
+    # a service with no finding produces no result.
+    run = _sarif_run(dump.dump(db_path, "sarif"))
+    assert run["results"] == []

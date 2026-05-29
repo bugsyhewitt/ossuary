@@ -387,6 +387,38 @@ def test_cli_dump_kev_only_filter(tmp_path, monkeypatch, capsys):
     assert cves == ["CVE-HOT"]
 
 
+def test_cli_dump_sarif_format(tmp_path, monkeypatch, capsys):
+    import sqlite3
+
+    db_file = str(tmp_path / "engagement-test.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("INSERT INTO assets (id, ip, state) VALUES (1, '10.10.0.5', 'up')")
+        conn.execute(
+            "INSERT INTO services (id, asset_id, port, protocol, name, product, "
+            "version) VALUES (1, 1, 80, 'tcp', 'http', 'nginx', '1.18.0')"
+        )
+        conn.execute(
+            "INSERT INTO findings (service_id, cve_id, summary, severity, epss_score, "
+            "kev) VALUES (1, 'CVE-2021-23017', 'off-by-one', '7.7', 0.5, 1)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    rc = cli.main(["dump", "--db", db_file, "--format", "sarif"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["version"] == "2.1.0"
+    run = doc["runs"][0]
+    assert run["tool"]["driver"]["name"] == "ossuary"
+    assert run["results"][0]["ruleId"] == "CVE-2021-23017"
+    # KEV finding is escalated to error level.
+    assert run["results"][0]["level"] == "error"
+
+
 def test_cli_dump_sort_by_priority(tmp_path, monkeypatch, capsys):
     import sqlite3
 

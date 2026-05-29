@@ -59,7 +59,7 @@ ossuary probe        HTTP/web-layer probe of web ports -> web_probes table
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
-ossuary dump         export engagement state as JSON/CSV/Markdown/HTML (filterable by KEV/EPSS/severity)
+ossuary dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF (filterable by KEV/EPSS/severity)
 ossuary stats        print an at-a-glance engagement summary (counts + top hits)
 ossuary tag          attach / list / remove labels on assets for grouping & filtering
 ossuary profiles     list the named scan profiles and their nmap flags
@@ -382,13 +382,14 @@ ossuary dump --db engagement-acme.db --format json > acme-state.json
 
 ### Export formats
 
-`dump` speaks four formats via `--format`:
+`dump` speaks five formats via `--format`:
 
 ```bash
 ossuary dump --db engagement-acme.db --format json     > acme-state.json
 ossuary dump --db engagement-acme.db --format csv      > acme-findings.csv
 ossuary dump --db engagement-acme.db --format markdown > acme-findings.md
 ossuary dump --db engagement-acme.db --format html     > acme-report.html
+ossuary dump --db engagement-acme.db --format sarif    > acme-findings.sarif
 ```
 
 - **`json`** (default) — the nested `assets → services → findings` structure,
@@ -404,14 +405,26 @@ ossuary dump --db engagement-acme.db --format html     > acme-report.html
   red **KEV** badge on confirmed-exploited CVEs and severity-tier colour coding
   on every finding row. It renders offline and is safe to hand to a client as a
   deliverable — open it in a browser or attach it to an engagement write-up.
+- **`sarif`** — a **SARIF v2.1.0** document (Static Analysis Results Interchange
+  Format, the OASIS standard). One `result` per finding, one `rule` per distinct
+  CVE, located by `host:proto/port`. EPSS, KEV, severity, product and version
+  ride along as result `properties`. This is the artifact GitHub code scanning,
+  DefectDojo, Azure DevOps, and the wider security-tooling ecosystem ingest
+  natively, so you can pipe an engagement's findings straight into a triage
+  pipeline or a code-scanning dashboard.
 
 The `json`, `csv`, and `markdown` formats cover the same fields; CSV and
 Markdown flatten the JSON nesting into these columns: `ip, hostname,
 asset_state, discovered_at, tags, port, protocol, service_name, product,
 version, cpe, fingerprinted_at, cve_id, summary, severity, source, epss_score,
 kev, matched_at`. The `html` report carries the same underlying data, presented
-per-host rather than as a flat table. `--tag LABEL` filters every format to the
-assets carrying that label.
+per-host rather than as a flat table. The `sarif` document is finding-centric —
+a service with no finding produces no `result` — and maps each finding to a SARIF
+`level`: a **KEV** finding is always `error` (regardless of the often-blank
+post-NIST-retreat CVSS), then numeric severity drives it (`>= 7.0` → `error`,
+`>= 4.0` → `warning`, lower → `note`), with an un-scored, non-KEV finding
+defaulting to `warning`. `--tag LABEL` filters every format to the assets
+carrying that label.
 
 #### Actionability filters — `--kev-only`, `--min-epss`, `--min-severity`
 
@@ -443,7 +456,7 @@ Semantics:
 
 The flags **compose** (a finding must clear every threshold given) and combine
 with `--tag` (e.g. `--tag in-scope --kev-only`). They apply identically to
-`json`, `csv`, `markdown`, and `html`. When a filter is active, services and assets left
+`json`, `csv`, `markdown`, `html`, and `sarif`. When a filter is active, services and assets left
 with no surviving findings are pruned, so the output collapses to a clean list
 of actionable hits. With no filter flags, `dump` returns the full inventory
 exactly as before (services with no findings still appear).
@@ -469,7 +482,7 @@ ossuary dump --db engagement-acme.db --kev-only --sort-by-priority
 
 Findings with no EPSS score or a blank/non-numeric severity sink to the bottom
 of their tier rather than being dropped (use the filters above to drop them).
-The flag applies identically to `json`, `csv`, `markdown`, and `html`, and composes with
+The flag applies identically to `json`, `csv`, `markdown`, `html`, and `sarif`, and composes with
 `--tag` and the actionability filters. Without it, ordering is the historical
 alphabetical-by-CVE-id, byte-for-byte unchanged.
 

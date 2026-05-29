@@ -383,6 +383,45 @@ change, fully offline-tested.
 
 ---
 
+## Rank 14 — SARIF v2.1.0 export (`dump --format sarif`)  ✅ IMPLEMENTED
+
+> Shipped: `dump` gains `--format sarif`, a fifth export format alongside
+> json / csv / markdown / html. It emits a SARIF v2.1.0 (Static Analysis Results
+> Interchange Format, OASIS) document — one `result` per finding, one
+> de-duplicated `rule` per distinct CVE (a CVE matched on several hosts
+> contributes a single rule referenced by `ruleIndex`). Each result is located by
+> `host:proto/port` and carries EPSS / KEV / severity / product / version / source
+> as `properties`; the SARIF `level` is derived from the live signal (KEV →
+> `error` always, then numeric CVSS tiers, then `warning` for an un-scored
+> non-KEV finding). CVE rules link to their NVD detail page via `helpUri`.
+> Rendering happens off the same `dump.build_state`, so the SARIF respects the R8
+> actionability filters and R9 `--sort-by-priority` identically to the other
+> formats; an empty engagement yields a valid document with an empty `results`
+> array. Pure-Python (`json`), no new dependencies, no schema change, no network
+> calls, fully offline-tested. +14 tests.
+
+**What:** R6 added machine- and paste-friendly export formats (csv / markdown),
+R11 added the shareable HTML deliverable, and R8/R9/R10 made the export show the
+*right* findings in the *right* order. The missing artifact is the **standard
+machine interchange format** — the file that drops an engagement's findings
+straight into the security-tooling ecosystem rather than a human's eyes. SARIF
+v2.1.0 is exactly that: GitHub code scanning, DefectDojo, Azure DevOps, and most
+SAST/DAST dashboards ingest it natively.
+
+**Why now:** It closes the report-export lineage opened by R6 from the other end.
+The JSON dump is ossuary's own shape, CSV is for spreadsheets, Markdown is for
+platform submissions, HTML is the human deliverable — but SARIF is the lingua
+franca for piping findings *into other tools*. With NIST's enrichment retreat the
+EPSS+KEV signal is the prioritisation axis; carrying it in the SARIF `level` and
+`properties` lets downstream triage tooling key off the live signal. Reusing
+`build_state` means it inherits every filter and ordering control for free, so
+it's a thin presentation layer over proven logic.
+
+**Effort:** Small. A pure-Python serialiser over the existing nested state + one
+`--format` choice; no new dependencies, no schema change, fully offline-tested.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |
