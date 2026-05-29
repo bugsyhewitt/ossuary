@@ -47,6 +47,8 @@ import sqlite3
 from pathlib import Path
 
 from . import db, dump
+from .vex import VexSuppressions
+from .vex import load as vex_load
 
 # How many leading findings the summary lists by default, in triage order.
 DEFAULT_TOP = 5
@@ -161,15 +163,16 @@ def _state_counts(
     min_epss: float | None,
     min_severity: float | None,
     kev_only: bool,
+    vex: VexSuppressions | None,
 ) -> tuple[int, int, list[dict]]:
     """Counts for the subset selected by `tag` and/or the actionability filters.
 
     Reuses ``dump.build_state`` with the identical scoping / filter parameters so
     the totals agree with a scoped-and-filtered ``dump`` by construction: same
     assets, same services, same surviving findings. (When the actionability
-    filters are active, ``build_state`` prunes services / assets with no
-    surviving findings, so those pruned rows are excluded from the counts too,
-    exactly as the filtered dump excludes them.) Returns (asset_count,
+    filters or VEX suppression are active, ``build_state`` prunes services /
+    assets with no surviving findings, so those pruned rows are excluded from the
+    counts too, exactly as the filtered dump excludes them.) Returns (asset_count,
     service_count, findings) where findings is a flat list of the finding dicts
     across every surviving service.
     """
@@ -179,6 +182,7 @@ def _state_counts(
         min_epss=min_epss,
         min_severity=min_severity,
         kev_only=kev_only,
+        vex=vex,
     )
     assets = state["assets"]
     service_count = 0
@@ -198,6 +202,7 @@ def build_stats(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    vex: VexSuppressions | None = None,
 ) -> dict:
     """Compute the engagement summary as a plain dict.
 
@@ -216,17 +221,30 @@ def build_stats(
     would export. The tag scoping and the filters compose (a finding must clear
     both to be counted).
 
-    When neither a tag nor any filter is set, the summary covers the whole
-    engagement and is computed straight off the tables (the historical behaviour,
-    byte-for-byte unchanged).
+    `vex`, when given, is a parsed VEX suppression index (see `ossuary.vex`):
+    findings whose CVE has been ruled `not_affected` / `fixed` for their location
+    are excluded from the counts, exactly as `dump --vex` excludes them from the
+    export — so the summary describes the post-triage subset a `dump --vex` would
+    show. It composes with the tag scoping and the actionability filters.
+
+    When neither a tag, a filter, nor a VEX index is set, the summary covers the
+    whole engagement and is computed straight off the tables (the historical
+    behaviour, byte-for-byte unchanged).
     """
-    if tag is not None or min_epss is not None or min_severity is not None or kev_only:
+    if (
+        tag is not None
+        or min_epss is not None
+        or min_severity is not None
+        or kev_only
+        or vex is not None
+    ):
         asset_count, service_count, findings = _state_counts(
             conn,
             tag=tag,
             min_epss=min_epss,
             min_severity=min_severity,
             kev_only=kev_only,
+            vex=vex,
         )
         return _aggregate(asset_count, service_count, findings, top=top)
 
@@ -252,6 +270,7 @@ def _scope_suffix(
     min_epss: float | None,
     min_severity: float | None,
     kev_only: bool,
+    vex: bool = False,
 ) -> str:
     """Build the ``(...)`` scope suffix recording the active tag / filters.
 
@@ -267,6 +286,8 @@ def _scope_suffix(
         parts.append(f"epss>={min_epss:g}")
     if min_severity is not None:
         parts.append(f"severity>={min_severity:g}")
+    if vex:
+        parts.append("vex-suppressed")
     return f" ({', '.join(parts)})" if parts else ""
 
 
@@ -277,15 +298,20 @@ def to_text(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    vex: bool = False,
 ) -> str:
     """Render the summary as a human-readable text report.
 
-    When a tag and/or any actionability filter is given the header records the
-    scope so a scoped / filtered roll-up reads unambiguously next to a
-    whole-engagement one.
+    When a tag and/or any actionability filter (or VEX suppression) is given the
+    header records the scope so a scoped / filtered roll-up reads unambiguously
+    next to a whole-engagement one.
     """
     suffix = _scope_suffix(
-        tag=tag, min_epss=min_epss, min_severity=min_severity, kev_only=kev_only
+        tag=tag,
+        min_epss=min_epss,
+        min_severity=min_severity,
+        kev_only=kev_only,
+        vex=vex,
     )
     header = f"engagement summary{suffix}"
     lines = [
@@ -330,6 +356,7 @@ def stats(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    vex_path: str | Path | None = None,
 ) -> str:
     """Return the engagement summary as a serialised string in the given format.
 
@@ -340,12 +367,17 @@ def stats(
     the same actionability filters `dump` applies (Rank 8); with any set the
     summary describes only the findings worth reporting, matching a filtered
     `dump` by construction.
+    `vex_path`, when set, is the path to an OpenVEX JSON document; findings whose
+    CVE has been ruled `not_affected` / `fixed` (for their location) are excluded
+    from the counts — the summary then describes the post-triage subset a
+    `dump --vex` would export. It composes with `tag` and the other filters.
     """
     if fmt not in SUPPORTED_FORMATS:
         supported = ", ".join(SUPPORTED_FORMATS)
         raise ValueError(
             f"unsupported stats format {fmt!r} (supported: {supported})"
         )
+    suppressions = vex_load(vex_path) if vex_path is not None else None
     conn = db.require_initialised(db_path)
     try:
         summary = build_stats(
@@ -355,6 +387,7 @@ def stats(
             min_epss=min_epss,
             min_severity=min_severity,
             kev_only=kev_only,
+            vex=suppressions,
         )
     finally:
         conn.close()
@@ -366,4 +399,5 @@ def stats(
         min_epss=min_epss,
         min_severity=min_severity,
         kev_only=kev_only,
+        vex=suppressions is not None,
     )

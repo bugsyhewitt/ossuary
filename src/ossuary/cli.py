@@ -41,6 +41,22 @@ def _add_db_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_vex_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--vex",
+        default=None,
+        metavar="PATH",
+        help=(
+            "path to an OpenVEX JSON document; suppress findings whose CVE has "
+            "been ruled not_affected / fixed (triage-cleared rows are hidden "
+            "but kept in the DB). A statement with no products suppresses the "
+            "CVE everywhere; a scoped statement suppresses only findings whose "
+            "ip / ip:proto/port / CPE matches a listed product (the same "
+            "suppression `dump --vex` applies)"
+        ),
+    )
+
+
 def _add_profile_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--profile",
@@ -325,6 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
             "catalog (the same filter `dump --kev-only` applies)"
         ),
     )
+    _add_vex_arg(p_stats)
 
     p_stale = sub.add_parser(
         "stale",
@@ -385,6 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
             "catalog (the same filter `dump --kev-only` applies)"
         ),
     )
+    _add_vex_arg(p_stale)
 
     p_diff = sub.add_parser(
         "diff",
@@ -447,6 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
             "on each side (the same filter `dump --kev-only` applies)"
         ),
     )
+    _add_vex_arg(p_diff)
 
     p_probe = sub.add_parser(
         "probe", help="HTTP/web layer discovery — probe web ports on known assets"
@@ -707,6 +726,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
             min_epss=args.min_epss,
             min_severity=args.min_severity,
             kev_only=args.kev_only,
+            vex_path=args.vex,
         )
     )
     return 0
@@ -722,6 +742,7 @@ def _cmd_stale(args: argparse.Namespace) -> int:
             min_epss=args.min_epss,
             min_severity=args.min_severity,
             kev_only=args.kev_only,
+            vex_path=args.vex,
         )
     )
     return 0
@@ -737,6 +758,7 @@ def _cmd_diff(args: argparse.Namespace) -> int:
             min_epss=args.min_epss,
             min_severity=args.min_severity,
             kev_only=args.kev_only,
+            vex_path=args.vex,
         )
     )
     return 0

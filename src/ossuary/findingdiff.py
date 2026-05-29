@@ -43,6 +43,8 @@ import json
 from pathlib import Path
 
 from . import db, dump
+from .vex import VexSuppressions
+from .vex import load as vex_load
 
 SUPPORTED_FORMATS = ("text", "json")
 
@@ -144,6 +146,7 @@ def _read_state(
     min_epss: float | None,
     min_severity: float | None,
     kev_only: bool,
+    vex: VexSuppressions | None,
 ) -> dict:
     """Open an engagement DB and return its scoped / filtered ``build_state``.
 
@@ -151,7 +154,8 @@ def _read_state(
     actionability filters are applied on top. So a diff scoped with either
     compares only the findings that survive the scope on *each* side — i.e.
     "what's new among the in-scope / actionable findings." With neither this is
-    the full finding inventory of the DB.
+    the full finding inventory of the DB. ``vex``, when given, suppresses
+    triage-cleared findings (``not_affected`` / ``fixed``) on this side too.
     """
     conn = db.require_initialised(db_path)
     try:
@@ -161,6 +165,7 @@ def _read_state(
             min_epss=min_epss,
             min_severity=min_severity,
             kev_only=kev_only,
+            vex=vex,
         )
     finally:
         conn.close()
@@ -174,6 +179,7 @@ def build_diff(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    vex: VexSuppressions | None = None,
 ) -> dict:
     """Compute the finding-level diff between two engagement DB files.
 
@@ -184,6 +190,13 @@ def build_diff(
     applied identically to both sides before diffing — so the diff describes the
     change within the scoped (in-scope / actionable) subset. ``tag`` composes
     with the actionability filters.
+
+    ``vex``, when given, is a parsed VEX suppression index (see ``ossuary.vex``);
+    findings ruled ``not_affected`` / ``fixed`` (for their location) are
+    suppressed on *both* sides before diffing — so a CVE triaged away on both the
+    baseline and the current scan never reads as ``persisting``, and one cleared
+    only on the current side reads as ``resolved`` (the triage resolved it, just
+    like a patch would). It composes with ``tag`` and the actionability filters.
     """
     baseline = _read_state(
         baseline_db,
@@ -191,6 +204,7 @@ def build_diff(
         min_epss=min_epss,
         min_severity=min_severity,
         kev_only=kev_only,
+        vex=vex,
     )
     current = _read_state(
         current_db,
@@ -198,6 +212,7 @@ def build_diff(
         min_epss=min_epss,
         min_severity=min_severity,
         kev_only=kev_only,
+        vex=vex,
     )
     return diff_states(baseline, current)
 
@@ -253,17 +268,21 @@ def diff(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    vex_path: str | Path | None = None,
 ) -> str:
     """Return the finding diff between two DBs as a serialised string.
 
     ``fmt`` is ``text`` (human-readable) or ``json`` (the same structure, for
     piping). ``tag`` scopes each side to assets carrying that label, and the
-    actionability filters scope both sides before diffing. See
-    :func:`build_diff` for the comparison semantics.
+    actionability filters scope both sides before diffing. ``vex_path``, when
+    set, is the path to an OpenVEX JSON document whose ``not_affected`` /
+    ``fixed`` rulings suppress matching findings on both sides before diffing.
+    See :func:`build_diff` for the comparison semantics.
     """
     if fmt not in SUPPORTED_FORMATS:
         supported = ", ".join(SUPPORTED_FORMATS)
         raise ValueError(f"unsupported diff format {fmt!r} (supported: {supported})")
+    suppressions = vex_load(vex_path) if vex_path is not None else None
     result = build_diff(
         baseline_db,
         current_db,
@@ -271,6 +290,7 @@ def diff(
         min_epss=min_epss,
         min_severity=min_severity,
         kev_only=kev_only,
+        vex=suppressions,
     )
     if fmt == "json":
         return json.dumps(result, indent=2, sort_keys=False)
