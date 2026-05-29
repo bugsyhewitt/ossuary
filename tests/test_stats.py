@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from ossuary import db, stats
+from ossuary import db, stats, tags
 
 
 def _seed_mixed(db_path):
@@ -191,3 +191,135 @@ def test_stats_rejects_unknown_format(db_path):
 def test_stats_uninitialised_db_raises(tmp_path):
     with pytest.raises(RuntimeError, match="not initialised"):
         stats.stats(tmp_path / "missing.db", "text")
+
+
+# --------------------------------------------------------------------------
+# tag scoping — the `--tag` workflow companion to `dump --tag`
+# --------------------------------------------------------------------------
+
+def _seed_two_hosts(db_path):
+    """Two assets with disjoint findings, so a tag scopes to one host's signal.
+
+    host-a (10.10.0.5): one KEV/high-EPSS/critical finding on port 80.
+    host-b (10.10.0.6): one non-KEV/low-EPSS/low finding on port 443.
+    Only host-a is tagged "in-scope".
+    """
+    conn = db.init_db(db_path)
+    try:
+        a = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        b = db.upsert_asset(conn, "10.10.0.6", "host-b", "up")
+        sa = db.upsert_service(conn, a, 80, "tcp", "http", "nginx", "1.18.0", None)
+        sb = db.upsert_service(conn, b, 443, "tcp", "https", "nginx", "1.20.0", None)
+        db.upsert_finding(conn, sa, "CVE-A", "exploited", "9.8",
+                          epss_score=0.91, kev=1)
+        db.upsert_finding(conn, sb, "CVE-B", "theoretical", "3.0",
+                          epss_score=0.03, kev=0)
+        conn.commit()
+    finally:
+        conn.close()
+    tags.add_tag(db_path, "10.10.0.5", "in-scope")
+
+
+def test_stats_tag_scopes_counts_to_tagged_asset(db_path):
+    _seed_two_hosts(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        summary = stats.build_stats(conn, tag="in-scope")
+    finally:
+        conn.close()
+    # Only host-a (and its one service / finding) is in scope.
+    assert summary["assets"] == 1
+    assert summary["services"] == 1
+    assert summary["findings"] == 1
+    assert summary["kev"] == 1
+
+
+def test_stats_tag_scopes_tiers_and_top(db_path):
+    _seed_two_hosts(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        summary = stats.build_stats(conn, tag="in-scope")
+    finally:
+        conn.close()
+    # Only CVE-A's signal survives the scope; CVE-B (host-b) is excluded.
+    assert summary["epss_tiers"] == {"high": 1, "medium": 0, "low": 0, "unscored": 0}
+    assert summary["severity_tiers"] == {
+        "critical": 1, "high": 0, "medium": 0, "low": 0, "blank": 0
+    }
+    assert [f["cve_id"] for f in summary["top_findings"]] == ["CVE-A"]
+
+
+def test_stats_no_tag_covers_whole_engagement(db_path):
+    _seed_two_hosts(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        summary = stats.build_stats(conn)
+    finally:
+        conn.close()
+    # Without a tag, both hosts and both findings are counted.
+    assert summary["assets"] == 2
+    assert summary["services"] == 2
+    assert summary["findings"] == 2
+    assert summary["kev"] == 1
+
+
+def test_stats_tag_agrees_with_scoped_dump(db_path):
+    from ossuary import dump
+
+    _seed_two_hosts(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        summary = stats.build_stats(conn, tag="in-scope")
+        state = dump.build_state(conn, tag="in-scope")
+    finally:
+        conn.close()
+    # stats counts must match what a scoped dump shows, by construction.
+    dump_assets = len(state["assets"])
+    dump_services = sum(len(a["services"]) for a in state["assets"])
+    dump_findings = sum(
+        len(s["findings"]) for a in state["assets"] for s in a["services"]
+    )
+    assert summary["assets"] == dump_assets
+    assert summary["services"] == dump_services
+    assert summary["findings"] == dump_findings
+
+
+def test_stats_unknown_tag_yields_empty_summary(db_path):
+    _seed_two_hosts(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        summary = stats.build_stats(conn, tag="does-not-exist")
+    finally:
+        conn.close()
+    assert summary["assets"] == 0
+    assert summary["services"] == 0
+    assert summary["findings"] == 0
+    assert summary["kev"] == 0
+    assert summary["top_findings"] == []
+
+
+def test_stats_text_tag_header_records_scope(db_path):
+    _seed_two_hosts(db_path)
+    out = stats.stats(db_path, "text", tag="in-scope")
+    assert "engagement summary (tag: in-scope)" in out
+    assert "assets:   1" in out
+    assert "CVE-A" in out
+    # the out-of-scope host's finding must not appear
+    assert "CVE-B" not in out
+
+
+def test_stats_text_no_tag_header_unchanged(db_path):
+    _seed_two_hosts(db_path)
+    out = stats.stats(db_path, "text")
+    # the header has no scope suffix when unscoped (byte-for-byte prior shape)
+    assert out.splitlines()[0] == "engagement summary"
+
+
+def test_stats_json_tag_scopes_numbers(db_path):
+    _seed_two_hosts(db_path)
+    scoped = json.loads(stats.stats(db_path, "json", tag="in-scope"))
+    full = json.loads(stats.stats(db_path, "json"))
+    assert scoped["assets"] == 1
+    assert full["assets"] == 2
+    # the json shape carries no extra "tag" key — same structure as before
+    assert set(scoped.keys()) == set(full.keys())

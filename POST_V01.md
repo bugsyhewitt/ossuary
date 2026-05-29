@@ -318,6 +318,35 @@ offline-tested.
 
 ---
 
+## Rank 12 — Tag-scoped engagement summary (`stats --tag`)  ✅ IMPLEMENTED
+
+> Shipped: `stats` gains `--tag LABEL`, scoping the roll-up to assets carrying
+> that label — the same scoping `dump --tag` (Rank 4) applies. Tag scoping
+> reuses `dump.build_state(conn, tag=...)`, so the scoped totals (assets /
+> services / findings / KEV / EPSS+severity tiers / top findings) agree with a
+> scoped `dump` by construction. The JSON shape is unchanged (no new key); the
+> text header records the scope as `engagement summary (tag: <label>)`. With no
+> `--tag`, behaviour is byte-for-byte the prior whole-engagement summary. Pure
+> Python, no new dependencies, no schema change, no network calls. +9 tests.
+
+**What:** R4 added asset tagging and wired `--tag` into `dump` (export only the
+in-scope / VIP / priority subset) and `cruise` (tag-change diffs). R10 added the
+`stats` roll-up — but only over the *whole* engagement. The gap: a hunter who
+tags hosts can scope their export but not their summary. `stats --tag` closes
+that, so the summarise-then-export workflow operates on one consistent subset.
+
+**Why now:** It's the last-mile consistency fix between the two read surfaces a
+hunter uses to triage a scoped engagement. `dump --tag` answers "give me the
+rows for these hosts"; `stats --tag` answers "give me the shape of these hosts."
+Reusing `build_state` means the scoped numbers can't drift from a scoped dump.
+
+**Effort:** Small. An optional `tag` param threaded through `build_stats` +
+`stats` + one argparse flag; the aggregation is factored into a shared helper so
+the tagged and untagged paths produce the identical structure. No new
+dependencies, no schema change, fully offline-tested.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |

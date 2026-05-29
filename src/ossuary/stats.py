@@ -9,6 +9,12 @@ The summary is computed from the same `assets` / `services` / `findings` data
 `dump` reads, so it stays consistent with every other surface. It carries no
 network calls, no new schema, and no new dependencies.
 
+`stats` accepts the same `tag` scoping `dump` does (Rank 4 tags): with a tag
+set, the roll-up covers only assets carrying that label — the natural companion
+to `dump --tag` so a hunter can both summarise *and* export the same in-scope /
+VIP / priority subset. Tag scoping reuses `dump.build_state`, so the scoped
+counts agree with a scoped dump by construction.
+
 Reported counts:
 
   * assets / services / findings totals
@@ -30,7 +36,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from . import db
+from . import db, dump
 
 # How many leading findings the summary lists by default, in triage order.
 DEFAULT_TOP = 5
@@ -93,24 +99,20 @@ def _severity_tier(sev: float | None) -> str:
     return "low"
 
 
-def build_stats(conn: sqlite3.Connection, *, top: int = DEFAULT_TOP) -> dict:
-    """Compute the engagement summary as a plain dict.
+def _aggregate(
+    asset_count: int,
+    service_count: int,
+    findings: list[dict],
+    *,
+    top: int,
+) -> dict:
+    """Roll counts up over a flat list of finding dicts into the summary shape.
 
-    `top` controls how many leading findings (in triage order) are returned in
-    the ``top_findings`` list. The counts cover the whole engagement regardless
-    of `top`.
+    Shared by both the whole-engagement path and the tag-scoped path so the two
+    produce the identical structure. `findings` carries at least the
+    ``cve_id`` / ``summary`` / ``severity`` / ``source`` / ``epss_score`` /
+    ``kev`` keys; extra keys are ignored.
     """
-    asset_count = conn.execute("SELECT COUNT(*) AS c FROM assets").fetchone()["c"]
-    service_count = conn.execute("SELECT COUNT(*) AS c FROM services").fetchone()["c"]
-
-    findings = [
-        dict(row)
-        for row in conn.execute(
-            "SELECT cve_id, summary, severity, source, epss_score, kev "
-            "FROM findings"
-        ).fetchall()
-    ]
-
     kev_count = 0
     epss_tiers = {"high": 0, "medium": 0, "low": 0, "unscored": 0}
     severity_tiers = {"critical": 0, "high": 0, "medium": 0, "low": 0, "blank": 0}
@@ -142,14 +144,71 @@ def build_stats(conn: sqlite3.Connection, *, top: int = DEFAULT_TOP) -> dict:
     }
 
 
+def _scoped_counts(conn: sqlite3.Connection, tag: str) -> tuple[int, int, list[dict]]:
+    """Counts for the subset of the engagement carrying `tag`.
+
+    Reuses ``dump.build_state(conn, tag=tag)`` so the scoped totals agree with a
+    scoped ``dump`` by construction: same assets, same services, same findings.
+    Returns (asset_count, service_count, findings) where findings is a flat list
+    of the finding dicts across every scoped service.
+    """
+    state = dump.build_state(conn, tag=tag)
+    assets = state["assets"]
+    service_count = 0
+    findings: list[dict] = []
+    for asset in assets:
+        service_count += len(asset["services"])
+        for svc in asset["services"]:
+            findings.extend(svc["findings"])
+    return len(assets), service_count, findings
+
+
+def build_stats(
+    conn: sqlite3.Connection,
+    *,
+    top: int = DEFAULT_TOP,
+    tag: str | None = None,
+) -> dict:
+    """Compute the engagement summary as a plain dict.
+
+    `top` controls how many leading findings (in triage order) are returned in
+    the ``top_findings`` list. The counts cover the whole scope regardless of
+    `top`.
+
+    `tag`, when set, restricts the roll-up to assets carrying that tag label —
+    the same scoping `dump --tag` applies — so a hunter can summarise just their
+    in-scope / VIP / priority subset. When unset, the summary covers the whole
+    engagement (the historical behaviour, byte-for-byte unchanged).
+    """
+    if tag is not None:
+        asset_count, service_count, findings = _scoped_counts(conn, tag)
+        return _aggregate(asset_count, service_count, findings, top=top)
+
+    asset_count = conn.execute("SELECT COUNT(*) AS c FROM assets").fetchone()["c"]
+    service_count = conn.execute("SELECT COUNT(*) AS c FROM services").fetchone()["c"]
+    findings = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT cve_id, summary, severity, source, epss_score, kev "
+            "FROM findings"
+        ).fetchall()
+    ]
+    return _aggregate(asset_count, service_count, findings, top=top)
+
+
 def _fmt_epss(epss) -> str:
     return f"{epss:.2f}" if epss is not None else "—"
 
 
-def to_text(summary: dict) -> str:
-    """Render the summary as a human-readable text report."""
+def to_text(summary: dict, *, tag: str | None = None) -> str:
+    """Render the summary as a human-readable text report.
+
+    When `tag` is given the header records the scope so a scoped roll-up reads
+    unambiguously next to a whole-engagement one.
+    """
+    header = "engagement summary" if tag is None else f"engagement summary (tag: {tag})"
     lines = [
-        "engagement summary",
+        header,
         f"  assets:   {summary['assets']}",
         f"  services: {summary['services']}",
         f"  findings: {summary['findings']}",
@@ -186,11 +245,14 @@ def stats(
     fmt: str = "text",
     *,
     top: int = DEFAULT_TOP,
+    tag: str | None = None,
 ) -> str:
     """Return the engagement summary as a serialised string in the given format.
 
     `fmt` is ``text`` (human-readable) or ``json`` (the same numbers, for
     piping). `top` bounds how many leading findings appear in the priority list.
+    `tag`, when set, scopes the roll-up to assets carrying that label — the same
+    subset `dump --tag` exports.
     """
     if fmt not in SUPPORTED_FORMATS:
         supported = ", ".join(SUPPORTED_FORMATS)
@@ -199,9 +261,9 @@ def stats(
         )
     conn = db.require_initialised(db_path)
     try:
-        summary = build_stats(conn, top=top)
+        summary = build_stats(conn, top=top, tag=tag)
     finally:
         conn.close()
     if fmt == "json":
         return json.dumps(summary, indent=2, sort_keys=False)
-    return to_text(summary)
+    return to_text(summary, tag=tag)

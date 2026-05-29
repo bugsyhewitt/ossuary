@@ -515,3 +515,31 @@ def test_cli_stats_json_format(tmp_path, capsys):
     summary = json.loads(capsys.readouterr().out)
     assert summary["assets"] == 0
     assert summary["top_findings"] == []
+
+
+def test_cli_stats_tag_scopes_summary(tmp_path, capsys):
+    """`stats --tag` scopes the roll-up to tagged assets, like `dump --tag`."""
+    from ossuary import db, tags
+
+    db_file = str(tmp_path / "engagement-test.db")
+    conn = db.init_db(db_file)
+    try:
+        a = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        b = db.upsert_asset(conn, "10.10.0.6", "host-b", "up")
+        sa = db.upsert_service(conn, a, 80, "tcp", "http", "nginx", "1.18.0", None)
+        sb = db.upsert_service(conn, b, 443, "tcp", "https", "nginx", "1.20.0", None)
+        db.upsert_finding(conn, sa, "CVE-A", "exploited", "9.8", epss_score=0.9, kev=1)
+        db.upsert_finding(conn, sb, "CVE-B", "noise", "3.0", epss_score=0.02, kev=0)
+        conn.commit()
+    finally:
+        conn.close()
+    tags.add_tag(db_file, "10.10.0.5", "in-scope")
+    capsys.readouterr()
+
+    rc = cli.main(["stats", "--db", db_file, "--tag", "in-scope"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "engagement summary (tag: in-scope)" in out
+    assert "assets:   1" in out
+    assert "CVE-A" in out
+    assert "CVE-B" not in out
