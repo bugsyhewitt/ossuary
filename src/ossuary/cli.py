@@ -9,6 +9,7 @@ Subcommands (v0.1):
     cruise       re-fingerprint, diff against last state, report changes
     watch        run cruise on an interval, emitting a diff summary each pass
     dump         export full engagement state as JSON, CSV, Markdown, HTML, or SARIF
+    web          list the recorded web-probe inventory (read companion to probe)
     stats        print a top-of-funnel engagement summary (counts + top hits)
     stale        flag findings not re-confirmed within N days (age staleness)
     diff         compare two engagement DBs -> new / resolved / persisting findings
@@ -28,7 +29,7 @@ from . import __version__, cruise as cruise_mod, cves, db, discover as discover_
 from . import dump as dump_mod, fingerprint as fingerprint_mod, probe as probe_mod
 from . import findingdiff as findingdiff_mod, profiles as profiles_mod
 from . import stale as stale_mod, stats as stats_mod, tags as tags_mod
-from . import watch as watch_mod
+from . import watch as watch_mod, web as web_mod
 
 
 def _add_db_arg(parser: argparse.ArgumentParser) -> None:
@@ -456,6 +457,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated list of ports to probe (default: 80,443,8080,8443)",
     )
 
+    p_web = sub.add_parser(
+        "web",
+        help="list the recorded web-probe inventory (read companion to probe)",
+    )
+    _add_db_arg(p_web)
+    p_web.add_argument(
+        "--format",
+        default="text",
+        choices=["text", "json"],
+        help="output format: text (human-readable, grouped per host) or json",
+    )
+    p_web.add_argument(
+        "--host",
+        default=None,
+        metavar="HOST",
+        help="only list probes for a single asset (IP or hostname)",
+    )
+    p_web.add_argument(
+        "--tech",
+        default=None,
+        metavar="TECH",
+        help=(
+            "only list probes whose tech fingerprints include TECH "
+            "(case-insensitive substring, e.g. wordpress, nginx)"
+        ),
+    )
+
     p_tag = sub.add_parser(
         "tag", help="attach / list / remove labels on assets for grouping & filtering"
     )
@@ -710,6 +738,18 @@ def _cmd_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_web(args: argparse.Namespace) -> int:
+    print(
+        web_mod.web(
+            args.db,
+            args.format,
+            host=args.host,
+            tech=args.tech,
+        )
+    )
+    return 0
+
+
 def _cmd_tag(args: argparse.Namespace) -> int:
     if args.tag_action == "add":
         created = tags_mod.add_tag(args.db, args.asset, args.tag)
@@ -748,6 +788,7 @@ _DISPATCH = {
     "stale": _cmd_stale,
     "diff": _cmd_diff,
     "probe": _cmd_probe,
+    "web": _cmd_web,
     "tag": _cmd_tag,
     "profiles": _cmd_profiles,
 }

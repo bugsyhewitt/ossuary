@@ -494,6 +494,42 @@ offline-tested.
 
 ---
 
+## Rank 18 — Web-layer inventory read surface (`ossuary web`)  ✅ IMPLEMENTED
+
+> Shipped: new `ossuary.web` module + `ossuary web` subcommand — the read
+> companion to `probe` (Rank 3). `probe` *writes* the `web_probes` table (status
+> code, `Server` banner, page `<title>`, redirect chain, tech fingerprints) but
+> nothing *read* it back: `dump` only walks assets → services → findings, so the
+> whole web layer a hunter populated was invisible after the live probe stdout
+> scrolled past. `ossuary web` lists every recorded probe joined to its owning
+> asset, ordered by IP / port / protocol, with `--format text|json`. Two filters
+> scope the listing without re-probing: `--host` (IP or hostname) and `--tech`
+> (case-insensitive substring match against the decoded tech fingerprints; they
+> compose). The `redirect_chain` / `tech_fingerprints` columns `probe` stores as
+> JSON text are decoded back into lists so both formats expose structured values.
+> Pure Python (`json`), no new dependencies, no schema change, no network calls,
+> fully offline-tested. +32 tests.
+
+**What:** Rank 3 added `ossuary probe` — the *write* side of the HTTP/web layer.
+But the persisted web inventory had no read surface: every other read command
+(`dump` / `stats` / `stale` / `diff`) walks the assets → services → findings
+nesting and never touches `web_probes`, so a hunter who probed could see the data
+once on stdout and never again. `ossuary web` is to `probe` what `stats` / `stale`
+are to `match-cves`: the read companion that surfaces what was written.
+
+**Why now:** It closes the gap opened by Rank 3. A hunter triaging a web target
+asks "which hosts answer HTTP, what are they running, where do they redirect" —
+exactly the columns `probe` already records but couldn't show. Reusing the stored
+rows means the listing can't drift from what `probe` wrote, and the `--tech`
+filter turns the web layer into a targeted surface ("show me every WordPress
+endpoint") rather than a one-shot scan log.
+
+**Effort:** Small. A pure-Python read-and-filter over the existing `web_probes`
+table + one subcommand; no new dependencies, no schema change, no network, fully
+offline-tested.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |
