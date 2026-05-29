@@ -497,6 +497,47 @@ def test_cli_dump_cyclonedx_format(tmp_path, monkeypatch, capsys):
     assert vuln["affects"][0]["ref"] == "10.10.0.5:tcp/80"
 
 
+def test_cli_dump_spdx_format(tmp_path, monkeypatch, capsys):
+    import json
+    import sqlite3
+
+    db_file = str(tmp_path / "engagement-test.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("INSERT INTO assets (id, ip, state) VALUES (1, '10.10.0.5', 'up')")
+        conn.execute(
+            "INSERT INTO services (id, asset_id, port, protocol, name, product, "
+            "version, cpe) VALUES (1, 1, 80, 'tcp', 'http', 'nginx', '1.18.0', "
+            "'cpe:/a:nginx')"
+        )
+        conn.execute(
+            "INSERT INTO findings (service_id, cve_id, summary, severity, epss_score, "
+            "kev) VALUES (1, 'CVE-2021-23017', 'off-by-one', '7.7', 0.5, 1)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    rc = cli.main(["dump", "--db", db_file, "--format", "spdx"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["spdxVersion"] == "SPDX-2.3"
+    pkg = doc["packages"][0]
+    assert pkg["SPDXID"] == "SPDXRef-10.10.0.5-tcp-80"
+    assert pkg["name"] == "nginx"
+    # The matched CVE rides as a SECURITY external reference on its package.
+    cve_refs = [
+        r["referenceLocator"]
+        for r in pkg["externalRefs"]
+        if r["referenceType"] == "cve"
+    ]
+    assert cve_refs == ["https://nvd.nist.gov/vuln/detail/CVE-2021-23017"]
+    # The document DESCRIBES the package.
+    assert doc["relationships"][0]["relatedSpdxElement"] == pkg["SPDXID"]
+
+
 def test_cli_dump_sort_by_priority(tmp_path, monkeypatch, capsys):
     import sqlite3
 

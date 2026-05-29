@@ -8,7 +8,7 @@ Subcommands (v0.1):
     match-cves   query OSV.dev for service versions -> findings table
     cruise       re-fingerprint, diff against last state, report changes
     watch        run cruise on an interval, emitting a diff summary each pass
-    dump         export full engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX
+    dump         export full engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX
     web          list the recorded web-probe inventory (read companion to probe)
     stats        print a top-of-funnel engagement summary (counts + top hits)
     stale        flag findings not re-confirmed within N days (age staleness)
@@ -201,14 +201,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_dump.add_argument(
         "--format",
         default="json",
-        choices=["json", "csv", "markdown", "html", "sarif", "jira", "cyclonedx"],
+        choices=[
+            "json",
+            "csv",
+            "markdown",
+            "html",
+            "sarif",
+            "jira",
+            "cyclonedx",
+            "spdx",
+        ],
         help=(
             "output format: json (nested), csv or markdown (flat, one finding "
             "per row), html (self-contained report grouped per asset), sarif "
             "(SARIF v2.1.0 for GitHub code scanning / DefectDojo / etc.), "
             "jira (issue-tracker import CSV for Jira / Linear, one ticket per "
-            "finding), or cyclonedx (CycloneDX 1.5 SBOM linking each finding to "
-            "its discovered-service component, for Dependency-Track / DefectDojo)"
+            "finding), cyclonedx (CycloneDX 1.5 SBOM linking each finding to "
+            "its discovered-service component, for Dependency-Track / DefectDojo), "
+            "or spdx (SPDX 2.3 SBOM — the ISO/IEC 5962:2021 standard alongside "
+            "CycloneDX — one package per service with a SECURITY external "
+            "reference per matched CVE)"
         ),
     )
     p_dump.add_argument(
