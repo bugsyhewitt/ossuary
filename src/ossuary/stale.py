@@ -36,6 +36,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import db, dump
+from .vex import VexSuppressions
+from .vex import load as vex_load
 
 # Default age threshold, in days, beyond which a finding is flagged stale.
 DEFAULT_MAX_AGE_DAYS = 30
@@ -80,6 +82,7 @@ def build_stale(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    vex: VexSuppressions | None = None,
 ) -> dict:
     """Compute the stale-findings report as a plain dict.
 
@@ -92,6 +95,12 @@ def build_stale(
     `kev_only`) scope the candidate set exactly as they do for `dump`, reusing
     `dump.build_state`, so the flagged subset can't drift from a scoped /
     filtered dump. The age threshold then applies on top.
+
+    `vex`, when given, is a parsed VEX suppression index (see `ossuary.vex`):
+    findings whose CVE has been ruled `not_affected` / `fixed` for their location
+    are dropped from the candidate set before the age check, so a triage-cleared
+    finding is never flagged stale (exactly as `dump --vex` hides it). It
+    composes with the tag scoping and the actionability filters.
 
     The returned dict carries `max_age_days`, the reference `as_of` timestamp,
     a `count`, and a `stale` list ordered oldest-first (findings with unknown age
@@ -111,6 +120,7 @@ def build_stale(
         min_epss=min_epss,
         min_severity=min_severity,
         kev_only=kev_only,
+        vex=vex,
     )
 
     stale: list[dict] = []
@@ -168,6 +178,7 @@ def _scope_suffix(
     min_epss: float | None,
     min_severity: float | None,
     kev_only: bool,
+    vex: bool = False,
 ) -> str:
     """Build the ``(...)`` scope suffix recording the active tag / filters."""
     parts: list[str] = []
@@ -179,6 +190,8 @@ def _scope_suffix(
         parts.append(f"epss>={min_epss:g}")
     if min_severity is not None:
         parts.append(f"severity>={min_severity:g}")
+    if vex:
+        parts.append("vex-suppressed")
     return f" ({', '.join(parts)})" if parts else ""
 
 
@@ -189,10 +202,15 @@ def to_text(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    vex: bool = False,
 ) -> str:
     """Render the stale report as a human-readable text block, oldest-first."""
     suffix = _scope_suffix(
-        tag=tag, min_epss=min_epss, min_severity=min_severity, kev_only=kev_only
+        tag=tag,
+        min_epss=min_epss,
+        min_severity=min_severity,
+        kev_only=kev_only,
+        vex=vex,
     )
     header = (
         f"stale findings{suffix} "
@@ -223,12 +241,17 @@ def stale(
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
+    vex_path: str | Path | None = None,
 ) -> str:
     """Return the stale-findings report as a serialised string.
 
     `fmt` is ``text`` (human-readable) or ``json`` (the same rows). `max_age_days`
     sets the staleness threshold in days. `tag` and the actionability filters
     scope the candidate set exactly as they do for `dump`.
+    `vex_path`, when set, is the path to an OpenVEX JSON document; findings whose
+    CVE has been ruled `not_affected` / `fixed` (for their location) are dropped
+    from the candidate set before the age check, so a triage-cleared finding is
+    never flagged stale. It composes with `tag` and the other filters.
     """
     if fmt not in SUPPORTED_FORMATS:
         supported = ", ".join(SUPPORTED_FORMATS)
@@ -237,6 +260,7 @@ def stale(
         )
     if max_age_days < 0:
         raise ValueError("--max-age-days must be non-negative")
+    suppressions = vex_load(vex_path) if vex_path is not None else None
     conn = db.require_initialised(db_path)
     try:
         report = build_stale(
@@ -246,6 +270,7 @@ def stale(
             min_epss=min_epss,
             min_severity=min_severity,
             kev_only=kev_only,
+            vex=suppressions,
         )
     finally:
         conn.close()
@@ -257,4 +282,5 @@ def stale(
         min_epss=min_epss,
         min_severity=min_severity,
         kev_only=kev_only,
+        vex=suppressions is not None,
     )

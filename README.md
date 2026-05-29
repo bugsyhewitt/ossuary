@@ -638,6 +638,13 @@ and `--sort-by-priority`, and applies identically to `json`, `csv`, `markdown`,
 pruned. With no `--vex`, the export is unchanged. A missing or malformed VEX file
 fails loudly with a clear error.
 
+The same `--vex` flag is also accepted by **`stats`**, **`stale`**, and
+**`diff`** — every finding-level read surface — so a single triage document
+silences the ruled-out findings everywhere at once: they drop out of the `stats`
+counts, are never flagged by `stale`, and are removed from both sides of a `diff`
+before the comparison (see each command's section below). The suppression
+semantics are identical across all four surfaces.
+
 ### Engagement summary (`ossuary stats`)
 
 `dump` emits the full per-finding inventory; `stats` gives the top-of-funnel
@@ -730,6 +737,18 @@ engagement summary (kev-only, epss>=0.5)
 This is the roll-up companion to the filtered export: `dump --kev-only` gives
 you *the actionable rows*, `stats --kev-only` gives you *the shape of the
 actionable subset* — both over the identical set of findings.
+
+`stats` also accepts `--vex PATH` (see
+[VEX suppression](#vex-suppression----vex)): findings the VEX document rules
+`not_affected` / `fixed` are excluded from every count, so the summary describes
+the post-triage subset a `dump --vex` would export. The text header records the
+scope as `vex-suppressed`, and it composes with `--tag` and the actionability
+filters.
+
+```bash
+# summarise what's left after the triage rulings are applied
+ossuary stats --db engagement-acme.db --vex triage.openvex.json
+```
 
 ### Cruise mode
 
@@ -890,10 +909,21 @@ ossuary diff --db baseline.db --against engagement-acme.db --min-epss 0.5 --form
 ossuary diff --db baseline.db --against engagement-acme.db --tag in-scope --kev-only
 ```
 
+**VEX suppression.** `diff` also accepts `--vex PATH` (see
+[VEX suppression](#vex-suppression----vex)). The rulings are applied to *both*
+sides before diffing, so a CVE you've triaged away (`not_affected` / `fixed`)
+never shows up as `persisting`, and one cleared only against the current scan
+reads as `resolved` (the triage resolved it, just like a patch would):
+
+```bash
+# diff what changed, ignoring the CVEs already ruled out
+ossuary diff --db baseline.db --against engagement-acme.db --vex triage.openvex.json
+```
+
 > **Design note.** `diff` reads each DB through the same `build_state` the
-> exports use, so the tag-scoped / filtered, location-keyed view it diffs is
-> identical to what a tag-scoped / filtered `dump` of each DB would show. Pure
-> Python, no new schema, no network.
+> exports use, so the tag-scoped / filtered / VEX-suppressed, location-keyed view
+> it diffs is identical to what a tag-scoped / filtered / suppressed `dump` of
+> each DB would show. Pure Python, no new schema, no network.
 
 ### Age staleness (`ossuary stale`)
 
@@ -931,6 +961,17 @@ my actively-exploited findings have gone stale":
 ```bash
 ossuary stale --db engagement-acme.db --kev-only
 ossuary stale --db engagement-acme.db --tag in-scope --min-epss 0.5 --format json
+```
+
+It also accepts `--vex PATH` (see
+[VEX suppression](#vex-suppression----vex)): a finding ruled `not_affected` /
+`fixed` is dropped from the candidate set before the age check, so a CVE you've
+already triaged away is never flagged stale. The text header records the scope as
+`vex-suppressed`, and it composes with `--tag` and the actionability filters.
+
+```bash
+# don't let triage-cleared findings show up as "stale"
+ossuary stale --db engagement-acme.db --vex triage.openvex.json
 ```
 
 `--format json` emits `{max_age_days, as_of, count, stale[]}` for piping.
