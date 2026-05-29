@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from ossuary import db, dump
+from ossuary import db, dump, tags
 
 # Columns shared by the flat (CSV / Markdown) exports — one finding per row,
 # joining asset + service + finding context.
@@ -883,3 +883,172 @@ def test_normalise_until_leaves_datetime_untouched():
 
 def test_normalise_until_passes_none_through():
     assert dump._normalise_until(None) is None
+
+
+# --------------------------------------------------------------------------
+# Issue-tracker import CSV export (Jira / Linear)
+# --------------------------------------------------------------------------
+
+JIRA_COLUMNS = [
+    "Summary",
+    "Description",
+    "Priority",
+    "Labels",
+    "Component",
+    "CVE",
+    "EPSS",
+    "KEV",
+    "Severity",
+    "Host",
+    "Port",
+]
+
+
+def _jira_rows(out: str) -> list[dict]:
+    """Parse the jira-format CSV into a list of dict rows (header-keyed)."""
+    reader = csv.reader(io.StringIO(out))
+    rows = list(reader)
+    assert rows[0] == JIRA_COLUMNS
+    return [dict(zip(JIRA_COLUMNS, r)) for r in rows[1:]]
+
+
+def test_dump_jira_is_listed_as_supported_format():
+    assert "jira" in dump.SUPPORTED_FORMATS
+
+
+def test_dump_jira_has_issue_tracker_header():
+    # The first four columns are the ones Jira / Linear map onto issue fields.
+    assert dump.JIRA_COLUMNS[:4] == ["Summary", "Description", "Priority", "Labels"]
+
+
+def test_dump_jira_emits_one_row_per_finding(db_path):
+    _seed_one_finding(db_path)
+    rows = _jira_rows(dump.dump(db_path, "jira"))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["CVE"] == "CVE-2021-23017"
+    assert row["Host"] == "10.10.0.5 (host-a)"
+    assert row["Port"] == "tcp/80"
+    assert row["Severity"] == "7.7"
+
+
+def test_dump_jira_empty_db_is_header_only(db_path):
+    db.init_db(db_path).close()
+    rows = _jira_rows(dump.dump(db_path, "jira"))
+    assert rows == []
+
+
+def test_dump_jira_omits_service_with_no_findings(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.9", None, "up")
+        db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        conn.commit()
+    finally:
+        conn.close()
+    # Finding-centric: a service with no finding produces no ticket row.
+    rows = _jira_rows(dump.dump(db_path, "jira"))
+    assert rows == []
+
+
+def test_dump_jira_summary_and_description_are_ticket_shaped(db_path):
+    _seed_one_finding(db_path)
+    row = _jira_rows(dump.dump(db_path, "jira"))[0]
+    # Summary is a human title naming the CVE and host.
+    assert "CVE-2021-23017" in row["Summary"]
+    assert "10.10.0.5 (host-a)" in row["Summary"]
+    # Description carries the triage context, including the OSV summary text.
+    assert "CVE: CVE-2021-23017" in row["Description"]
+    assert "off-by-one" in row["Description"]
+
+
+def test_dump_jira_priority_maps_from_live_signal(db_path):
+    _seed_mixed_findings(db_path)
+    by_cve = {r["CVE"]: r for r in _jira_rows(dump.dump(db_path, "jira"))}
+    # KEV -> Highest; high EPSS/severity -> High; cold low -> Low; mid -> Medium.
+    assert by_cve["CVE-HOT"]["Priority"] == "Highest"
+    assert by_cve["CVE-COLD"]["Priority"] == "Low"
+    assert by_cve["CVE-MID"]["Priority"] == "Medium"
+
+
+def test_dump_jira_blank_signal_is_low_priority(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-BLANK", "x", None, epss_score=None, kev=0)
+        conn.commit()
+    finally:
+        conn.close()
+    row = _jira_rows(dump.dump(db_path, "jira"))[0]
+    assert row["Priority"] == "Low"
+
+
+def test_dump_jira_kev_finding_carries_kev_label(db_path):
+    _seed_mixed_findings(db_path)
+    by_cve = {r["CVE"]: r for r in _jira_rows(dump.dump(db_path, "jira"))}
+    assert by_cve["CVE-HOT"]["KEV"] == "yes"
+    assert "kev" in by_cve["CVE-HOT"]["Labels"].split(";")
+    # A non-KEV finding has no kev label.
+    assert by_cve["CVE-COLD"]["KEV"] == "no"
+    assert "kev" not in by_cve["CVE-COLD"]["Labels"].split(";")
+
+
+def test_dump_jira_labels_include_asset_tags(db_path):
+    _seed_one_finding(db_path)
+    tags.add_tag(db_path, "10.10.0.5", "in-scope")
+    row = _jira_rows(dump.dump(db_path, "jira"))[0]
+    assert "in-scope" in row["Labels"].split(";")
+
+
+def test_dump_jira_component_reflects_service(db_path):
+    _seed_one_finding(db_path)
+    row = _jira_rows(dump.dump(db_path, "jira"))[0]
+    assert row["Component"] == "nginx 1.18.0"
+
+
+def test_dump_jira_epss_cell_formatted_and_blank_when_absent(db_path):
+    _seed_mixed_findings(db_path)
+    by_cve = {r["CVE"]: r for r in _jira_rows(dump.dump(db_path, "jira"))}
+    assert by_cve["CVE-HOT"]["EPSS"] == "0.94"
+    # No EPSS score -> empty cell, not "None".
+    assert by_cve["CVE-MID"]["EPSS"] == ""
+
+
+def test_dump_jira_honours_actionability_filters(db_path):
+    _seed_mixed_findings(db_path)
+    rows = _jira_rows(dump.dump(db_path, "jira", kev_only=True))
+    # Only the KEV finding survives the filter.
+    assert [r["CVE"] for r in rows] == ["CVE-HOT"]
+
+
+def test_dump_jira_honours_tag_scope(db_path):
+    _seed_mixed_findings(db_path)
+    tags.add_tag(db_path, "10.10.0.5", "in-scope")
+    rows = _jira_rows(dump.dump(db_path, "jira", tag="in-scope"))
+    # The tagged host's findings all appear.
+    assert {r["CVE"] for r in rows} == {"CVE-HOT", "CVE-COLD", "CVE-MID"}
+    # A tag no asset carries scopes to nothing.
+    assert _jira_rows(dump.dump(db_path, "jira", tag="nope")) == []
+
+
+def test_dump_jira_sort_by_priority_orders_rows(db_path):
+    _seed_mixed_findings(db_path)
+    rows = _jira_rows(dump.dump(db_path, "jira", sort_by_priority=True))
+    # Within svc-80 the KEV finding leads the cold one under priority order.
+    cves_80 = [r["CVE"] for r in rows if r["Component"] == "nginx 1.18.0"]
+    assert cves_80 == ["CVE-HOT", "CVE-COLD"]
+
+
+def test_dump_jira_round_trips_through_csv_reader(db_path):
+    # A finding summary with a comma / newline must survive CSV quoting intact.
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-CSV", "heap overflow, then RCE", "9.0")
+        conn.commit()
+    finally:
+        conn.close()
+    row = _jira_rows(dump.dump(db_path, "jira"))[0]
+    assert "heap overflow, then RCE" in row["Description"]

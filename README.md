@@ -60,7 +60,7 @@ ossuary web          list the recorded web-probe inventory (read companion to pr
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
-ossuary dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF (filterable by KEV/EPSS/severity)
+ossuary dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira (filterable by KEV/EPSS/severity)
 ossuary stats        print an at-a-glance engagement summary (counts + top hits)
 ossuary stale        flag findings not re-confirmed within N days (age staleness)
 ossuary diff         compare two engagement DBs -> new / resolved / persisting findings
@@ -424,7 +424,7 @@ ossuary dump --db engagement-acme.db --format json > acme-state.json
 
 ### Export formats
 
-`dump` speaks five formats via `--format`:
+`dump` speaks six formats via `--format`:
 
 ```bash
 ossuary dump --db engagement-acme.db --format json     > acme-state.json
@@ -432,6 +432,7 @@ ossuary dump --db engagement-acme.db --format csv      > acme-findings.csv
 ossuary dump --db engagement-acme.db --format markdown > acme-findings.md
 ossuary dump --db engagement-acme.db --format html     > acme-report.html
 ossuary dump --db engagement-acme.db --format sarif    > acme-findings.sarif
+ossuary dump --db engagement-acme.db --format jira     > acme-tickets.csv
 ```
 
 - **`json`** (default) — the nested `assets → services → findings` structure,
@@ -454,6 +455,18 @@ ossuary dump --db engagement-acme.db --format sarif    > acme-findings.sarif
   DefectDojo, Azure DevOps, and the wider security-tooling ecosystem ingest
   natively, so you can pipe an engagement's findings straight into a triage
   pipeline or a code-scanning dashboard.
+- **`jira`** — an **issue-tracker import CSV** shaped as tickets rather than raw
+  inventory: one row per finding with `Summary`, `Description`, `Priority`, and
+  `Labels` columns (plus `Component`, `CVE`, `EPSS`, `KEV`, `Severity`, `Host`,
+  `Port` for context). Both Jira's CSV importer and Linear's CSV importer map
+  those leading columns straight onto issue fields, so a hunter turns an
+  engagement's findings into a triage backlog without retyping. `Priority` is
+  mapped from the live signal — a **KEV** (confirmed-exploited) finding is always
+  `Highest`, then the hotter of EPSS / CVSS drives it (`>= 0.5` EPSS or `>= 7.0`
+  CVSS → `High`, `>= 0.1` EPSS or `>= 4.0` CVSS → `Medium`, otherwise `Low`).
+  Each row's `Labels` carries the host's tags plus `kev` when confirmed
+  exploited. Like SARIF it is finding-centric (a service with no finding produces
+  no ticket).
 
 The `json`, `csv`, and `markdown` formats cover the same fields; CSV and
 Markdown flatten the JSON nesting into these columns: `ip, hostname,
@@ -465,8 +478,12 @@ a service with no finding produces no `result` — and maps each finding to a SA
 `level`: a **KEV** finding is always `error` (regardless of the often-blank
 post-NIST-retreat CVSS), then numeric severity drives it (`>= 7.0` → `error`,
 `>= 4.0` → `warning`, lower → `note`), with an un-scored, non-KEV finding
-defaulting to `warning`. `--tag LABEL` filters every format to the assets
-carrying that label.
+defaulting to `warning`. The `jira` CSV is likewise finding-centric (one ticket
+per finding, no row for a finding-less service) and uses *issue-tracker* column
+names (`Summary` / `Description` / `Priority` / `Labels` …) rather than the raw
+inventory columns the plain `csv` format emits. `--tag LABEL` filters every
+format to the assets carrying that label (for `jira`, the tags also flow into
+each ticket's `Labels`).
 
 #### Actionability filters — `--kev-only`, `--min-epss`, `--min-severity`
 
@@ -498,7 +515,7 @@ Semantics:
 
 The flags **compose** (a finding must clear every threshold given) and combine
 with `--tag` (e.g. `--tag in-scope --kev-only`). They apply identically to
-`json`, `csv`, `markdown`, `html`, and `sarif`. When a filter is active, services and assets left
+`json`, `csv`, `markdown`, `html`, `sarif`, and `jira`. When a filter is active, services and assets left
 with no surviving findings are pruned, so the output collapses to a clean list
 of actionable hits. With no filter flags, `dump` returns the full inventory
 exactly as before (services with no findings still appear).
@@ -524,7 +541,7 @@ ossuary dump --db engagement-acme.db --kev-only --sort-by-priority
 
 Findings with no EPSS score or a blank/non-numeric severity sink to the bottom
 of their tier rather than being dropped (use the filters above to drop them).
-The flag applies identically to `json`, `csv`, `markdown`, `html`, and `sarif`, and composes with
+The flag applies identically to `json`, `csv`, `markdown`, `html`, `sarif`, and `jira`, and composes with
 `--tag` and the actionability filters. Without it, ordering is the historical
 alphabetical-by-CVE-id, byte-for-byte unchanged.
 
@@ -553,7 +570,7 @@ Dates may be a bare `YYYY-MM-DD` or a full `'YYYY-MM-DD HH:MM:SS'`. A bare-date
 survives `--until 2026-05-29`). A finding with no recorded `matched_at` is
 excluded once either bound is set, and services / assets left with no surviving
 findings are pruned — exactly like the actionability filters. The window applies
-identically to `json`, `csv`, `markdown`, `html`, and `sarif`, and composes with
+identically to `json`, `csv`, `markdown`, `html`, `sarif`, and `jira`, and composes with
 `--tag`, the actionability filters, and `--sort-by-priority`. With neither bound
 set, the export is unchanged.
 

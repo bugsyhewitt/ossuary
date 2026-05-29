@@ -24,6 +24,16 @@ findings) to one of four shapes:
                    engagement's actionable findings straight into the tooling
                    ecosystem. Like the other formats it reads off ``build_state``,
                    so it honours the same filters and priority order.
+  * ``jira``     — an issue-tracker import CSV: one row per finding, shaped as a
+                   ticket (``Summary`` title, rich ``Description``, mapped
+                   ``Priority``, ``Labels``) rather than the raw inventory the
+                   plain ``csv`` format emits. Both Jira's CSV importer and
+                   Linear's CSV importer map these columns straight onto issue
+                   fields, so a hunter can turn an engagement's actionable
+                   findings into a triage backlog without retyping. It is
+                   finding-centric (a service with no finding produces no row,
+                   like SARIF) and reads off ``build_state``, so it honours the
+                   same filters and priority order.
 
 The flat (csv / markdown) formats cover exactly the same fields as the JSON
 output, flattened across the asset/service/finding nesting.
@@ -65,7 +75,7 @@ from pathlib import Path
 
 from . import __version__, db, tags
 
-SUPPORTED_FORMATS = ("json", "csv", "markdown", "html", "sarif")
+SUPPORTED_FORMATS = ("json", "csv", "markdown", "html", "sarif", "jira")
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
 # the asset-, service-, and finding-level fields the JSON dump exposes.
@@ -687,6 +697,139 @@ def to_sarif(state: dict) -> str:
     return json.dumps(sarif, indent=2, sort_keys=False)
 
 
+# --------------------------------------------------------------------------
+# Issue-tracker import CSV export (Jira / Linear)
+# --------------------------------------------------------------------------
+
+# Columns for the issue-tracker import CSV, in emission order. The first four
+# are the ones Jira's CSV importer and Linear's CSV importer map directly onto
+# issue fields (Summary -> title, Description -> body, Priority -> priority,
+# Labels -> labels); the remainder ride along as custom fields / extra columns
+# so the triage context isn't lost. This is a ticket-shaped view, distinct from
+# the raw-inventory FLAT_COLUMNS the plain `csv` format emits.
+JIRA_COLUMNS = [
+    "Summary",
+    "Description",
+    "Priority",
+    "Labels",
+    "Component",
+    "CVE",
+    "EPSS",
+    "KEV",
+    "Severity",
+    "Host",
+    "Port",
+]
+
+
+def _jira_priority(finding: dict) -> str:
+    """Map a finding's live exploitation signal to a Jira/Linear priority name.
+
+    Uses the same KEV-first / EPSS / numeric-severity signal the rest of ossuary
+    triages on, mapped onto the default Jira priority scheme (which Linear's CSV
+    importer also recognises): a KEV (confirmed-exploited) finding is always
+    ``Highest``; otherwise EPSS or numeric CVSS — whichever is hotter — drives it
+    (>= 0.5 EPSS or >= 7.0 CVSS -> ``High``, >= 0.1 EPSS or >= 4.0 CVSS ->
+    ``Medium``), with an un-scored / cold finding defaulting to ``Low``.
+    """
+    if finding.get("kev"):
+        return "Highest"
+    epss = finding.get("epss_score")
+    sev = _parse_severity(finding.get("severity"))
+    if (epss is not None and epss >= 0.5) or (sev is not None and sev >= 7.0):
+        return "High"
+    if (epss is not None and epss >= 0.1) or (sev is not None and sev >= 4.0):
+        return "Medium"
+    return "Low"
+
+
+def _jira_rows(state: dict) -> list[dict]:
+    """Flatten the nested engagement state to one issue-shaped dict per finding.
+
+    Finding-centric: a service with no findings yields no row (the format is a
+    triage backlog of vulnerabilities, not an asset inventory). Each row carries
+    a human ``Summary`` title, a multi-line ``Description`` with the triage
+    context, a mapped ``Priority``, and ``;``-joined ``Labels`` (the host's tags
+    plus ``kev`` when confirmed-exploited).
+    """
+    rows: list[dict] = []
+    for asset in state["assets"]:
+        ip = asset["ip"]
+        host = asset.get("hostname")
+        host_label = f"{ip} ({host})" if host else ip
+        asset_tags = list(asset.get("tags") or [])
+        for svc in asset["services"]:
+            port = svc["port"]
+            protocol = svc["protocol"]
+            product = svc.get("product")
+            version = svc.get("version")
+            svc_detail = " ".join(p for p in (product, version) if p)
+            component = svc_detail or f"{protocol}/{port}"
+            for f in svc["findings"]:
+                cve_id = f.get("cve_id") or "UNKNOWN"
+                summary_text = f.get("summary") or ""
+                epss = f.get("epss_score")
+                epss_cell = f"{epss:.2f}" if isinstance(epss, (int, float)) else ""
+                kev = bool(f.get("kev"))
+                severity = f.get("severity") or ""
+
+                title = f"{cve_id} on {host_label}" + (
+                    f" ({svc_detail})" if svc_detail else f" ({protocol}/{port})"
+                )
+                desc_lines = [
+                    f"CVE: {cve_id}",
+                    f"Host: {host_label}",
+                    f"Service: {protocol}/{port}"
+                    + (f" — {svc_detail}" if svc_detail else ""),
+                    f"Severity (CVSS): {severity or '—'}",
+                    f"EPSS: {epss_cell or '—'}",
+                    f"KEV (CISA confirmed-exploited): {'yes' if kev else 'no'}",
+                ]
+                if f.get("source"):
+                    desc_lines.append(f"Source: {f['source']}")
+                if summary_text:
+                    desc_lines.append("")
+                    desc_lines.append(summary_text)
+                description = "\n".join(desc_lines)
+
+                labels = list(asset_tags)
+                if kev:
+                    labels.append("kev")
+
+                rows.append(
+                    {
+                        "Summary": title,
+                        "Description": description,
+                        "Priority": _jira_priority(f),
+                        "Labels": ";".join(labels),
+                        "Component": component,
+                        "CVE": cve_id,
+                        "EPSS": epss_cell,
+                        "KEV": "yes" if kev else "no",
+                        "Severity": severity,
+                        "Host": host_label,
+                        "Port": f"{protocol}/{port}",
+                    }
+                )
+    return rows
+
+
+def to_jira(state: dict) -> str:
+    """Serialise the engagement state as an issue-tracker import CSV.
+
+    One row per finding, shaped as a ticket (``Summary`` / ``Description`` /
+    ``Priority`` / ``Labels`` …) so Jira's and Linear's CSV importers map the
+    rows straight onto issue fields. Finding-centric: services with no findings
+    produce no rows. An empty engagement still yields a valid CSV (header only).
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(JIRA_COLUMNS)
+    for row in _jira_rows(state):
+        writer.writerow([_cell(row.get(col)) for col in JIRA_COLUMNS])
+    return buf.getvalue()
+
+
 def dump(
     db_path: str | Path,
     fmt: str = "json",
@@ -701,7 +844,8 @@ def dump(
 ) -> str:
     """Return the engagement state as a serialised string in the given format.
 
-    `fmt` is one of ``json``, ``csv``, ``markdown``, ``html``, or ``sarif``.
+    `fmt` is one of ``json``, ``csv``, ``markdown``, ``html``, ``sarif``, or
+    ``jira`` (an issue-tracker import CSV for Jira / Linear).
     `tag`, when set,
     restricts the export to assets carrying that tag label. `min_epss`,
     `min_severity`, and `kev_only` are actionability filters: each restricts the
@@ -740,4 +884,6 @@ def dump(
         return to_html(state)
     if fmt == "sarif":
         return to_sarif(state)
+    if fmt == "jira":
+        return to_jira(state)
     return json.dumps(state, indent=2, sort_keys=False)
