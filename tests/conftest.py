@@ -54,24 +54,39 @@ def osv_response(vulns: list[dict] | None = None) -> dict:
 # NVD CVE API v2-shaped builder
 # --------------------------------------------------------------------------
 
+# Maps the friendly CVSS-version label used in test partials to the metric key
+# NVD's CVE API v2 nests the score under.
+_NVD_METRIC_KEYS = {
+    "v4": "cvssMetricV40",
+    "v31": "cvssMetricV31",
+    "v30": "cvssMetricV30",
+    "v2": "cvssMetricV2",
+}
+
+
 def nvd_response(cves: list[dict] | None = None) -> dict:
     """Build an NVD CVE API v2 response.
 
-    `cves` is a list of {id, summary, base_score} partials. Each is wrapped in
-    the v2 schema's `vulnerabilities[].cve` envelope with an English description
-    and (when base_score is given) a CVSS v3.1 metric. Empty/None yields the
-    NVD "no results" shape ({"vulnerabilities": []}).
+    `cves` is a list of {id, summary, base_score, cvss} partials. Each is
+    wrapped in the v2 schema's `vulnerabilities[].cve` envelope with an English
+    description and (when base_score is given) a CVSS metric. The optional
+    `cvss` field selects which CVSS version the score is published under —
+    ``"v4"``/``"v31"``/``"v30"``/``"v2"`` — defaulting to v3.1 so existing
+    callers are unaffected. A partial may also pass `metrics` directly to inject
+    a raw metrics dict (e.g. to mix multiple CVSS versions on one CVE). Empty/
+    None yields the NVD "no results" shape ({"vulnerabilities": []}).
     """
     vulnerabilities = []
     for entry in cves or []:
         cve: dict = {"id": entry["id"]}
         if entry.get("summary") is not None:
             cve["descriptions"] = [{"lang": "en", "value": entry["summary"]}]
-        if entry.get("base_score") is not None:
+        if entry.get("metrics") is not None:
+            cve["metrics"] = entry["metrics"]
+        elif entry.get("base_score") is not None:
+            key = _NVD_METRIC_KEYS[entry.get("cvss", "v31")]
             cve["metrics"] = {
-                "cvssMetricV31": [
-                    {"cvssData": {"baseScore": entry["base_score"]}}
-                ]
+                key: [{"cvssData": {"baseScore": entry["base_score"]}}]
             }
         vulnerabilities.append({"cve": cve})
     return {"vulnerabilities": vulnerabilities}

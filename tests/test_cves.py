@@ -175,6 +175,43 @@ def test_parse_nvd_response_empty():
     assert cves.parse_nvd_response({}) == []
 
 
+def test_parse_nvd_response_extracts_cvss_v4_score():
+    # A CVE scored only under CVSS 4.0 (cvssMetricV40) must surface its score
+    # instead of falling through to a blank severity.
+    resp = nvd_response(
+        [
+            {
+                "id": "CVE-2025-0001",
+                "summary": "v4-only scored CVE",
+                "base_score": 9.3,
+                "cvss": "v4",
+            }
+        ]
+    )
+    findings = cves.parse_nvd_response(resp)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "9.3"
+
+
+def test_nvd_severity_prefers_v4_over_v31():
+    # When both CVSS 4.0 and 3.1 metrics are present, v4 (newest standard) wins.
+    metrics = {
+        "cvssMetricV40": [{"cvssData": {"baseScore": 9.3}}],
+        "cvssMetricV31": [{"cvssData": {"baseScore": 7.5}}],
+    }
+    assert cves._nvd_severity(metrics) == "9.3"
+
+
+def test_nvd_severity_falls_back_to_v31_when_no_v4():
+    # No v4 metric => the existing v3.1 > v3.0 > v2 fallback chain still applies.
+    metrics = {"cvssMetricV31": [{"cvssData": {"baseScore": 7.5}}]}
+    assert cves._nvd_severity(metrics) == "7.5"
+
+
+def test_nvd_severity_none_when_no_metrics():
+    assert cves._nvd_severity({}) is None
+
+
 def test_nvd_not_called_for_default_osv_source(db_path, monkeypatch):
     _seed_service(db_path, "nginx", "1.18.0")
     monkeypatch.setattr(cves, "query_osv", lambda p, v: osv_response([]))
