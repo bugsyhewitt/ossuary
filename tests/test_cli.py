@@ -419,6 +419,40 @@ def test_cli_dump_sarif_format(tmp_path, monkeypatch, capsys):
     assert run["results"][0]["level"] == "error"
 
 
+def test_cli_dump_jira_format(tmp_path, monkeypatch, capsys):
+    import csv
+    import io
+    import sqlite3
+
+    db_file = str(tmp_path / "engagement-test.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("INSERT INTO assets (id, ip, state) VALUES (1, '10.10.0.5', 'up')")
+        conn.execute(
+            "INSERT INTO services (id, asset_id, port, protocol, name, product, "
+            "version) VALUES (1, 1, 80, 'tcp', 'http', 'nginx', '1.18.0')"
+        )
+        conn.execute(
+            "INSERT INTO findings (service_id, cve_id, summary, severity, epss_score, "
+            "kev) VALUES (1, 'CVE-2021-23017', 'off-by-one', '7.7', 0.5, 1)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    rc = cli.main(["dump", "--db", db_file, "--format", "jira"])
+    assert rc == 0
+    rows = list(csv.reader(io.StringIO(capsys.readouterr().out)))
+    assert rows[0][:4] == ["Summary", "Description", "Priority", "Labels"]
+    row = dict(zip(rows[0], rows[1]))
+    assert row["CVE"] == "CVE-2021-23017"
+    # KEV finding maps to the top priority and carries the kev label.
+    assert row["Priority"] == "Highest"
+    assert "kev" in row["Labels"].split(";")
+
+
 def test_cli_dump_sort_by_priority(tmp_path, monkeypatch, capsys):
     import sqlite3
 
