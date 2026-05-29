@@ -61,6 +61,7 @@ ossuary cruise       re-fingerprint, diff against last saved state, report chang
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
 ossuary dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF (filterable by KEV/EPSS/severity)
 ossuary stats        print an at-a-glance engagement summary (counts + top hits)
+ossuary stale        flag findings not re-confirmed within N days (age staleness)
 ossuary diff         compare two engagement DBs -> new / resolved / persisting findings
 ossuary tag          attach / list / remove labels on assets for grouping & filtering
 ossuary profiles     list the named scan profiles and their nmap flags
@@ -752,6 +753,51 @@ ossuary diff --db baseline.db --against engagement-acme.db --min-epss 0.5 --form
 > **Design note.** `diff` reads each DB through the same `build_state` the
 > exports use, so the filtered, location-keyed view it diffs is identical to what
 > a filtered `dump` of each DB would show. Pure Python, no new schema, no network.
+
+### Age staleness (`ossuary stale`)
+
+`dump --since/--until` slices findings by an *absolute* scan-time window. `stale`
+asks the *relative* question: **which findings haven't been re-confirmed by a
+recent scan?** Every time `match-cves` re-matches a CVE on a service it refreshes
+that finding's `matched_at`, so a finding whose `matched_at` has gone cold has not
+been re-seen since that date. Two things produce a cold finding, and both are
+worth surfacing:
+
+- the service was **patched or removed** and the stale row is now noise to prune;
+- it's a **long-standing exposure** that has sat unresolved for weeks.
+
+`ossuary stale` flags every finding older than a threshold (default **30 days**),
+ordered oldest-first so the most-neglected finding leads:
+
+```bash
+ossuary stale --db engagement-acme.db
+#   stale findings (> 30 days, as of 2026-05-29 12:00:00)
+#     count: 1
+#     10.10.0.5:tcp/80  CVE-2020-1234  age: 148.3d  severity: 9.0  EPSS: 0.80 | KEV: YES  (last seen: 2026-01-01 12:00:00)
+
+# tighten or loosen the window
+ossuary stale --db engagement-acme.db --max-age-days 7
+```
+
+A finding with **no recorded `matched_at`** is always flagged (unknown age == not
+recently confirmed), with its age reported as `unknown`; these sort last.
+
+**Scoping & filters.** `stale` accepts the same `--tag`, `--kev-only`,
+`--min-epss`, and `--min-severity` controls as `dump` / `stats` / `diff`, so you
+can narrow the candidate set before applying the age threshold — e.g. "which of
+my actively-exploited findings have gone stale":
+
+```bash
+ossuary stale --db engagement-acme.db --kev-only
+ossuary stale --db engagement-acme.db --tag in-scope --min-epss 0.5 --format json
+```
+
+`--format json` emits `{max_age_days, as_of, count, stale[]}` for piping.
+
+> **Design note.** `stale` reads through the same `build_state` the exports use,
+> so its scoped/filtered candidate set is identical to what a filtered `dump`
+> would show; the age comparison then applies on top. Pure Python, no new schema,
+> no network calls.
 
 ---
 

@@ -10,6 +10,7 @@ Subcommands (v0.1):
     watch        run cruise on an interval, emitting a diff summary each pass
     dump         export full engagement state as JSON, CSV, Markdown, HTML, or SARIF
     stats        print a top-of-funnel engagement summary (counts + top hits)
+    stale        flag findings not re-confirmed within N days (age staleness)
     diff         compare two engagement DBs -> new / resolved / persisting findings
     profiles     list the named scan profiles (stealth/aggressive/web/default)
 
@@ -26,7 +27,8 @@ import sys
 from . import __version__, cruise as cruise_mod, cves, db, discover as discover_mod
 from . import dump as dump_mod, fingerprint as fingerprint_mod, probe as probe_mod
 from . import findingdiff as findingdiff_mod, profiles as profiles_mod
-from . import stats as stats_mod, tags as tags_mod, watch as watch_mod
+from . import stale as stale_mod, stats as stats_mod, tags as tags_mod
+from . import watch as watch_mod
 
 
 def _add_db_arg(parser: argparse.ArgumentParser) -> None:
@@ -304,6 +306,66 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "only count findings in CISA's Known Exploited Vulnerabilities "
+            "catalog (the same filter `dump --kev-only` applies)"
+        ),
+    )
+
+    p_stale = sub.add_parser(
+        "stale",
+        help="flag findings not re-confirmed (matched_at) within N days",
+    )
+    _add_db_arg(p_stale)
+    p_stale.add_argument(
+        "--format",
+        default="text",
+        choices=["text", "json"],
+        help="output format: text (human-readable) or json (same rows)",
+    )
+    p_stale.add_argument(
+        "--max-age-days",
+        type=float,
+        default=stale_mod.DEFAULT_MAX_AGE_DAYS,
+        metavar="DAYS",
+        help=(
+            "flag findings whose matched_at is older than DAYS "
+            f"(default: {stale_mod.DEFAULT_MAX_AGE_DAYS}); findings with no "
+            "matched_at are always flagged"
+        ),
+    )
+    p_stale.add_argument(
+        "--tag",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "only consider assets carrying this tag (the same scoping "
+            "`dump --tag` applies; see `ossuary tag`)"
+        ),
+    )
+    p_stale.add_argument(
+        "--min-epss",
+        type=float,
+        default=None,
+        metavar="P",
+        help=(
+            "only consider findings with an EPSS exploit-probability >= P (0-1); "
+            "the same filter `dump --min-epss` applies"
+        ),
+    )
+    p_stale.add_argument(
+        "--min-severity",
+        type=float,
+        default=None,
+        metavar="SCORE",
+        help=(
+            "only consider findings with a numeric severity (CVSS) >= SCORE; "
+            "the same filter `dump --min-severity` applies"
+        ),
+    )
+    p_stale.add_argument(
+        "--kev-only",
+        action="store_true",
+        help=(
+            "only consider findings in CISA's Known Exploited Vulnerabilities "
             "catalog (the same filter `dump --kev-only` applies)"
         ),
     )
@@ -593,6 +655,21 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_stale(args: argparse.Namespace) -> int:
+    print(
+        stale_mod.stale(
+            args.db,
+            args.format,
+            max_age_days=args.max_age_days,
+            tag=args.tag,
+            min_epss=args.min_epss,
+            min_severity=args.min_severity,
+            kev_only=args.kev_only,
+        )
+    )
+    return 0
+
+
 def _cmd_diff(args: argparse.Namespace) -> int:
     print(
         findingdiff_mod.diff(
@@ -658,6 +735,7 @@ _DISPATCH = {
     "watch": _cmd_watch,
     "dump": _cmd_dump,
     "stats": _cmd_stats,
+    "stale": _cmd_stale,
     "diff": _cmd_diff,
     "probe": _cmd_probe,
     "tag": _cmd_tag,
