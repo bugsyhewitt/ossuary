@@ -1620,3 +1620,193 @@ def tmp_vex_file(db_path, doc, json_mod):
     path = db_path.parent / "edited.vex.json"
     path.write_text(json_mod.dumps(doc), encoding="utf-8")
     return str(path)
+
+
+# --------------------------------------------------------------------------
+# CycloneDX VEX export (`--format cdx-vex`) — the CycloneDX-native VEX shape
+# --------------------------------------------------------------------------
+#
+# A CycloneDX 1.5 document that carries the same components + vulnerabilities
+# as `--format cyclonedx` *plus* an `analysis` block on every vulnerability
+# whose `state` is the CycloneDX VEX status. Default emitted state is the spec
+# value `in_triage` — the editable triage worksheet a hunter ships into a
+# Dependency-Track / Anchore / CycloneDX-consuming pipeline alongside the SBOM.
+
+# Valid CycloneDX VEX `analysis.state` values — the spec vocabulary a hunter
+# may flip an entry to as they triage.
+_CDX_VEX_STATES = {
+    "resolved",
+    "resolved_with_pedigree",
+    "exploitable",
+    "in_triage",
+    "false_positive",
+    "not_affected",
+}
+
+
+def _cdx_vex(out):
+    """Parse a CycloneDX-VEX dump and assert its document-level invariants."""
+    doc = json.loads(out)
+    assert doc["bomFormat"] == "CycloneDX"
+    assert doc["specVersion"] == "1.5"
+    assert "components" in doc
+    assert "vulnerabilities" in doc
+    return doc
+
+
+def test_dump_cdx_vex_is_listed_as_supported_format():
+    assert "cdx-vex" in dump.SUPPORTED_FORMATS
+
+
+def test_dump_cdx_vex_is_valid_1_5_document(db_path):
+    _seed_one_finding(db_path)
+    doc = _cdx_vex(dump.dump(db_path, "cdx-vex"))
+    tool = doc["metadata"]["tools"][0]
+    assert tool["name"] == "ossuary"
+    assert "version" in tool
+    # Same per-service / per-finding emission as the plain CycloneDX SBOM.
+    assert len(doc["components"]) == 1
+    assert len(doc["vulnerabilities"]) == 1
+
+
+def test_dump_cdx_vex_empty_db_has_empty_arrays(db_path):
+    db.init_db(db_path).close()
+    doc = _cdx_vex(dump.dump(db_path, "cdx-vex"))
+    assert doc["components"] == []
+    assert doc["vulnerabilities"] == []
+
+
+def test_dump_cdx_vex_every_vulnerability_carries_analysis_block(db_path):
+    _seed_mixed_findings(db_path)
+    doc = _cdx_vex(dump.dump(db_path, "cdx-vex"))
+    assert len(doc["vulnerabilities"]) >= 1
+    for v in doc["vulnerabilities"]:
+        # The presence of the `analysis` block is what makes this a VEX
+        # document and distinguishes it from a plain CycloneDX SBOM.
+        assert "analysis" in v, f"missing analysis on {v.get('id')}"
+        assert v["analysis"]["state"] in _CDX_VEX_STATES
+
+
+def test_dump_cdx_vex_default_state_is_in_triage(db_path):
+    _seed_one_finding(db_path)
+    doc = _cdx_vex(dump.dump(db_path, "cdx-vex"))
+    # Default state on export — every finding is un-triaged; the hunter flips
+    # entries to not_affected / false_positive / resolved as they rule out.
+    assert doc["vulnerabilities"][0]["analysis"]["state"] == "in_triage"
+
+
+def test_dump_cdx_vex_carries_same_sbom_fields_as_cyclonedx(db_path):
+    """cdx-vex is cyclonedx + analysis — strip analysis and the rest must match."""
+    _seed_mixed_findings(db_path)
+    sbom = json.loads(dump.dump(db_path, "cyclonedx"))
+    vex = json.loads(dump.dump(db_path, "cdx-vex"))
+    assert sbom["components"] == vex["components"]
+    stripped = [
+        {k: val for k, val in v.items() if k != "analysis"}
+        for v in vex["vulnerabilities"]
+    ]
+    assert stripped == sbom["vulnerabilities"]
+
+
+def test_dump_cdx_vex_vulnerability_still_links_to_component(db_path):
+    """The SBOM linkage (affects[].ref) survives the VEX overlay."""
+    _seed_one_finding(db_path)
+    doc = _cdx_vex(dump.dump(db_path, "cdx-vex"))
+    comp_ref = doc["components"][0]["bom-ref"]
+    vuln = doc["vulnerabilities"][0]
+    assert vuln["id"] == "CVE-2021-23017"
+    assert vuln["affects"][0]["ref"] == comp_ref
+
+
+def test_dump_cdx_vex_emits_component_even_with_no_findings(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.9", None, "up")
+        db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = _cdx_vex(dump.dump(db_path, "cdx-vex"))
+    assert len(doc["components"]) == 1
+    assert doc["components"][0]["name"] == "OpenSSH"
+    assert doc["vulnerabilities"] == []
+
+
+def test_dump_cdx_vex_filters_apply(db_path):
+    _seed_mixed_findings(db_path)
+    doc = _cdx_vex(dump.dump(db_path, "cdx-vex", kev_only=True))
+    cves = {v["id"] for v in doc["vulnerabilities"]}
+    assert cves == {"CVE-HOT"}
+    # And the surviving vuln still carries its analysis block.
+    assert doc["vulnerabilities"][0]["analysis"]["state"] == "in_triage"
+
+
+def test_dump_cdx_vex_sort_by_priority_orders_vulnerabilities(db_path):
+    _seed_one_service_many_findings(db_path)
+    doc = _cdx_vex(dump.dump(db_path, "cdx-vex", sort_by_priority=True))
+    emitted = [v["id"] for v in doc["vulnerabilities"]]
+    assert emitted == [
+        "CVE-2020-KEVHI",
+        "CVE-2020-KEVLO",
+        "CVE-2020-WARM",
+        "CVE-2020-COLD",
+    ]
+
+
+def test_dump_cdx_vex_tag_filter_applies(db_path):
+    """The `--tag` scope composes with the cdx-vex export like every other format."""
+    conn = db.init_db(db_path)
+    try:
+        a1 = db.upsert_asset(conn, "10.10.0.5", "h1", "up")
+        s1 = db.upsert_service(conn, a1, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s1, "CVE-IN", "x", "7.0")
+        a2 = db.upsert_asset(conn, "10.10.0.6", "h2", "up")
+        s2 = db.upsert_service(conn, a2, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s2, "CVE-OUT", "x", "7.0")
+        conn.commit()
+    finally:
+        conn.close()
+    tags.add_tag(db_path, "10.10.0.5", "prod")
+    doc = _cdx_vex(dump.dump(db_path, "cdx-vex", tag="prod"))
+    cves = {v["id"] for v in doc["vulnerabilities"]}
+    assert cves == {"CVE-IN"}
+    assert {c["bom-ref"] for c in doc["components"]} == {"10.10.0.5:tcp/80"}
+
+
+def test_dump_cdx_vex_vex_suppression_applies(db_path):
+    """A `--vex` suppression is applied upstream of the cdx-vex emission."""
+    _seed_mixed_findings(db_path)
+    # Author an OpenVEX doc that rules CVE-HOT not_affected on its location.
+    vex_doc = {
+        "@context": "https://openvex.dev/ns/v0.2.0",
+        "@id": "https://example.test/vex/suppress-hot",
+        "author": "test",
+        "timestamp": "1970-01-01T00:00:00Z",
+        "version": 1,
+        "statements": [
+            {
+                "vulnerability": {"name": "CVE-HOT"},
+                "status": "not_affected",
+                "products": [{"@id": "10.10.0.5:tcp/80"}],
+            }
+        ],
+    }
+    suppress_path = tmp_vex_file(db_path, vex_doc, json)
+    doc = _cdx_vex(dump.dump(db_path, "cdx-vex", vex_path=suppress_path))
+    cves = {v["id"] for v in doc["vulnerabilities"]}
+    assert "CVE-HOT" not in cves
+    # And remaining entries still carry the analysis block.
+    for v in doc["vulnerabilities"]:
+        assert v["analysis"]["state"] == "in_triage"
+
+
+def test_dump_cdx_vex_round_trip_through_json_parse(db_path):
+    """The emitted document is valid JSON and stable across two emissions."""
+    _seed_one_finding(db_path)
+    first = dump.dump(db_path, "cdx-vex")
+    second = dump.dump(db_path, "cdx-vex")
+    assert first == second
+    doc = json.loads(first)
+    # Indented (human-readable) like the other JSON formats.
+    assert "\n" in first
+    assert doc["bomFormat"] == "CycloneDX"

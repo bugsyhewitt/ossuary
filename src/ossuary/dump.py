@@ -130,6 +130,7 @@ SUPPORTED_FORMATS = (
     "cyclonedx",
     "spdx",
     "vex",
+    "cdx-vex",
 )
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
@@ -1354,6 +1355,75 @@ def to_vex(state: dict) -> str:
     return json.dumps(document, indent=2, sort_keys=False)
 
 
+# --------------------------------------------------------------------------
+# CycloneDX VEX export (`--format cdx-vex`)
+# --------------------------------------------------------------------------
+#
+# CycloneDX VEX is the CycloneDX-native counterpart to OpenVEX: a CycloneDX
+# 1.5 document carrying the discovered services as ``components`` and each
+# finding as a ``vulnerability`` *with an ``analysis`` block* recording the
+# triage state — the field that turns a CycloneDX SBOM into a VEX. The status
+# vocabulary is CycloneDX's own (``in_triage`` / ``exploitable`` /
+# ``not_affected`` / ``false_positive`` / ``resolved`` / ``resolved_with_pedigree``)
+# rather than OpenVEX's, so a hunter who is shipping into a CycloneDX-only
+# pipeline (Dependency-Track, Anchore, JFrog Xray, the broader supply-chain
+# ecosystem that prefers CycloneDX-native VEX over OpenVEX) gets the editable
+# triage worksheet in the format their downstream consumer reads.
+#
+# The default emitted ``state`` is ``in_triage`` — every finding is un-triaged
+# at export time, exactly the way the OpenVEX export emits ``affected``. The
+# hunter flips entries to ``not_affected`` / ``false_positive`` / ``resolved``
+# as they rule findings out; the edited document is the VEX deliverable that
+# accompanies the SBOM in a supply-chain handoff. We do NOT round-trip this
+# format back through ``ossuary.vex.parse`` (that path is OpenVEX-shaped); the
+# cdx-vex document is an export-only artifact for downstream CycloneDX
+# consumers, alongside the OpenVEX worksheet that ``--format vex`` emits for
+# the in-house ``--vex`` suppression loop.
+
+# CycloneDX VEX's default analysis state — the spec value for an untriaged
+# finding. A hunter flips this to one of the clearing states as they triage.
+_CDX_VEX_DEFAULT_STATE = "in_triage"
+
+
+def to_cdx_vex(state: dict) -> str:
+    """Serialise the engagement state as a CycloneDX 1.5 VEX document.
+
+    Emits a ``bomFormat: CycloneDX`` / ``specVersion: 1.5`` JSON document
+    carrying one ``component`` per discovered service and one ``vulnerability``
+    per finding — the same SBOM shape ``--format cyclonedx`` emits — *with* an
+    ``analysis`` block on every vulnerability whose ``state`` defaults to
+    ``in_triage`` (CycloneDX's spec value for an untriaged finding). It is the
+    CycloneDX-native counterpart to ``--format vex`` (OpenVEX): the editable
+    triage worksheet a hunter ships into a Dependency-Track / Anchore /
+    CycloneDX-consuming supply-chain pipeline, flipping each entry to
+    ``not_affected`` / ``false_positive`` / ``resolved`` as they rule findings
+    out. An empty engagement still yields a valid document with empty
+    ``components`` / ``vulnerabilities`` arrays.
+    """
+    components, vulnerabilities = _cyclonedx_components_and_vulns(state)
+    # Attach an `analysis` block to every vulnerability — the field that
+    # distinguishes a CycloneDX VEX document from a plain CycloneDX SBOM.
+    for v in vulnerabilities:
+        v["analysis"] = {"state": _CDX_VEX_DEFAULT_STATE}
+    bom = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "version": 1,
+        "metadata": {
+            "tools": [
+                {
+                    "vendor": "bugsyhewitt",
+                    "name": "ossuary",
+                    "version": __version__,
+                }
+            ],
+        },
+        "components": components,
+        "vulnerabilities": vulnerabilities,
+    }
+    return json.dumps(bom, indent=2, sort_keys=False)
+
+
 def dump(
     db_path: str | Path,
     fmt: str = "json",
@@ -1376,7 +1446,12 @@ def dump(
     CycloneDX — one package per service with a SECURITY external reference per
     matched CVE), or ``vex`` (a standalone OpenVEX document, one ``affected``
     statement per finding — the editable triage worksheet that is the inverse of
-    the ``--vex`` suppression-import path and round-trips through it).
+    the ``--vex`` suppression-import path and round-trips through it), or
+    ``cdx-vex`` (a CycloneDX 1.5 VEX document — the CycloneDX-native counterpart
+    to OpenVEX, with an ``analysis.state`` of ``in_triage`` on every
+    vulnerability for a hunter to edit down to ``not_affected`` /
+    ``false_positive`` / ``resolved``, ready to ship into a Dependency-Track /
+    Anchore / CycloneDX-consuming pipeline).
     `tag`, when set,
     restricts the export to assets carrying that tag label. `min_epss`,
     `min_severity`, and `kev_only` are actionability filters: each restricts the
@@ -1429,4 +1504,6 @@ def dump(
         return to_spdx(state)
     if fmt == "vex":
         return to_vex(state)
+    if fmt == "cdx-vex":
+        return to_cdx_vex(state)
     return json.dumps(state, indent=2, sort_keys=False)
