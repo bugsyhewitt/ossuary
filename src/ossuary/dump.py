@@ -74,6 +74,8 @@ import sqlite3
 from pathlib import Path
 
 from . import __version__, db, tags
+from .vex import VexSuppressions
+from .vex import load as vex_load
 
 SUPPORTED_FORMATS = ("json", "csv", "markdown", "html", "sarif", "jira")
 
@@ -213,6 +215,24 @@ def _priority_key(finding: dict) -> tuple:
     return (-kev, -epss, -sev, cve_id)
 
 
+def _finding_identifiers(ip: str | None, svc: dict, finding_location: str) -> set[str]:
+    """Collect the strings a VEX product scope may match a finding against.
+
+    A scoped VEX statement lists product identifiers; a finding is in scope when
+    any of its locating strings — the asset ip, its ``ip:proto/port`` service
+    location, or the service CPE — matches one. Blank values are dropped.
+    """
+    ids: set[str] = set()
+    if ip:
+        ids.add(ip)
+    if finding_location:
+        ids.add(finding_location)
+    cpe = svc.get("cpe")
+    if cpe:
+        ids.add(str(cpe))
+    return ids
+
+
 def build_state(
     conn: sqlite3.Connection,
     tag: str | None = None,
@@ -223,6 +243,7 @@ def build_state(
     since: str | None = None,
     until: str | None = None,
     sort_by_priority: bool = False,
+    vex: VexSuppressions | None = None,
 ) -> dict:
     """Assemble the full engagement state as a nested dict.
 
@@ -246,6 +267,12 @@ def build_state(
     KEV-first, then by descending EPSS, descending numeric severity, and finally
     CVE id — the same triage order `match-cves` prints — so the highest-signal
     findings lead. When unset, findings keep their alphabetical-by-CVE-id order.
+
+    `vex`, when given, is a parsed VEX suppression index (see `ossuary.vex`).
+    Findings whose CVE has been ruled `not_affected` / `fixed` for the finding's
+    location are dropped — the triage-already-cleared rows are hidden without
+    deleting them from the DB. Suppression composes with every other filter and,
+    like them, prunes services / assets left with no surviving finding.
     """
     until = _normalise_until(until)
     since = since.strip() if since is not None else None
@@ -255,6 +282,7 @@ def build_state(
         or kev_only
         or since is not None
         or until is not None
+        or vex is not None
     )
     assets_out: list[dict] = []
     if tag is not None:
@@ -295,6 +323,19 @@ def build_state(
                         f, min_epss, min_severity, kev_only, since, until
                     )
                 ]
+                if vex is not None:
+                    location = f"{asset['ip']}:{svc['protocol']}/{svc['port']}"
+                    svc_view = {"cpe": svc["cpe"]}
+                    identifiers = _finding_identifiers(
+                        asset["ip"], svc_view, location
+                    )
+                    findings_out = [
+                        f
+                        for f in findings_out
+                        if not vex.is_suppressed(
+                            f.get("cve_id"), identifiers=identifiers
+                        )
+                    ]
                 # When filtering for actionable findings, a service with none
                 # left carries no signal — drop it so the report shows only hits.
                 if not findings_out:
@@ -844,6 +885,7 @@ def dump(
     since: str | None = None,
     until: str | None = None,
     sort_by_priority: bool = False,
+    vex_path: str | Path | None = None,
 ) -> str:
     """Return the engagement state as a serialised string in the given format.
 
@@ -859,12 +901,17 @@ def dump(
     `sort_by_priority`, when set, orders each service's findings KEV-first /
     descending-EPSS / descending-severity / CVE-id (the `match-cves` triage
     order) instead of the default alphabetical-by-CVE-id ordering.
+    `vex_path`, when set, is the path to an OpenVEX JSON document; findings whose
+    CVE has been ruled `not_affected` / `fixed` (for their location) are
+    suppressed from the export — triage-cleared findings are hidden without being
+    deleted from the DB. It composes with `tag` and the other filters.
     """
     if fmt not in SUPPORTED_FORMATS:
         supported = ", ".join(SUPPORTED_FORMATS)
         raise ValueError(
             f"unsupported dump format {fmt!r} (supported: {supported})"
         )
+    suppressions = vex_load(vex_path) if vex_path is not None else None
     conn = db.require_initialised(db_path)
     try:
         state = build_state(
@@ -876,6 +923,7 @@ def dump(
             since=since,
             until=until,
             sort_by_priority=sort_by_priority,
+            vex=suppressions,
         )
     finally:
         conn.close()

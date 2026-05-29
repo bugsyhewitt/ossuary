@@ -586,6 +586,58 @@ identically to `json`, `csv`, `markdown`, `html`, `sarif`, and `jira`, and compo
 `--tag`, the actionability filters, and `--sort-by-priority`. With neither bound
 set, the export is unchanged.
 
+#### VEX suppression — `--vex`
+
+After a `match-cves` pass a large engagement carries hundreds of CVE findings,
+and triage inevitably rules a chunk of them *not actually exploitable here* — a
+false-positive version match, a disabled feature, a box patched out-of-band.
+Re-scanning re-discovers those same CVEs every time, so the noise comes back on
+every cruise unless you record "already ruled out." A
+[VEX document](https://github.com/openvex/spec) (Vulnerability Exploitability
+eXchange — the open **OpenVEX** JSON shape) is the portable, standard way to
+capture those rulings, and `--vex` feeds one into the export to **suppress** the
+ruled-out findings — hiding them from every report without deleting the rows
+(the evidence stays in the DB).
+
+```bash
+# hide every finding the VEX has cleared (not_affected / fixed)
+ossuary dump --db engagement-acme.db --vex triage.openvex.json --format markdown
+```
+
+A VEX document is a list of `statements`, each naming a `vulnerability` (the
+CVE), a `status`, and optionally the `products` it applies to:
+
+```json
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "author": "you",
+  "statements": [
+    { "vulnerability": { "name": "CVE-2024-1111" }, "status": "not_affected" },
+    { "vulnerability": { "name": "CVE-2024-2222" }, "status": "fixed",
+      "products": [ { "@id": "10.10.0.5:tcp/443" } ] }
+  ]
+}
+```
+
+Suppression semantics:
+
+- A finding is suppressed only when its CVE is ruled **`not_affected`** or
+  **`fixed`** — the two statuses that mean "not a live issue here." `affected`
+  and `under_investigation` leave the finding visible (they are not a clearance).
+- A statement with **no `products`** is a *blanket* ruling — the CVE is hidden
+  wherever it appears.
+- A statement that **lists `products`** is a *scoped* ruling — the CVE is hidden
+  only on findings whose location matches a listed product identifier. ossuary
+  matches a finding against its asset ip, its `ip:proto/port` service location,
+  and its service CPE, so you can clear a CVE on one host without silencing the
+  same CVE on another.
+
+Suppression composes with `--tag`, the actionability filters, `--since/--until`,
+and `--sort-by-priority`, and applies identically to `json`, `csv`, `markdown`,
+`html`, `sarif`, and `jira`; services / assets left with no surviving finding are
+pruned. With no `--vex`, the export is unchanged. A missing or malformed VEX file
+fails loudly with a clear error.
+
 ### Engagement summary (`ossuary stats`)
 
 `dump` emits the full per-finding inventory; `stats` gives the top-of-funnel
