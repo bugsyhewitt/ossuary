@@ -256,6 +256,36 @@ def build_parser() -> argparse.ArgumentParser:
             "`dump --tag` applies; see `ossuary tag`)"
         ),
     )
+    p_stats.add_argument(
+        "--min-epss",
+        type=float,
+        default=None,
+        metavar="P",
+        help=(
+            "only count findings with an EPSS exploit-probability >= P (0-1); "
+            "findings without an EPSS score are excluded (the same filter "
+            "`dump --min-epss` applies)"
+        ),
+    )
+    p_stats.add_argument(
+        "--min-severity",
+        type=float,
+        default=None,
+        metavar="SCORE",
+        help=(
+            "only count findings with a numeric severity (CVSS) >= SCORE; "
+            "blank/non-numeric severities are excluded (the same filter "
+            "`dump --min-severity` applies)"
+        ),
+    )
+    p_stats.add_argument(
+        "--kev-only",
+        action="store_true",
+        help=(
+            "only count findings in CISA's Known Exploited Vulnerabilities "
+            "catalog (the same filter `dump --kev-only` applies)"
+        ),
+    )
 
     p_probe = sub.add_parser(
         "probe", help="HTTP/web layer discovery — probe web ports on known assets"
@@ -473,7 +503,17 @@ def _cmd_dump(args: argparse.Namespace) -> int:
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
-    print(stats_mod.stats(args.db, args.format, top=args.top, tag=args.tag))
+    print(
+        stats_mod.stats(
+            args.db,
+            args.format,
+            top=args.top,
+            tag=args.tag,
+            min_epss=args.min_epss,
+            min_severity=args.min_severity,
+            kev_only=args.kev_only,
+        )
+    )
     return 0
 
 

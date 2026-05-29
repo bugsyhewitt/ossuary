@@ -540,6 +540,32 @@ engagement summary (tag: in-scope)
   ...
 ```
 
+`stats` also accepts the same actionability filters as `dump` — `--kev-only`,
+`--min-epss P`, and `--min-severity SCORE` (see
+[Actionability filters](#actionability-filters----kev-only---min-epss---min-severity)).
+With any set, the roll-up describes only the findings worth reporting:
+non-clearing findings are dropped, and services / assets left with no surviving
+finding are pruned from the counts — so the summary matches what a filtered
+`dump` would export, by construction. The filters compose with each other and
+with `--tag`, and the text header records every active scope.
+
+```bash
+# summarise only the actively-exploited, high-EPSS findings
+ossuary stats --db engagement-acme.db --kev-only --min-epss 0.5
+```
+
+```
+engagement summary (kev-only, epss>=0.5)
+  assets:   1
+  services: 1
+  findings: 1
+  ...
+```
+
+This is the roll-up companion to the filtered export: `dump --kev-only` gives
+you *the actionable rows*, `stats --kev-only` gives you *the shape of the
+actionable subset* — both over the identical set of findings.
+
 ### Cruise mode
 
 Later in the engagement, re-scan and see what moved:

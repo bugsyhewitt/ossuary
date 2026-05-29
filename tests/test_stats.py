@@ -323,3 +323,159 @@ def test_stats_json_tag_scopes_numbers(db_path):
     assert full["assets"] == 2
     # the json shape carries no extra "tag" key — same structure as before
     assert set(scoped.keys()) == set(full.keys())
+
+
+# --------------------------------------------------------------------------
+# actionability filters — the kev-only / min-epss / min-severity companion to
+# `dump`'s Rank 8 filters
+# --------------------------------------------------------------------------
+
+def test_stats_kev_only_counts_only_kev_findings(db_path):
+    _seed_mixed(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        summary = stats.build_stats(conn, kev_only=True)
+    finally:
+        conn.close()
+    # Only CVE-HOT is KEV; the cold and mid findings drop out, and so does the
+    # ssh service that carried no KEV finding.
+    assert summary["findings"] == 1
+    assert summary["kev"] == 1
+    assert summary["services"] == 1
+    assert summary["assets"] == 1
+    assert [f["cve_id"] for f in summary["top_findings"]] == ["CVE-HOT"]
+
+
+def test_stats_min_epss_excludes_low_and_unscored(db_path):
+    _seed_mixed(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        summary = stats.build_stats(conn, min_epss=0.5)
+    finally:
+        conn.close()
+    # CVE-HOT 0.94 survives; CVE-COLD 0.02 and CVE-MID (no EPSS) are excluded.
+    assert summary["findings"] == 1
+    assert summary["epss_tiers"] == {"high": 1, "medium": 0, "low": 0, "unscored": 0}
+
+
+def test_stats_min_severity_excludes_low_and_blank(db_path):
+    _seed_mixed(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        summary = stats.build_stats(conn, min_severity=7.0)
+    finally:
+        conn.close()
+    # Only CVE-HOT (9.8) clears 7.0; CVE-MID (6.5) and CVE-COLD (3.1) drop.
+    assert summary["findings"] == 1
+    assert summary["severity_tiers"] == {
+        "critical": 1, "high": 0, "medium": 0, "low": 0, "blank": 0
+    }
+
+
+def test_stats_filters_compose(db_path):
+    _seed_mixed(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        # KEV-only AND min-severity 9.0 — CVE-HOT clears both.
+        summary = stats.build_stats(conn, kev_only=True, min_severity=9.0)
+    finally:
+        conn.close()
+    assert summary["findings"] == 1
+    assert [f["cve_id"] for f in summary["top_findings"]] == ["CVE-HOT"]
+
+
+def test_stats_filter_can_empty_the_summary(db_path):
+    _seed_mixed(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        # No finding has EPSS >= 0.99, so everything is pruned.
+        summary = stats.build_stats(conn, min_epss=0.99)
+    finally:
+        conn.close()
+    assert summary["assets"] == 0
+    assert summary["services"] == 0
+    assert summary["findings"] == 0
+    assert summary["kev"] == 0
+    assert summary["top_findings"] == []
+
+
+def test_stats_no_filter_unchanged(db_path):
+    _seed_mixed(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        # Passing the filter params at their no-op defaults must equal the
+        # historical whole-engagement summary byte-for-byte.
+        baseline = stats.build_stats(conn)
+        with_defaults = stats.build_stats(
+            conn, min_epss=None, min_severity=None, kev_only=False
+        )
+    finally:
+        conn.close()
+    assert with_defaults == baseline
+
+
+def test_stats_filters_compose_with_tag(db_path):
+    _seed_two_hosts(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        # host-a (in-scope) has the only KEV finding; host-b is out of scope.
+        scoped = stats.build_stats(conn, tag="in-scope", kev_only=True)
+        # the same KEV filter without the tag still sees only host-a's KEV hit
+        # here, but the tag must further restrict to in-scope assets.
+        out_of_scope = stats.build_stats(conn, tag="in-scope", min_epss=0.99)
+    finally:
+        conn.close()
+    assert scoped["findings"] == 1
+    assert [f["cve_id"] for f in scoped["top_findings"]] == ["CVE-A"]
+    # tag + an impossible EPSS floor empties the scoped summary
+    assert out_of_scope["findings"] == 0
+
+
+def test_stats_filtered_agrees_with_filtered_dump(db_path):
+    from ossuary import dump
+
+    _seed_mixed(db_path)
+    conn = db.require_initialised(db_path)
+    try:
+        summary = stats.build_stats(conn, min_severity=7.0)
+        state = dump.build_state(conn, min_severity=7.0)
+    finally:
+        conn.close()
+    dump_assets = len(state["assets"])
+    dump_services = sum(len(a["services"]) for a in state["assets"])
+    dump_findings = sum(
+        len(s["findings"]) for a in state["assets"] for s in a["services"]
+    )
+    assert summary["assets"] == dump_assets
+    assert summary["services"] == dump_services
+    assert summary["findings"] == dump_findings
+
+
+def test_stats_text_header_records_kev_filter(db_path):
+    _seed_mixed(db_path)
+    out = stats.stats(db_path, "text", kev_only=True)
+    assert out.splitlines()[0] == "engagement summary (kev-only)"
+
+
+def test_stats_text_header_records_epss_and_severity_filters(db_path):
+    _seed_mixed(db_path)
+    out = stats.stats(db_path, "text", min_epss=0.5, min_severity=7.0)
+    first = out.splitlines()[0]
+    assert "epss>=0.5" in first
+    assert "severity>=7" in first
+
+
+def test_stats_text_header_combines_tag_and_filters(db_path):
+    _seed_two_hosts(db_path)
+    out = stats.stats(db_path, "text", tag="in-scope", kev_only=True)
+    assert out.splitlines()[0] == "engagement summary (tag: in-scope, kev-only)"
+
+
+def test_stats_json_filter_keeps_shape(db_path):
+    _seed_mixed(db_path)
+    filtered = json.loads(stats.stats(db_path, "json", kev_only=True))
+    full = json.loads(stats.stats(db_path, "json"))
+    # the filter trims numbers but the JSON structure is unchanged
+    assert set(filtered.keys()) == set(full.keys())
+    assert filtered["findings"] == 1
+    assert full["findings"] == 3

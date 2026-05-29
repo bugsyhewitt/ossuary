@@ -543,3 +543,44 @@ def test_cli_stats_tag_scopes_summary(tmp_path, capsys):
     assert "assets:   1" in out
     assert "CVE-A" in out
     assert "CVE-B" not in out
+
+
+def test_cli_stats_actionability_filters_scope_summary(tmp_path, capsys):
+    """`stats --kev-only` / `--min-epss` / `--min-severity` mirror `dump`'s filters."""
+    from ossuary import db
+
+    db_file = str(tmp_path / "engagement-test.db")
+    conn = db.init_db(db_file)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        s80 = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.18.0", None)
+        s22 = db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        db.upsert_finding(conn, s80, "CVE-HOT", "exploited", "9.8",
+                          epss_score=0.94, kev=1)
+        db.upsert_finding(conn, s80, "CVE-COLD", "theoretical", "3.1",
+                          epss_score=0.02, kev=0)
+        db.upsert_finding(conn, s22, "CVE-MID", "needs auth", "6.5",
+                          epss_score=None, kev=0)
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    rc = cli.main(["stats", "--db", db_file, "--kev-only", "--format", "json"])
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    # only the KEV finding (and its service / asset) survives the filter
+    assert summary["findings"] == 1
+    assert summary["services"] == 1
+    assert summary["kev"] == 1
+    assert [f["cve_id"] for f in summary["top_findings"]] == ["CVE-HOT"]
+
+
+def test_cli_stats_filter_header_records_scope(tmp_path, capsys):
+    db_file = str(tmp_path / "engagement-test.db")
+    cli.main(["init", "--db", db_file])
+    capsys.readouterr()
+    rc = cli.main(["stats", "--db", db_file, "--min-severity", "7.0"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "severity>=7" in out.splitlines()[0]

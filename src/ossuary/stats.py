@@ -15,6 +15,16 @@ to `dump --tag` so a hunter can both summarise *and* export the same in-scope /
 VIP / priority subset. Tag scoping reuses `dump.build_state`, so the scoped
 counts agree with a scoped dump by construction.
 
+`stats` also accepts the same actionability filters `dump` does (Rank 8 —
+`min_epss` / `min_severity` / `kev_only`): with any set, the roll-up covers only
+the findings that clear every threshold, and services / assets left with no
+surviving findings are pruned — the companion to `dump --kev-only --min-epss …`
+so a hunter can summarise *and* export the identical actionable subset. Like the
+tag scoping, the filters reuse `dump.build_state`, so the filtered counts agree
+with a filtered dump by construction. With no tag and no filter, the summary is
+computed straight off the tables (the historical whole-engagement path,
+byte-for-byte unchanged).
+
 Reported counts:
 
   * assets / services / findings totals
@@ -144,15 +154,32 @@ def _aggregate(
     }
 
 
-def _scoped_counts(conn: sqlite3.Connection, tag: str) -> tuple[int, int, list[dict]]:
-    """Counts for the subset of the engagement carrying `tag`.
+def _state_counts(
+    conn: sqlite3.Connection,
+    *,
+    tag: str | None,
+    min_epss: float | None,
+    min_severity: float | None,
+    kev_only: bool,
+) -> tuple[int, int, list[dict]]:
+    """Counts for the subset selected by `tag` and/or the actionability filters.
 
-    Reuses ``dump.build_state(conn, tag=tag)`` so the scoped totals agree with a
-    scoped ``dump`` by construction: same assets, same services, same findings.
-    Returns (asset_count, service_count, findings) where findings is a flat list
-    of the finding dicts across every scoped service.
+    Reuses ``dump.build_state`` with the identical scoping / filter parameters so
+    the totals agree with a scoped-and-filtered ``dump`` by construction: same
+    assets, same services, same surviving findings. (When the actionability
+    filters are active, ``build_state`` prunes services / assets with no
+    surviving findings, so those pruned rows are excluded from the counts too,
+    exactly as the filtered dump excludes them.) Returns (asset_count,
+    service_count, findings) where findings is a flat list of the finding dicts
+    across every surviving service.
     """
-    state = dump.build_state(conn, tag=tag)
+    state = dump.build_state(
+        conn,
+        tag=tag,
+        min_epss=min_epss,
+        min_severity=min_severity,
+        kev_only=kev_only,
+    )
     assets = state["assets"]
     service_count = 0
     findings: list[dict] = []
@@ -168,6 +195,9 @@ def build_stats(
     *,
     top: int = DEFAULT_TOP,
     tag: str | None = None,
+    min_epss: float | None = None,
+    min_severity: float | None = None,
+    kev_only: bool = False,
 ) -> dict:
     """Compute the engagement summary as a plain dict.
 
@@ -177,11 +207,27 @@ def build_stats(
 
     `tag`, when set, restricts the roll-up to assets carrying that tag label —
     the same scoping `dump --tag` applies — so a hunter can summarise just their
-    in-scope / VIP / priority subset. When unset, the summary covers the whole
-    engagement (the historical behaviour, byte-for-byte unchanged).
+    in-scope / VIP / priority subset.
+
+    `min_epss`, `min_severity`, and `kev_only` are the same actionability filters
+    `dump` applies (Rank 8): with any set, only findings clearing every threshold
+    are counted, and services / assets left with no surviving findings are pruned
+    — so the summary describes exactly the actionable subset a filtered `dump`
+    would export. The tag scoping and the filters compose (a finding must clear
+    both to be counted).
+
+    When neither a tag nor any filter is set, the summary covers the whole
+    engagement and is computed straight off the tables (the historical behaviour,
+    byte-for-byte unchanged).
     """
-    if tag is not None:
-        asset_count, service_count, findings = _scoped_counts(conn, tag)
+    if tag is not None or min_epss is not None or min_severity is not None or kev_only:
+        asset_count, service_count, findings = _state_counts(
+            conn,
+            tag=tag,
+            min_epss=min_epss,
+            min_severity=min_severity,
+            kev_only=kev_only,
+        )
         return _aggregate(asset_count, service_count, findings, top=top)
 
     asset_count = conn.execute("SELECT COUNT(*) AS c FROM assets").fetchone()["c"]
@@ -200,13 +246,48 @@ def _fmt_epss(epss) -> str:
     return f"{epss:.2f}" if epss is not None else "—"
 
 
-def to_text(summary: dict, *, tag: str | None = None) -> str:
+def _scope_suffix(
+    *,
+    tag: str | None,
+    min_epss: float | None,
+    min_severity: float | None,
+    kev_only: bool,
+) -> str:
+    """Build the ``(...)`` scope suffix recording the active tag / filters.
+
+    Returns the empty string when nothing scopes the summary, so an unscoped,
+    unfiltered roll-up keeps its plain ``engagement summary`` header byte-for-byte.
+    """
+    parts: list[str] = []
+    if tag is not None:
+        parts.append(f"tag: {tag}")
+    if kev_only:
+        parts.append("kev-only")
+    if min_epss is not None:
+        parts.append(f"epss>={min_epss:g}")
+    if min_severity is not None:
+        parts.append(f"severity>={min_severity:g}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def to_text(
+    summary: dict,
+    *,
+    tag: str | None = None,
+    min_epss: float | None = None,
+    min_severity: float | None = None,
+    kev_only: bool = False,
+) -> str:
     """Render the summary as a human-readable text report.
 
-    When `tag` is given the header records the scope so a scoped roll-up reads
-    unambiguously next to a whole-engagement one.
+    When a tag and/or any actionability filter is given the header records the
+    scope so a scoped / filtered roll-up reads unambiguously next to a
+    whole-engagement one.
     """
-    header = "engagement summary" if tag is None else f"engagement summary (tag: {tag})"
+    suffix = _scope_suffix(
+        tag=tag, min_epss=min_epss, min_severity=min_severity, kev_only=kev_only
+    )
+    header = f"engagement summary{suffix}"
     lines = [
         header,
         f"  assets:   {summary['assets']}",
@@ -246,13 +327,19 @@ def stats(
     *,
     top: int = DEFAULT_TOP,
     tag: str | None = None,
+    min_epss: float | None = None,
+    min_severity: float | None = None,
+    kev_only: bool = False,
 ) -> str:
     """Return the engagement summary as a serialised string in the given format.
 
     `fmt` is ``text`` (human-readable) or ``json`` (the same numbers, for
     piping). `top` bounds how many leading findings appear in the priority list.
     `tag`, when set, scopes the roll-up to assets carrying that label — the same
-    subset `dump --tag` exports.
+    subset `dump --tag` exports. `min_epss`, `min_severity`, and `kev_only` are
+    the same actionability filters `dump` applies (Rank 8); with any set the
+    summary describes only the findings worth reporting, matching a filtered
+    `dump` by construction.
     """
     if fmt not in SUPPORTED_FORMATS:
         supported = ", ".join(SUPPORTED_FORMATS)
@@ -261,9 +348,22 @@ def stats(
         )
     conn = db.require_initialised(db_path)
     try:
-        summary = build_stats(conn, top=top, tag=tag)
+        summary = build_stats(
+            conn,
+            top=top,
+            tag=tag,
+            min_epss=min_epss,
+            min_severity=min_severity,
+            kev_only=kev_only,
+        )
     finally:
         conn.close()
     if fmt == "json":
         return json.dumps(summary, indent=2, sort_keys=False)
-    return to_text(summary, tag=tag)
+    return to_text(
+        summary,
+        tag=tag,
+        min_epss=min_epss,
+        min_severity=min_severity,
+        kev_only=kev_only,
+    )
