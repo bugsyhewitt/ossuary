@@ -82,22 +82,26 @@ default:
 - **KEV** — whether the CVE appears in CISA's
   [Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)
   catalog, i.e. confirmed exploited in the wild.
+- **Exploit** — whether a public exploit / PoC for the CVE is catalogued in
+  [Exploit-DB](https://www.exploit-db.com/), i.e. a ready-to-run exploit already
+  exists. This is a distinct axis from KEV: a fresh CVE with a published exploit
+  but no in-the-wild sightings (and a low EPSS) only shows up on this signal.
 
 ```bash
 ossuary match-cves --db engagement-acme.db
 #   matched 5 finding(s) -> engagement-acme.db
-#     CVE-2021-23017  severity: 7.7  EPSS: 0.87 | KEV: YES
-#     CVE-2023-44487  severity: —    EPSS: 0.94 | KEV: YES
+#     CVE-2021-23017  severity: 7.7  EPSS: 0.87 | KEV: YES | Exploit: YES
+#     CVE-2023-44487  severity: —    EPSS: 0.94 | KEV: YES | Exploit: no
 #     ...
 ```
 
 The output is sorted KEV-first, then by descending EPSS, so the CVEs that are
 actually being exploited float to the top regardless of CVSS.
 
-The CISA KEV catalog (~1 MB) is downloaded once and cached in the engagement DB
-with a 24-hour TTL, so repeated runs don't re-fetch it. EPSS is a per-CVE
-lookup. To skip enrichment entirely (no EPSS/KEV HTTP calls), use
-`--no-enrich`:
+The CISA KEV catalog (~1 MB) and the Exploit-DB index are each downloaded once
+and cached in the engagement DB (`kev_cache` / `exploitdb_cache`) with a 24-hour
+TTL, so repeated runs don't re-fetch them. EPSS is a per-CVE lookup. To skip
+enrichment entirely (no EPSS/KEV/Exploit-DB HTTP calls), use `--no-enrich`:
 
 ```bash
 ossuary match-cves --db engagement-acme.db --no-enrich
@@ -350,6 +354,7 @@ Four tables, one engagement file:
 │ severity / source        │
 │ epss_score   (FIRST EPSS)│  exploit-probability float [0,1], nullable
 │ kev          (0/1)       │  1 if in CISA Known Exploited Vulns catalog
+│ exploit      (0/1)       │  1 if a public exploit exists in Exploit-DB
 │ matched_at               │
 └──────────────────────────┘
 
@@ -382,9 +387,10 @@ Four tables, one engagement file:
 
 Foreign keys cascade: deleting an asset removes its services and their findings.
 
-The `epss_score` and `kev` columns are added automatically (via an idempotent
-migration at startup) to engagement DBs created before enrichment landed, so
-older `.db` files keep working without a manual re-init. The `tags` table and
+The `epss_score`, `kev` and `exploit` columns are added automatically (via an
+idempotent migration at startup) to engagement DBs created before each
+enrichment landed, so older `.db` files keep working without a manual re-init.
+The `tags` table and
 `cruise_runs.tag_snapshot` column are added by the same migration mechanism, so
 pre-tagging engagement files gain tagging support on their next `ossuary` run.
 
@@ -472,7 +478,7 @@ The `json`, `csv`, and `markdown` formats cover the same fields; CSV and
 Markdown flatten the JSON nesting into these columns: `ip, hostname,
 asset_state, discovered_at, tags, port, protocol, service_name, product,
 version, cpe, fingerprinted_at, cve_id, summary, severity, source, epss_score,
-kev, matched_at`. The `html` report carries the same underlying data, presented
+kev, exploit, matched_at`. The `html` report carries the same underlying data, presented
 per-host rather than as a flat table. The `sarif` document is finding-centric —
 a service with no finding produces no `result` — and maps each finding to a SARIF
 `level`: a **KEV** finding is always `error` (regardless of the often-blank

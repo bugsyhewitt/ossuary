@@ -78,6 +78,9 @@ def test_full_pipeline_offline(tmp_path, monkeypatch, capsys):
         enrich, "fetch_kev_catalog",
         lambda: {"vulnerabilities": [{"cveID": "CVE-2021-23017"}]},
     )
+    monkeypatch.setattr(
+        enrich, "fetch_exploitdb_index", lambda: "id,codes\n1,CVE-2021-23017\n"
+    )
 
     assert cli.main(["init", "--db", db_file]) == 0
     assert cli.main(["discover", "--db", db_file, "--targets", str(TARGETS_FILE)]) == 0
@@ -133,6 +136,9 @@ def test_match_cves_default_enriches_and_displays(tmp_path, monkeypatch, capsys)
         enrich, "fetch_kev_catalog",
         lambda: {"vulnerabilities": [{"cveID": "CVE-2021-23017"}]},
     )
+    monkeypatch.setattr(
+        enrich, "fetch_exploitdb_index", lambda: "id,codes\n1,CVE-2021-23017\n"
+    )
 
     capsys.readouterr()
     rc = cli.main(["match-cves", "--db", db_file])
@@ -141,6 +147,8 @@ def test_match_cves_default_enriches_and_displays(tmp_path, monkeypatch, capsys)
     assert "CVE-2021-23017" in out
     assert "EPSS: 0.87" in out
     assert "KEV: YES" in out
+    # the matched CVE has a public exploit in the (mocked) Exploit-DB index
+    assert "Exploit: YES" in out
 
 
 def test_match_cves_no_enrich_makes_no_enrichment_calls(tmp_path, monkeypatch, capsys):
@@ -151,6 +159,7 @@ def test_match_cves_no_enrich_makes_no_enrichment_calls(tmp_path, monkeypatch, c
 
     monkeypatch.setattr(enrich, "query_epss", boom)
     monkeypatch.setattr(enrich, "fetch_kev_catalog", boom)
+    monkeypatch.setattr(enrich, "fetch_exploitdb_index", boom)
 
     capsys.readouterr()
     rc = cli.main(["match-cves", "--db", db_file, "--no-enrich"])
@@ -159,6 +168,7 @@ def test_match_cves_no_enrich_makes_no_enrichment_calls(tmp_path, monkeypatch, c
     assert "CVE-2021-23017" in out
     assert "EPSS: —" in out
     assert "KEV: no" in out
+    assert "Exploit: no" in out
 
 
 def test_match_cves_source_both_queries_nvd(tmp_path, monkeypatch, capsys):

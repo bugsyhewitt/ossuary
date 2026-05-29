@@ -111,8 +111,9 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "annotate findings with EPSS exploit-probability (FIRST) and CISA "
-            "KEV status (default: enabled; use --no-enrich to skip the lookups)"
+            "annotate findings with EPSS exploit-probability (FIRST), CISA "
+            "KEV status, and public-exploit availability (Exploit-DB) (default: "
+            "enabled; use --no-enrich to skip the lookups)"
         ),
     )
     p_match.add_argument(
@@ -563,16 +564,20 @@ def _format_finding(row: dict) -> str:
     """Render one finding row as a single severity-context line.
 
     Shows the OSV/NVD severity (often blank for fresh CVEs since NIST's
-    enrichment retreat) alongside the restored signal: EPSS exploit probability
-    and CISA KEV status.
+    enrichment retreat) alongside the restored signal: EPSS exploit probability,
+    CISA KEV status, and whether a public exploit exists (Exploit-DB).
     """
     severity = row["severity"] or "—"
     epss = row["epss_score"]
     epss_str = f"{epss:.2f}" if epss is not None else "—"
     kev_str = "YES" if row["kev"] else "no"
+    # row may be a sqlite3.Row from a SELECT that predates the exploit column;
+    # guard the lookup so the renderer never KeyErrors on an older query path.
+    exploit = row["exploit"] if "exploit" in row.keys() else 0
+    exploit_str = "YES" if exploit else "no"
     return (
         f"  {row['cve_id']}  severity: {severity}  "
-        f"EPSS: {epss_str} | KEV: {kev_str}"
+        f"EPSS: {epss_str} | KEV: {kev_str} | Exploit: {exploit_str}"
     )
 
 
@@ -597,8 +602,8 @@ def _cmd_match_cves(args: argparse.Namespace) -> int:
         conn = db.require_initialised(args.db)
         try:
             rows = conn.execute(
-                "SELECT cve_id, severity, epss_score, kev FROM findings "
-                "ORDER BY kev DESC, epss_score DESC NULLS LAST, cve_id"
+                "SELECT cve_id, severity, epss_score, kev, exploit FROM findings "
+                "ORDER BY kev DESC, exploit DESC, epss_score DESC NULLS LAST, cve_id"
             ).fetchall()
         finally:
             conn.close()

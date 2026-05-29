@@ -239,21 +239,29 @@ def _persist_findings(
 ) -> int:
     """Enrich (optionally) and upsert a list of findings against a service row.
 
-    ``kev_state`` is a tiny mutable cache ({"ids": set, "loaded": bool}) so the
-    KEV id set is fetched at most once across the whole match run. Returns the
-    number of findings written.
+    ``kev_state`` is a tiny mutable cache ({"ids": set, "loaded": bool,
+    "exploit_ids": set}) so the KEV and Exploit-DB id sets are each fetched at
+    most once across the whole match run. Returns the number of findings written.
     """
     written = 0
     for finding in findings:
         epss_score: float | None = None
         kev = 0
+        exploit = 0
         if enrich_findings:
             if not kev_state["loaded"]:
                 kev_state["ids"] = enrich.get_kev_ids(conn)
+                kev_state["exploit_ids"] = enrich.get_exploit_ids(conn)
                 kev_state["loaded"] = True
-            annotation = enrich.enrich_finding(conn, finding["cve_id"], kev_state["ids"])
+            annotation = enrich.enrich_finding(
+                conn,
+                finding["cve_id"],
+                kev_state["ids"],
+                kev_state["exploit_ids"],
+            )
             epss_score = annotation["epss_score"]
             kev = annotation["kev"]
+            exploit = annotation["exploit"]
         db.upsert_finding(
             conn,
             service_id=service_id,
@@ -263,6 +271,7 @@ def _persist_findings(
             source=source_label,
             epss_score=epss_score,
             kev=kev,
+            exploit=exploit,
         )
         written += 1
     return written
@@ -317,7 +326,7 @@ def match_web_cves(
             "WHERE server IS NOT NULL AND server != ''"
         ).fetchall()
 
-        kev_state: dict = {"ids": set(), "loaded": False}
+        kev_state: dict = {"ids": set(), "exploit_ids": set(), "loaded": False}
         total = 0
         for wp in probes:
             techs = probe.extract_versioned_techs(wp["server"])
@@ -368,7 +377,8 @@ def match_cves(
     an API key, 0.06s with one) to respect NVD's published ceilings.
 
     When ``enrich_findings`` is True (the default), each matched CVE is annotated
-    with its EPSS exploit-probability score (FIRST) and CISA KEV status.
+    with its EPSS exploit-probability score (FIRST), CISA KEV status, and whether
+    a public exploit for it is catalogued in Exploit-DB.
     """
     if source not in ("osv", "nvd", "both"):
         raise ValueError(f"unknown source {source!r}; expected osv, nvd, or both")
@@ -383,10 +393,11 @@ def match_cves(
             "WHERE product IS NOT NULL AND version IS NOT NULL"
         ).fetchall()
 
-        # Resolve the KEV id set once for the whole run (cached, TTL'd). Only
-        # touched when we actually have findings to enrich.
+        # Resolve the KEV and Exploit-DB id sets once for the whole run (cached,
+        # TTL'd). Only touched when we actually have findings to enrich.
         kev_ids: set[str] = set()
-        kev_loaded = False
+        exploit_ids: set[str] = set()
+        enrich_loaded = False
 
         total = 0
         for svc in services:
@@ -413,15 +424,18 @@ def match_cves(
             for finding in _merge_findings(osv_findings, nvd_findings):
                 epss_score: float | None = None
                 kev = 0
+                exploit = 0
                 if enrich_findings:
-                    if not kev_loaded:
+                    if not enrich_loaded:
                         kev_ids = enrich.get_kev_ids(conn)
-                        kev_loaded = True
+                        exploit_ids = enrich.get_exploit_ids(conn)
+                        enrich_loaded = True
                     annotation = enrich.enrich_finding(
-                        conn, finding["cve_id"], kev_ids
+                        conn, finding["cve_id"], kev_ids, exploit_ids
                     )
                     epss_score = annotation["epss_score"]
                     kev = annotation["kev"]
+                    exploit = annotation["exploit"]
                 db.upsert_finding(
                     conn,
                     service_id=int(svc["id"]),
@@ -431,6 +445,7 @@ def match_cves(
                     source=source_label,
                     epss_score=epss_score,
                     kev=kev,
+                    exploit=exploit,
                 )
                 total += 1
         conn.commit()
