@@ -347,6 +347,42 @@ dependencies, no schema change, fully offline-tested.
 
 ---
 
+## Rank 13 — Actionability filters on `stats` (KEV / EPSS / severity)  ✅ IMPLEMENTED
+
+> Shipped: `stats` gains `--kev-only`, `--min-epss P`, and `--min-severity SCORE`
+> — the same actionability filters R8 added to `dump`. With any set, the roll-up
+> covers only findings clearing every threshold; services / assets left with no
+> surviving finding are pruned from the counts, so the summary describes exactly
+> the actionable subset a filtered `dump` would export. Filtering reuses
+> `dump.build_state(...)` with the identical filter params, so the filtered
+> counts agree with a filtered `dump` by construction. The filters compose with
+> each other and with R12's `--tag`; the text header records every active scope
+> (e.g. `engagement summary (tag: in-scope, kev-only, epss>=0.5)`). The JSON
+> shape is unchanged. With no tag and no filter, the whole-engagement path is
+> byte-for-byte unchanged. Pure Python, no new dependencies, no schema change, no
+> network calls. +14 tests.
+
+**What:** R8 let a hunter trim a `dump` to the findings that matter; R10 added
+the `stats` roll-up but only over the *whole* (or, after R12, tag-scoped)
+engagement. The gap: a hunter who filters their export (`dump --kev-only
+--min-epss 0.5`) had no matching summary of *that same subset*. `stats`'
+actionability filters close it, so the summarise-then-export workflow operates on
+one consistent subset — exactly the consistency R12 brought for `--tag`.
+
+**Why now:** It's the last-mile consistency fix between the two read surfaces a
+hunter triages a filtered engagement with. `dump --kev-only` answers "give me the
+actionable rows"; `stats --kev-only` answers "give me the shape of the actionable
+subset." Reusing `build_state` means the filtered numbers can't drift from a
+filtered dump.
+
+**Effort:** Small. Optional `min_epss` / `min_severity` / `kev_only` params
+threaded through `build_stats` + `stats` + three argparse flags; the whole-scope
+path routes through `dump.build_state` whenever a tag or filter is active, while
+the unfiltered/untagged fast path is untouched. No new dependencies, no schema
+change, fully offline-tested.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |
