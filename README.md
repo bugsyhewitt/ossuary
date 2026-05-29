@@ -198,7 +198,7 @@ Tags are free-text, so any scheme works — flat labels (`in-scope`, `noise`) or
 namespaced ones (`env:prod`, `tier:critical`). Re-adding an existing tag is an
 idempotent no-op, and `--asset` accepts either the asset's IP or its hostname.
 
-Tags surface in two places automatically:
+Tags surface in three places automatically:
 
 - **`dump`** carries a `tags` array on every asset, and `--tag LABEL` filters
   the export to just the assets carrying that label:
@@ -206,6 +206,14 @@ Tags surface in two places automatically:
   ```bash
   # export only the in-scope hosts (and their services + findings)
   ossuary dump --db engagement-acme.db --tag in-scope > acme-in-scope.json
+  ```
+
+- **`stats`** accepts the same `--tag LABEL`, scoping the engagement roll-up to
+  the tagged subset — so you can summarise and export the identical set:
+
+  ```bash
+  # roll up only the in-scope hosts
+  ossuary stats --db engagement-acme.db --tag in-scope
   ```
 
 - **`cruise`** gains a `tag_changes` section in its diff, reporting tags added
@@ -513,6 +521,23 @@ ossuary stats --db engagement-acme.db --format json
 
 # show the top 20 hits (or 0 to omit the list entirely)
 ossuary stats --db engagement-acme.db --top 20
+```
+
+`--tag LABEL` scopes the roll-up to assets carrying that tag — the same
+scoping `dump --tag` applies (see [Asset tagging](#asset-tagging-ossuary-tag)).
+This is the workflow companion to a scoped export: summarise *and* dump the
+exact same in-scope / VIP / priority subset. The scoped counts agree with a
+scoped `dump` by construction, and the text header records the scope.
+
+```bash
+# summarise only the hosts tagged "in-scope"
+ossuary stats --db engagement-acme.db --tag in-scope
+```
+
+```
+engagement summary (tag: in-scope)
+  assets:   1
+  ...
 ```
 
 ### Cruise mode

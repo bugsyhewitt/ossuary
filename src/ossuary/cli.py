@@ -247,6 +247,15 @@ def build_parser() -> argparse.ArgumentParser:
             f"(default: {stats_mod.DEFAULT_TOP}; 0 to omit the list)"
         ),
     )
+    p_stats.add_argument(
+        "--tag",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "only summarise assets carrying this tag (the same scoping "
+            "`dump --tag` applies; see `ossuary tag`)"
+        ),
+    )
 
     p_probe = sub.add_parser(
         "probe", help="HTTP/web layer discovery — probe web ports on known assets"
@@ -464,7 +473,7 @@ def _cmd_dump(args: argparse.Namespace) -> int:
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
-    print(stats_mod.stats(args.db, args.format, top=args.top))
+    print(stats_mod.stats(args.db, args.format, top=args.top, tag=args.tag))
     return 0
 
 
