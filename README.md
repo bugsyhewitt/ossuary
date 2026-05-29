@@ -146,6 +146,12 @@ Each finding's `source` column records where it came from (`osv.dev`, `nvd`, or
 more reliable for non-federal CVEs, while NVD still enriches the CISA-KEV /
 critical-software tier promptly — cross-referencing covers both.
 
+When NVD supplies a CVSS base score, ossuary takes it newest-standard-first:
+**CVSS 4.0 → 3.1 → 3.0 → 2.0**. As CNAs and NVD adopt CVSS 4.0, a growing share
+of freshly analysed CVEs are scored *only* under v4, so consulting `cvssMetricV40`
+first means those CVEs populate a finding's `severity` (and flow through the
+`--min-severity` filters and priority sort) instead of falling through to blank.
+
 ### Matching web tech fingerprints (`--web`)
 
 `ossuary probe` records each web endpoint's `Server` banner in the `web_probes`

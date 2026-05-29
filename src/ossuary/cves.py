@@ -146,8 +146,8 @@ def parse_nvd_response(response: dict) -> list[dict]:
 
     The v2 schema nests each result under ``vulnerabilities[].cve`` with the id
     at ``cve.id``, the English description under ``cve.descriptions``, and CVSS
-    scores under ``cve.metrics`` (preferring v3.1 > v3.0 > v2). Returns a list
-    of {"cve_id", "summary", "severity"} dicts.
+    scores under ``cve.metrics`` (preferring v4.0 > v3.1 > v3.0 > v2). Returns a
+    list of {"cve_id", "summary", "severity"} dicts.
     """
     findings: list[dict] = []
     for item in response.get("vulnerabilities", []) or []:
@@ -171,8 +171,16 @@ def parse_nvd_response(response: dict) -> list[dict]:
 
 
 def _nvd_severity(metrics: dict) -> str | None:
-    """Pull the best available CVSS base score string from NVD metrics."""
-    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+    """Pull the best available CVSS base score string from NVD metrics.
+
+    Preference order is newest-standard-first: CVSS v4.0 > v3.1 > v3.0 > v2.0.
+    NVD's CVE API v2 exposes CVSS 4.0 scores under the ``cvssMetricV40`` key,
+    and as CNAs and NVD adopt CVSS 4.0 a growing share of fresh CVEs are scored
+    *only* under v4 — so consulting it first means a v4-only CVE populates the
+    finding's severity instead of falling through to a blank. The cvssData
+    envelope (with a ``baseScore`` field) is identical across all four versions.
+    """
+    for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
         entries = metrics.get(key) or []
         if entries:
             data = entries[0].get("cvssData") or {}
