@@ -1053,3 +1053,194 @@ def test_dump_jira_round_trips_through_csv_reader(db_path):
         conn.close()
     row = _jira_rows(dump.dump(db_path, "jira"))[0]
     assert "heap overflow, then RCE" in row["Description"]
+
+
+# --------------------------------------------------------------------------
+# CycloneDX 1.5 SBOM export (SBOM-linked findings — `--format cyclonedx`)
+# --------------------------------------------------------------------------
+
+def _bom(out):
+    """Parse a CycloneDX dump and assert its document-level invariants."""
+    doc = json.loads(out)
+    assert doc["bomFormat"] == "CycloneDX"
+    assert doc["specVersion"] == "1.5"
+    assert "components" in doc
+    assert "vulnerabilities" in doc
+    return doc
+
+
+def test_dump_cyclonedx_is_listed_as_supported_format():
+    assert "cyclonedx" in dump.SUPPORTED_FORMATS
+
+
+def test_dump_cyclonedx_rejected_format_still_errors(db_path):
+    db.init_db(db_path).close()
+    with pytest.raises(ValueError, match="unsupported dump format"):
+        dump.dump(db_path, "spdx")
+
+
+def test_dump_cyclonedx_is_valid_1_5_document(db_path):
+    _seed_one_finding(db_path)
+    doc = _bom(dump.dump(db_path, "cyclonedx"))
+    tool = doc["metadata"]["tools"][0]
+    assert tool["name"] == "ossuary"
+    assert "version" in tool
+    # One component per service, one vulnerability per finding.
+    assert len(doc["components"]) == 1
+    assert len(doc["vulnerabilities"]) == 1
+
+
+def test_dump_cyclonedx_empty_db_has_empty_arrays(db_path):
+    db.init_db(db_path).close()
+    doc = _bom(dump.dump(db_path, "cyclonedx"))
+    assert doc["components"] == []
+    assert doc["vulnerabilities"] == []
+
+
+def test_dump_cyclonedx_component_carries_identifiers(db_path):
+    _seed_one_finding(db_path)  # nginx 1.18.0 with cpe:/a:nginx on 10.10.0.5:tcp/80
+    doc = _bom(dump.dump(db_path, "cyclonedx"))
+    comp = doc["components"][0]
+    assert comp["type"] == "application"
+    assert comp["bom-ref"] == "10.10.0.5:tcp/80"
+    assert comp["name"] == "nginx"
+    assert comp["version"] == "1.18.0"
+    assert comp["cpe"] == "cpe:/a:nginx"
+    # A generic purl identifies the discovered software at the network layer.
+    assert comp["purl"] == "pkg:generic/nginx@1.18.0"
+
+
+def test_dump_cyclonedx_vulnerability_links_back_to_component(db_path):
+    _seed_one_finding(db_path)
+    doc = _bom(dump.dump(db_path, "cyclonedx"))
+    comp_ref = doc["components"][0]["bom-ref"]
+    vuln = doc["vulnerabilities"][0]
+    assert vuln["id"] == "CVE-2021-23017"
+    # The affects[].ref back-reference is the SBOM-to-findings link.
+    assert vuln["affects"][0]["ref"] == comp_ref
+    assert vuln["source"]["url"] == (
+        "https://nvd.nist.gov/vuln/detail/CVE-2021-23017"
+    )
+    assert vuln["ratings"][0]["severity"] == "high"  # CVSS 7.7 -> high
+    assert vuln["ratings"][0]["score"] == 7.7
+
+
+def test_dump_cyclonedx_carries_epss_kev_in_properties(db_path):
+    _seed_mixed_findings(db_path)
+    doc = _bom(dump.dump(db_path, "cyclonedx"))
+    by_cve = {v["id"]: v for v in doc["vulnerabilities"]}
+    hot_props = {p["name"]: p["value"] for p in by_cve["CVE-HOT"]["properties"]}
+    assert hot_props["ossuary:kev"] == "true"
+    assert hot_props["ossuary:epss"] == "0.94"
+    cold_props = {p["name"]: p["value"] for p in by_cve["CVE-COLD"]["properties"]}
+    assert cold_props["ossuary:kev"] == "false"
+
+
+def test_dump_cyclonedx_blank_severity_is_unknown_rating(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-BLANK", "x", None, epss_score=None, kev=0)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = _bom(dump.dump(db_path, "cyclonedx"))
+    rating = doc["vulnerabilities"][0]["ratings"][0]
+    assert rating["severity"] == "unknown"
+    # No numeric score means no score / method keys on the rating.
+    assert "score" not in rating
+
+
+def test_dump_cyclonedx_severity_tiers(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-CRIT", "x", "9.8")
+        db.upsert_finding(conn, sid, "CVE-HIGH", "x", "7.5")
+        db.upsert_finding(conn, sid, "CVE-MEDM", "x", "5.0")
+        db.upsert_finding(conn, sid, "CVE-LOWW", "x", "2.0")
+        conn.commit()
+    finally:
+        conn.close()
+    doc = _bom(dump.dump(db_path, "cyclonedx"))
+    tiers = {v["id"]: v["ratings"][0]["severity"] for v in doc["vulnerabilities"]}
+    assert tiers == {
+        "CVE-CRIT": "critical",
+        "CVE-HIGH": "high",
+        "CVE-MEDM": "medium",
+        "CVE-LOWW": "low",
+    }
+
+
+def test_dump_cyclonedx_emits_component_even_with_no_findings(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.9", None, "up")
+        db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        conn.commit()
+    finally:
+        conn.close()
+    # An SBOM is a component inventory: a service with no finding is still a
+    # discovered component, so it appears (unlike SARIF, which is finding-only).
+    doc = _bom(dump.dump(db_path, "cyclonedx"))
+    assert len(doc["components"]) == 1
+    assert doc["components"][0]["name"] == "OpenSSH"
+    assert doc["vulnerabilities"] == []
+
+
+def test_dump_cyclonedx_links_shared_cve_to_each_component(db_path):
+    conn = db.init_db(db_path)
+    try:
+        # Same CVE on two hosts -> two components, two distinct vuln entries,
+        # each linked to its own component bom-ref.
+        a1 = db.upsert_asset(conn, "10.10.0.5", "h1", "up")
+        s1 = db.upsert_service(conn, a1, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s1, "CVE-SHARED", "x", "7.0")
+        a2 = db.upsert_asset(conn, "10.10.0.6", "h2", "up")
+        s2 = db.upsert_service(conn, a2, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s2, "CVE-SHARED", "x", "7.0")
+        conn.commit()
+    finally:
+        conn.close()
+    doc = _bom(dump.dump(db_path, "cyclonedx"))
+    assert len(doc["components"]) == 2
+    assert len(doc["vulnerabilities"]) == 2
+    refs = {v["affects"][0]["ref"] for v in doc["vulnerabilities"]}
+    assert refs == {"10.10.0.5:tcp/80", "10.10.0.6:tcp/80"}
+
+
+def test_dump_cyclonedx_filters_apply(db_path):
+    _seed_mixed_findings(db_path)
+    doc = _bom(dump.dump(db_path, "cyclonedx", kev_only=True))
+    cves = {v["id"] for v in doc["vulnerabilities"]}
+    assert cves == {"CVE-HOT"}
+    # The pruned service carries no component either (filtered build_state).
+    assert len(doc["components"]) == 1
+    assert doc["components"][0]["bom-ref"] == "10.10.0.5:tcp/80"
+
+
+def test_dump_cyclonedx_sort_by_priority_orders_vulnerabilities(db_path):
+    _seed_one_service_many_findings(db_path)
+    doc = _bom(dump.dump(db_path, "cyclonedx", sort_by_priority=True))
+    emitted = [v["id"] for v in doc["vulnerabilities"]]
+    assert emitted == [
+        "CVE-2020-KEVHI",
+        "CVE-2020-KEVLO",
+        "CVE-2020-WARM",
+        "CVE-2020-COLD",
+    ]
+
+
+def test_dump_cyclonedx_purl_escapes_special_chars(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        # A product name with a space / slash must be percent-encoded in the purl.
+        db.upsert_service(conn, aid, 80, "tcp", "http", "Acme Web/Server", "2.0", None)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = _bom(dump.dump(db_path, "cyclonedx"))
+    assert doc["components"][0]["purl"] == "pkg:generic/Acme%20Web%2FServer@2.0"
