@@ -61,6 +61,7 @@ ossuary cruise       re-fingerprint, diff against last saved state, report chang
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
 ossuary dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF (filterable by KEV/EPSS/severity)
 ossuary stats        print an at-a-glance engagement summary (counts + top hits)
+ossuary diff         compare two engagement DBs -> new / resolved / persisting findings
 ossuary tag          attach / list / remove labels on assets for grouping & filtering
 ossuary profiles     list the named scan profiles and their nmap flags
 ```
@@ -663,6 +664,65 @@ cleanly on `SIGTERM`/`SIGINT`, finishing the in-flight pass's snapshot first.
 > interval doesn't justify the extra dependency and daemon-management surface.
 > Need cron-style schedules? Run `watch --once` from cron and let cron own the
 > cadence.
+
+### Finding-level diff (`ossuary diff`)
+
+`cruise` and `watch` diff the *service* surface of one DB over time — ports,
+versions, services appearing and disappearing. They never answer the question a
+hunter actually asks after re-scanning: **which CVE findings are new, and which
+got resolved (patched)?** `ossuary diff` compares the findings of two engagement
+DB files — a **baseline** (the earlier scan) and a **current** one (the later
+scan) — and classifies every finding:
+
+| class | meaning |
+|---|---|
+| `new` | in current, not in baseline — **newly exposed** |
+| `resolved` | in baseline, not in current — **patched / removed** |
+| `persisting` | in both — still exposed |
+
+A finding's identity is the triple `(ip, protocol/port, cve_id)` — the same
+host:service location the SARIF / HTML exports use — so the same CVE on two hosts
+is two findings, and a CVE that moves ports reads as one `resolved` + one `new`
+(it genuinely moved).
+
+The usual workflow is to keep a dated copy of the baseline DB, run a fresh scan
+into a new DB, then diff:
+
+```bash
+# baseline.db was last week's scan; engagement-acme.db is today's
+ossuary diff --db baseline.db --against engagement-acme.db
+#   finding diff: 1 new, 1 resolved, 2 persisting
+#   new (1) — newly exposed:
+#     10.10.0.5:tcp/80 (nginx 1.24.0)  CVE-2025-9999  severity: 8.8  EPSS: 0.90 | KEV: YES
+#   resolved (1) — patched / removed:
+#     10.10.0.5:tcp/80 (nginx 1.18.0)  CVE-2024-1234  severity: 9.1  EPSS: 0.80 | KEV: YES
+```
+
+`--db` is the baseline, `--against` is the current scan. The text report lists
+the `new` and `resolved` findings (the two that demand attention) and counts the
+`persisting` ones without listing them — a plain `dump` already covers unchanged
+exposure. `--format json` emits the full `{new, resolved, persisting}` structure
+for piping.
+
+`new`/`persisting` entries carry the **current** DB's finding detail (severity /
+EPSS / KEV / summary); `resolved` entries carry the **baseline**'s (the current
+DB no longer holds them).
+
+**Actionability filters.** `diff` accepts the same `--kev-only`, `--min-epss`,
+and `--min-severity` filters as `dump` and `stats`. They scope *both* sides
+before diffing, so you can ask "what's new among the findings worth reporting":
+
+```bash
+# only diff the KEV (actively-exploited) findings
+ossuary diff --db baseline.db --against engagement-acme.db --kev-only
+
+# only the high-EPSS exposure that changed
+ossuary diff --db baseline.db --against engagement-acme.db --min-epss 0.5 --format json
+```
+
+> **Design note.** `diff` reads each DB through the same `build_state` the
+> exports use, so the filtered, location-keyed view it diffs is identical to what
+> a filtered `dump` of each DB would show. Pure Python, no new schema, no network.
 
 ---
 
