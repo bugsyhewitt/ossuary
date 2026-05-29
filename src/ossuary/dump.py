@@ -16,6 +16,14 @@ findings) to one of four shapes:
                    the shareable, human-readable deliverable that closes the
                    report-export lineage. It carries the same data the other
                    formats do and respects the same filters / priority order.
+  * ``sarif``    — a SARIF v2.1.0 (Static Analysis Results Interchange Format,
+                   OASIS) document: one ``result`` per finding, one ``rule`` per
+                   distinct CVE. This is the standard machine artifact that
+                   GitHub code scanning, DefectDojo, Azure DevOps, and other
+                   security platforms ingest natively, so a hunter can pipe an
+                   engagement's actionable findings straight into the tooling
+                   ecosystem. Like the other formats it reads off ``build_state``,
+                   so it honours the same filters and priority order.
 
 The flat (csv / markdown) formats cover exactly the same fields as the JSON
 output, flattened across the asset/service/finding nesting.
@@ -44,9 +52,9 @@ import json
 import sqlite3
 from pathlib import Path
 
-from . import db, tags
+from . import __version__, db, tags
 
-SUPPORTED_FORMATS = ("json", "csv", "markdown", "html")
+SUPPORTED_FORMATS = ("json", "csv", "markdown", "html", "sarif")
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
 # the asset-, service-, and finding-level fields the JSON dump exposes.
@@ -447,6 +455,161 @@ def to_html(state: dict) -> str:
     return "\n".join(parts)
 
 
+# --------------------------------------------------------------------------
+# SARIF v2.1.0 export (POST_V01 Rank 14)
+# --------------------------------------------------------------------------
+
+# SARIF maps a numeric CVSS base score to one of four ordered severity levels.
+# ossuary additionally surfaces EPSS / KEV as result properties, but the SARIF
+# `level` is the field most consumers (GitHub code scanning et al.) key off, so
+# we derive it from the live signal: a KEV finding is always an `error`
+# regardless of (often blank, post-NIST-retreat) CVSS, then numeric severity
+# tiers, then `warning` as the floor for an un-scored finding.
+def _sarif_level(finding: dict) -> str:
+    """Map a finding to a SARIF result level (error/warning/note).
+
+    KEV (confirmed exploited) is always ``error``. Otherwise the numeric CVSS
+    severity drives it: >= 7.0 -> ``error``, >= 4.0 -> ``warning``, a parseable
+    lower score -> ``note``. A blank / non-numeric severity with no KEV signal
+    falls back to ``warning`` (the SARIF default) rather than silently sinking
+    to ``note`` — an un-triaged finding shouldn't read as low-importance.
+    """
+    if finding.get("kev"):
+        return "error"
+    sev = _parse_severity(finding.get("severity"))
+    if sev is None:
+        return "warning"
+    if sev >= 7.0:
+        return "error"
+    if sev >= 4.0:
+        return "warning"
+    return "note"
+
+
+def _sarif_results_and_rules(state: dict) -> tuple[list[dict], list[dict]]:
+    """Build the SARIF ``results`` list and the de-duplicated ``rules`` list.
+
+    One ``result`` is emitted per finding (carrying its host:port location and
+    EPSS / KEV / severity as result properties); one ``rule`` is emitted per
+    distinct CVE id, so a CVE matched on several hosts contributes a single rule
+    referenced by ``ruleId``. Rules are ordered by first appearance and results
+    follow the same per-host / per-service / per-finding walk the other formats
+    use, so the priority ordering (when requested) is preserved.
+    """
+    results: list[dict] = []
+    rules: list[dict] = []
+    rule_index: dict[str, int] = {}
+
+    for asset in state["assets"]:
+        ip = asset["ip"]
+        host = asset.get("hostname")
+        host_label = f"{ip} ({host})" if host else ip
+        for svc in asset["services"]:
+            port = svc["port"]
+            protocol = svc["protocol"]
+            location_uri = f"{ip}:{protocol}/{port}"
+            product = svc.get("product")
+            version = svc.get("version")
+            svc_detail = " ".join(p for p in (product, version) if p)
+            for f in svc["findings"]:
+                cve_id = f.get("cve_id") or "UNKNOWN"
+                summary = f.get("summary") or ""
+                # Register a rule the first time we see this CVE.
+                if cve_id not in rule_index:
+                    rule_index[cve_id] = len(rules)
+                    rule: dict = {
+                        "id": cve_id,
+                        "name": cve_id,
+                        "shortDescription": {"text": cve_id},
+                        "helpUri": (
+                            f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+                            if cve_id.upper().startswith("CVE-")
+                            else None
+                        ),
+                    }
+                    if summary:
+                        rule["fullDescription"] = {"text": summary}
+                    # Drop a None helpUri rather than emit a null.
+                    if rule["helpUri"] is None:
+                        del rule["helpUri"]
+                    rules.append(rule)
+
+                msg_target = svc_detail or f"{protocol}/{port}"
+                message = (
+                    f"{cve_id} on {host_label} ({msg_target})"
+                    + (f": {summary}" if summary else "")
+                )
+                properties: dict = {
+                    "ip": ip,
+                    "port": port,
+                    "protocol": protocol,
+                    "kev": bool(f.get("kev")),
+                }
+                if host:
+                    properties["hostname"] = host
+                if product:
+                    properties["product"] = product
+                if version:
+                    properties["version"] = version
+                if f.get("epss_score") is not None:
+                    properties["epss_score"] = f["epss_score"]
+                if f.get("severity") not in (None, ""):
+                    properties["severity"] = f["severity"]
+                if f.get("source"):
+                    properties["source"] = f["source"]
+
+                results.append(
+                    {
+                        "ruleId": cve_id,
+                        "ruleIndex": rule_index[cve_id],
+                        "level": _sarif_level(f),
+                        "message": {"text": message},
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": location_uri}
+                                }
+                            }
+                        ],
+                        "properties": properties,
+                    }
+                )
+    return results, rules
+
+
+def to_sarif(state: dict) -> str:
+    """Serialise the engagement state as a SARIF v2.1.0 document.
+
+    Emits a single run by the ``ossuary`` tool: one ``result`` per finding and
+    one ``rule`` per distinct CVE. The document validates against the SARIF
+    v2.1.0 schema and is ingestible by GitHub code scanning, DefectDojo, and the
+    wider security-tooling ecosystem. An empty engagement still yields a valid
+    document with an empty ``results`` array.
+    """
+    results, rules = _sarif_results_and_rules(state)
+    sarif = {
+        "$schema": (
+            "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/"
+            "Schemata/sarif-schema-2.1.0.json"
+        ),
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "ossuary",
+                        "informationUri": "https://github.com/bugsyhewitt/ossuary",
+                        "version": __version__,
+                        "rules": rules,
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
+    return json.dumps(sarif, indent=2, sort_keys=False)
+
+
 def dump(
     db_path: str | Path,
     fmt: str = "json",
@@ -459,7 +622,8 @@ def dump(
 ) -> str:
     """Return the engagement state as a serialised string in the given format.
 
-    `fmt` is one of ``json``, ``csv``, ``markdown``, or ``html``. `tag`, when set,
+    `fmt` is one of ``json``, ``csv``, ``markdown``, ``html``, or ``sarif``.
+    `tag`, when set,
     restricts the export to assets carrying that tag label. `min_epss`,
     `min_severity`, and `kev_only` are actionability filters: each restricts the
     export to findings clearing that threshold, pruning services and assets left
@@ -491,4 +655,6 @@ def dump(
         return to_markdown(state)
     if fmt == "html":
         return to_html(state)
+    if fmt == "sarif":
+        return to_sarif(state)
     return json.dumps(state, indent=2, sort_keys=False)

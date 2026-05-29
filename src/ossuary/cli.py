@@ -8,7 +8,7 @@ Subcommands (v0.1):
     match-cves   query OSV.dev for service versions -> findings table
     cruise       re-fingerprint, diff against last state, report changes
     watch        run cruise on an interval, emitting a diff summary each pass
-    dump         export full engagement state as JSON, CSV, Markdown, or HTML
+    dump         export full engagement state as JSON, CSV, Markdown, HTML, or SARIF
     stats        print a top-of-funnel engagement summary (counts + top hits)
     profiles     list the named scan profiles (stealth/aggressive/web/default)
 
@@ -180,10 +180,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_dump.add_argument(
         "--format",
         default="json",
-        choices=["json", "csv", "markdown", "html"],
+        choices=["json", "csv", "markdown", "html", "sarif"],
         help=(
             "output format: json (nested), csv or markdown (flat, one finding "
-            "per row), or html (self-contained report grouped per asset)"
+            "per row), html (self-contained report grouped per asset), or sarif "
+            "(SARIF v2.1.0 for GitHub code scanning / DefectDojo / etc.)"
         ),
     )
     p_dump.add_argument(
