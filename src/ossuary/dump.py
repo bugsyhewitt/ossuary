@@ -39,6 +39,21 @@ findings) to one of four shapes:
                    into an SBOM pipeline. Like the other formats it reads off
                    ``build_state``, so it honours the same filters and priority
                    order.
+  * ``spdx``     — an SPDX 2.3 SBOM (Software Package Data Exchange, ISO/IEC
+                   5962:2021) JSON document — the second open SBOM standard
+                   alongside CycloneDX. Each fingerprinted service becomes a
+                   ``package`` (with a stable ``SPDXID``, ``versionInfo``, and a
+                   ``cpe23Type`` / ``purl`` external reference where derivable),
+                   the document ``DESCRIBES`` each package via a relationship,
+                   and each finding becomes a ``SECURITY`` external reference on
+                   its package pointing at the CVE's NVD detail page (the SPDX
+                   2.3 idiom for attaching a vulnerability to a component, with
+                   EPSS / KEV / severity in the ref comment). This is the
+                   standard machine artifact SPDX-consuming supply-chain tools
+                   ingest, so a hunter can pipe an engagement's component +
+                   matched-vulnerability inventory into an SPDX pipeline. Like
+                   the other formats it reads off ``build_state``, so it honours
+                   the same filters and priority order.
   * ``jira``     — an issue-tracker import CSV: one row per finding, shaped as a
                    ticket (``Summary`` title, rich ``Description``, mapped
                    ``Priority``, ``Labels``) rather than the raw inventory the
@@ -93,7 +108,16 @@ from . import __version__, db, tags
 from .vex import VexSuppressions
 from .vex import load as vex_load
 
-SUPPORTED_FORMATS = ("json", "csv", "markdown", "html", "sarif", "jira", "cyclonedx")
+SUPPORTED_FORMATS = (
+    "json",
+    "csv",
+    "markdown",
+    "html",
+    "sarif",
+    "jira",
+    "cyclonedx",
+    "spdx",
+)
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
 # the asset-, service-, and finding-level fields the JSON dump exposes.
@@ -1048,6 +1072,182 @@ def to_cyclonedx(state: dict) -> str:
     return json.dumps(bom, indent=2, sort_keys=False)
 
 
+# --------------------------------------------------------------------------
+# SPDX 2.3 SBOM export (the ISO/IEC 5962:2021 companion to CycloneDX)
+# --------------------------------------------------------------------------
+
+# SPDX is the second of the two open SBOM standards (CycloneDX is the other),
+# standardised as ISO/IEC 5962:2021 and required by the US executive-order
+# software-supply-chain guidance. Where CycloneDX models a vulnerability as a
+# first-class object, SPDX 2.3 attaches a vulnerability to its package via a
+# `SECURITY` external reference (referenceCategory) pointing at the CVE's NVD
+# record. We emit the tag-value-equivalent JSON shape: a document with
+# creationInfo, one `package` per discovered service, a `DESCRIBES` relationship
+# from the document to each package, and a `SECURITY`/`cpe23Type`/`purl` external
+# reference list per package so a hunter's discovered-component + matched-CVE
+# inventory drops into any SPDX-consuming supply-chain tool.
+
+# Characters SPDX allows in an SPDXID after the mandatory `SPDXRef-` prefix:
+# letters, digits, `.` and `-`. Everything else (`:`, `/`, spaces, …) is mapped
+# to `-` so a service location like `10.10.0.5:tcp/80` yields a valid id.
+_SPDX_ID_SAFE = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-"
+)
+
+
+def _spdx_id(suffix: str) -> str:
+    """Build a schema-valid ``SPDXRef-<suffix>`` identifier.
+
+    SPDX restricts the id alphabet to letters, digits, ``.`` and ``-``; any
+    other character in ``suffix`` (``:`` / ``/`` / space …) is replaced with a
+    ``-`` so a service location maps to a unique, valid SPDXID.
+    """
+    cleaned = "".join(c if c in _SPDX_ID_SAFE else "-" for c in suffix)
+    return f"SPDXRef-{cleaned}"
+
+
+def _spdx_external_refs(svc: dict, findings: list[dict]) -> list[dict]:
+    """Build a package's SPDX 2.3 ``externalRefs`` list.
+
+    Carries the package identifiers SPDX recognises — a ``cpe23Type`` ref for a
+    service CPE and a ``purl`` ref for the derived Package URL — plus one
+    ``SECURITY`` / ``cve`` reference per finding, the SPDX 2.3 way of attaching a
+    matched vulnerability to a package (pointing at the CVE's NVD detail page).
+    """
+    refs: list[dict] = []
+    cpe = svc.get("cpe")
+    if cpe:
+        refs.append(
+            {
+                "referenceCategory": "SECURITY",
+                "referenceType": "cpe23Type",
+                "referenceLocator": str(cpe),
+            }
+        )
+    purl = _purl(svc.get("product"), svc.get("version"))
+    if purl:
+        refs.append(
+            {
+                "referenceCategory": "PACKAGE-MANAGER",
+                "referenceType": "purl",
+                "referenceLocator": purl,
+            }
+        )
+    for f in findings:
+        cve_id = f.get("cve_id") or "UNKNOWN"
+        if cve_id.upper().startswith("CVE-"):
+            locator = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+        else:
+            locator = cve_id
+        ref = {
+            "referenceCategory": "SECURITY",
+            "referenceType": "cve",
+            "referenceLocator": locator,
+        }
+        comment_bits = [cve_id]
+        sev = f.get("severity")
+        if sev not in (None, ""):
+            comment_bits.append(f"severity={sev}")
+        if f.get("epss_score") is not None:
+            comment_bits.append(f"epss={f['epss_score']}")
+        if f.get("kev"):
+            comment_bits.append("kev")
+        ref["comment"] = " ".join(comment_bits)
+        refs.append(ref)
+    return refs
+
+
+def _spdx_packages_and_relationships(
+    state: dict,
+    doc_spdxid: str,
+) -> tuple[list[dict], list[dict]]:
+    """Build the SPDX ``packages`` and ``relationships`` lists.
+
+    One ``package`` is emitted per service (every fingerprinted host:port),
+    carrying a stable SPDXID derived from its ``ip:proto/port`` location, the
+    service name / version, and the external references (CPE / purl / per-finding
+    CVE). One ``DESCRIBES`` relationship links the document to each package — the
+    SPDX way of declaring the document's described subjects. Packages follow the
+    same per-host / per-service walk the other formats use, so any requested
+    priority ordering is preserved.
+    """
+    packages: list[dict] = []
+    relationships: list[dict] = []
+
+    for asset in state["assets"]:
+        ip = asset["ip"]
+        host = asset.get("hostname")
+        for svc in asset["services"]:
+            port = svc["port"]
+            protocol = svc["protocol"]
+            ref = _bom_ref(ip, protocol, port)
+            spdxid = _spdx_id(ref)
+            name = svc.get("product") or svc.get("name") or f"{protocol}/{port}"
+            package: dict = {
+                "SPDXID": spdxid,
+                "name": str(name),
+                # SPDX requires these two fields on every package; ossuary does
+                # not assert anything about download source or licensing of a
+                # network-discovered service, so both are the spec's NOASSERTION.
+                "downloadLocation": "NOASSERTION",
+                "licenseConcluded": "NOASSERTION",
+                "copyrightText": "NOASSERTION",
+            }
+            if svc.get("version"):
+                package["versionInfo"] = str(svc["version"])
+            host_label = f"{ip} ({host})" if host else ip
+            package["comment"] = (
+                f"discovered service on {host_label} {protocol}/{port}"
+            )
+            ext_refs = _spdx_external_refs(svc, svc["findings"])
+            if ext_refs:
+                package["externalRefs"] = ext_refs
+            packages.append(package)
+            relationships.append(
+                {
+                    "spdxElementId": doc_spdxid,
+                    "relationshipType": "DESCRIBES",
+                    "relatedSpdxElement": spdxid,
+                }
+            )
+
+    return packages, relationships
+
+
+def to_spdx(state: dict) -> str:
+    """Serialise the engagement state as an SPDX 2.3 SBOM (JSON) document.
+
+    Emits an ``spdxVersion: SPDX-2.3`` document: one ``package`` per discovered
+    service and a ``DESCRIBES`` relationship from the document to each package.
+    Each package carries its CPE / purl identifier and one ``SECURITY`` external
+    reference per matched CVE — the SPDX 2.3 way of attaching a vulnerability to
+    a component. The document is ingestible by SPDX-consuming supply-chain tools
+    (the ISO/IEC 5962:2021 standard alongside CycloneDX). An empty engagement
+    still yields a valid document with empty ``packages`` / ``relationships``
+    arrays.
+    """
+    doc_spdxid = "SPDXRef-DOCUMENT"
+    packages, relationships = _spdx_packages_and_relationships(state, doc_spdxid)
+    spdx = {
+        "spdxVersion": "SPDX-2.3",
+        "dataLicense": "CC0-1.0",
+        "SPDXID": doc_spdxid,
+        "name": "ossuary-engagement",
+        "documentNamespace": (
+            "https://github.com/bugsyhewitt/ossuary/spdx/ossuary-engagement"
+        ),
+        "creationInfo": {
+            "creators": [f"Tool: ossuary-{__version__}"],
+            # A fixed sentinel keeps the document byte-stable for tests; SPDX
+            # requires the field but accepts any valid ISO-8601 instant.
+            "created": "1970-01-01T00:00:00Z",
+        },
+        "packages": packages,
+        "relationships": relationships,
+    }
+    return json.dumps(spdx, indent=2, sort_keys=False)
+
+
 def dump(
     db_path: str | Path,
     fmt: str = "json",
@@ -1064,8 +1264,11 @@ def dump(
     """Return the engagement state as a serialised string in the given format.
 
     `fmt` is one of ``json``, ``csv``, ``markdown``, ``html``, ``sarif``,
-    ``jira`` (an issue-tracker import CSV for Jira / Linear), or ``cyclonedx``
-    (a CycloneDX 1.5 SBOM linking each finding back to its component).
+    ``jira`` (an issue-tracker import CSV for Jira / Linear), ``cyclonedx``
+    (a CycloneDX 1.5 SBOM linking each finding back to its component), or
+    ``spdx`` (an SPDX 2.3 SBOM — the ISO/IEC 5962:2021 standard alongside
+    CycloneDX — one package per service with a SECURITY external reference per
+    matched CVE).
     `tag`, when set,
     restricts the export to assets carrying that tag label. `min_epss`,
     `min_severity`, and `kev_only` are actionability filters: each restricts the
@@ -1114,4 +1317,6 @@ def dump(
         return to_jira(state)
     if fmt == "cyclonedx":
         return to_cyclonedx(state)
+    if fmt == "spdx":
+        return to_spdx(state)
     return json.dumps(state, indent=2, sort_keys=False)

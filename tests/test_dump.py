@@ -1076,7 +1076,7 @@ def test_dump_cyclonedx_is_listed_as_supported_format():
 def test_dump_cyclonedx_rejected_format_still_errors(db_path):
     db.init_db(db_path).close()
     with pytest.raises(ValueError, match="unsupported dump format"):
-        dump.dump(db_path, "spdx")
+        dump.dump(db_path, "toml")
 
 
 def test_dump_cyclonedx_is_valid_1_5_document(db_path):
@@ -1244,3 +1244,201 @@ def test_dump_cyclonedx_purl_escapes_special_chars(db_path):
         conn.close()
     doc = _bom(dump.dump(db_path, "cyclonedx"))
     assert doc["components"][0]["purl"] == "pkg:generic/Acme%20Web%2FServer@2.0"
+
+
+# --------------------------------------------------------------------------
+# SPDX 2.3 SBOM export (`--format spdx`) — the ISO/IEC 5962:2021 companion
+# --------------------------------------------------------------------------
+
+def _spdx(out):
+    """Parse an SPDX dump and assert its document-level invariants."""
+    doc = json.loads(out)
+    assert doc["spdxVersion"] == "SPDX-2.3"
+    assert doc["dataLicense"] == "CC0-1.0"
+    assert doc["SPDXID"] == "SPDXRef-DOCUMENT"
+    assert "packages" in doc
+    assert "relationships" in doc
+    return doc
+
+
+def _pkg_security_refs(package):
+    """The SECURITY/cve external-reference locators on an SPDX package."""
+    return [
+        r["referenceLocator"]
+        for r in package.get("externalRefs", [])
+        if r["referenceType"] == "cve"
+    ]
+
+
+def test_dump_spdx_is_listed_as_supported_format():
+    assert "spdx" in dump.SUPPORTED_FORMATS
+
+
+def test_dump_spdx_is_valid_2_3_document(db_path):
+    _seed_one_finding(db_path)
+    doc = _spdx(dump.dump(db_path, "spdx"))
+    creators = doc["creationInfo"]["creators"]
+    assert any(c.startswith("Tool: ossuary-") for c in creators)
+    assert "created" in doc["creationInfo"]
+    # One package per service.
+    assert len(doc["packages"]) == 1
+    # The document DESCRIBES each package.
+    assert len(doc["relationships"]) == 1
+
+
+def test_dump_spdx_empty_db_has_empty_arrays(db_path):
+    db.init_db(db_path).close()
+    doc = _spdx(dump.dump(db_path, "spdx"))
+    assert doc["packages"] == []
+    assert doc["relationships"] == []
+
+
+def test_dump_spdx_package_carries_identifiers(db_path):
+    _seed_one_finding(db_path)  # nginx 1.18.0 cpe:/a:nginx on 10.10.0.5:tcp/80
+    doc = _spdx(dump.dump(db_path, "spdx"))
+    pkg = doc["packages"][0]
+    assert pkg["SPDXID"] == "SPDXRef-10.10.0.5-tcp-80"
+    assert pkg["name"] == "nginx"
+    assert pkg["versionInfo"] == "1.18.0"
+    # SPDX requires these on every package.
+    assert pkg["downloadLocation"] == "NOASSERTION"
+    assert pkg["licenseConcluded"] == "NOASSERTION"
+    ext = {r["referenceType"]: r["referenceLocator"] for r in pkg["externalRefs"]}
+    assert ext["cpe23Type"] == "cpe:/a:nginx"
+    assert ext["purl"] == "pkg:generic/nginx@1.18.0"
+
+
+def test_dump_spdx_describes_relationship_targets_each_package(db_path):
+    _seed_one_finding(db_path)
+    doc = _spdx(dump.dump(db_path, "spdx"))
+    pkg_id = doc["packages"][0]["SPDXID"]
+    rel = doc["relationships"][0]
+    assert rel["spdxElementId"] == "SPDXRef-DOCUMENT"
+    assert rel["relationshipType"] == "DESCRIBES"
+    assert rel["relatedSpdxElement"] == pkg_id
+
+
+def test_dump_spdx_finding_becomes_security_external_ref(db_path):
+    _seed_one_finding(db_path)
+    doc = _spdx(dump.dump(db_path, "spdx"))
+    refs = _pkg_security_refs(doc["packages"][0])
+    assert refs == ["https://nvd.nist.gov/vuln/detail/CVE-2021-23017"]
+    # The CVE ref records the live signal in its comment.
+    cve_ref = next(
+        r
+        for r in doc["packages"][0]["externalRefs"]
+        if r["referenceType"] == "cve"
+    )
+    assert cve_ref["referenceCategory"] == "SECURITY"
+    assert "CVE-2021-23017" in cve_ref["comment"]
+    assert "severity=7.7" in cve_ref["comment"]
+
+
+def test_dump_spdx_security_ref_carries_epss_and_kev(db_path):
+    _seed_mixed_findings(db_path)
+    doc = _spdx(dump.dump(db_path, "spdx"))
+    # CVE-HOT is on the nginx (80) package; find its cve ref comment.
+    comments = [
+        r["comment"]
+        for pkg in doc["packages"]
+        for r in pkg.get("externalRefs", [])
+        if r["referenceType"] == "cve"
+    ]
+    hot = next(c for c in comments if "CVE-HOT" in c)
+    assert "epss=0.94" in hot
+    assert "kev" in hot
+    cold = next(c for c in comments if "CVE-COLD" in c)
+    assert "kev" not in cold
+
+
+def test_dump_spdx_non_cve_finding_locator_is_the_raw_id(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "GHSA-xxxx", "advisory", "5.0")
+        conn.commit()
+    finally:
+        conn.close()
+    doc = _spdx(dump.dump(db_path, "spdx"))
+    assert _pkg_security_refs(doc["packages"][0]) == ["GHSA-xxxx"]
+
+
+def test_dump_spdx_emits_package_even_with_no_findings(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.9", None, "up")
+        db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        conn.commit()
+    finally:
+        conn.close()
+    # An SBOM is a component inventory: a service with no finding is still a
+    # discovered package, so it appears (like CycloneDX, unlike SARIF).
+    doc = _spdx(dump.dump(db_path, "spdx"))
+    assert len(doc["packages"]) == 1
+    assert doc["packages"][0]["name"] == "OpenSSH"
+    assert _pkg_security_refs(doc["packages"][0]) == []
+    assert len(doc["relationships"]) == 1
+
+
+def test_dump_spdx_ids_are_unique_and_valid(db_path):
+    conn = db.init_db(db_path)
+    try:
+        a1 = db.upsert_asset(conn, "10.10.0.5", "h1", "up")
+        db.upsert_service(conn, a1, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_service(conn, a1, 443, "tcp", "https", "nginx", "1.0", None)
+        a2 = db.upsert_asset(conn, "10.10.0.6", "h2", "up")
+        db.upsert_service(conn, a2, 80, "tcp", "http", "apache", "2.4", None)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = _spdx(dump.dump(db_path, "spdx"))
+    ids = [p["SPDXID"] for p in doc["packages"]]
+    assert len(ids) == len(set(ids)) == 3
+    # Every id is a valid SPDXRef-<alnum.-> identifier (no ':' or '/').
+    for sid in ids:
+        assert sid.startswith("SPDXRef-")
+        assert all(c not in sid for c in (":", "/", " "))
+
+
+def test_dump_spdx_filters_apply(db_path):
+    _seed_mixed_findings(db_path)
+    doc = _spdx(dump.dump(db_path, "spdx", kev_only=True))
+    # Only the KEV finding's service survives the filter -> one package.
+    assert len(doc["packages"]) == 1
+    assert doc["packages"][0]["SPDXID"] == "SPDXRef-10.10.0.5-tcp-80"
+    assert _pkg_security_refs(doc["packages"][0]) == [
+        "https://nvd.nist.gov/vuln/detail/CVE-HOT"
+    ]
+
+
+def test_dump_spdx_sort_by_priority_orders_security_refs(db_path):
+    _seed_one_service_many_findings(db_path)
+    doc = _spdx(dump.dump(db_path, "spdx", sort_by_priority=True))
+    refs = _pkg_security_refs(doc["packages"][0])
+    # The per-finding CVE refs follow the priority order build_state imposes.
+    assert refs == [
+        "https://nvd.nist.gov/vuln/detail/CVE-2020-KEVHI",
+        "https://nvd.nist.gov/vuln/detail/CVE-2020-KEVLO",
+        "https://nvd.nist.gov/vuln/detail/CVE-2020-WARM",
+        "https://nvd.nist.gov/vuln/detail/CVE-2020-COLD",
+    ]
+
+
+def test_dump_spdx_honours_tag_scope(db_path):
+    _seed_mixed_findings(db_path)  # all on 10.10.0.5
+    conn = db.init_db(db_path)
+    try:
+        db.upsert_asset(conn, "10.10.0.9", "other", "up")
+        aid = conn.execute(
+            "SELECT id FROM assets WHERE ip = '10.10.0.9'"
+        ).fetchone()["id"]
+        db.upsert_service(conn, aid, 21, "tcp", "ftp", "vsftpd", "3.0", None)
+        conn.commit()
+    finally:
+        conn.close()
+    tags.add_tag(db_path, "10.10.0.5", "in-scope")
+    doc = _spdx(dump.dump(db_path, "spdx", tag="in-scope"))
+    # Only the tagged host's services appear; the ftp service is excluded.
+    names = {p["name"] for p in doc["packages"]}
+    assert names == {"nginx", "OpenSSH"}
