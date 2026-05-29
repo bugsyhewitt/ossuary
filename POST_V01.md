@@ -422,6 +422,45 @@ it's a thin presentation layer over proven logic.
 
 ---
 
+## Rank 15 — Finding-level diff between two scans (`ossuary diff`)  ✅ IMPLEMENTED
+
+> Shipped: new `ossuary.findingdiff` module + `ossuary diff` subcommand. It
+> compares the findings of two engagement DB files — `--db` (baseline / earlier
+> scan) against `--against` (current / later scan) — and classifies every
+> finding, keyed on the `(ip, protocol/port, cve_id)` triple, as `new`
+> (current-only — newly exposed), `resolved` (baseline-only — patched / removed),
+> or `persisting` (in both). `--format text|json`; the text report lists the
+> `new` and `resolved` entries (the two that demand attention) and counts the
+> `persisting` ones. `new`/`persisting` entries carry the current DB's finding
+> detail, `resolved` entries the baseline's. Both DBs are read through
+> `dump.build_state`, so `diff` honours the same actionability filters
+> (`--kev-only` / `--min-epss` / `--min-severity`) — scoping *both* sides before
+> diffing so a hunter can ask "what's new among the actionable findings." A CVE
+> that moves ports reads as one resolved + one new (it genuinely moved). Pure
+> Python, no new schema, no new dependency, no network. +23 tests.
+
+**What:** `cruise` (and the `watch` daemon looping it) diffs the *service*
+surface of a single DB over time — ports, versions, services appearing /
+disappearing — and the cruise snapshot doesn't even carry findings. The missing
+artifact is the **vulnerability-surface delta**: after a re-scan, which CVE
+findings are new (newly exposed) and which were resolved (the admin patched)?
+That's the question that turns a re-scan into triage, and nothing answered it.
+
+**Why now:** It's the natural companion to the re-scan loop `cruise`/`watch`
+already encourage. A hunter who keeps a dated baseline DB and scans fresh into a
+new one wants the *finding* delta, not just the service delta — "CVE-X vanished
+off host Y (patched)" and "fresh CVE-Z appeared on a newly-exposed version" are
+the high-signal moments. Reusing `build_state` means the diff inherits the
+location keying and every actionability filter for free, so it's a thin
+comparison layer over proven logic and can't drift from what a filtered `dump`
+of each DB would show.
+
+**Effort:** Small. A pure-Python index-and-set-diff over two `build_state`
+results + one subcommand; no new dependencies, no schema change, no network,
+fully offline-tested.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |

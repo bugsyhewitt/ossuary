@@ -10,6 +10,7 @@ Subcommands (v0.1):
     watch        run cruise on an interval, emitting a diff summary each pass
     dump         export full engagement state as JSON, CSV, Markdown, HTML, or SARIF
     stats        print a top-of-funnel engagement summary (counts + top hits)
+    diff         compare two engagement DBs -> new / resolved / persisting findings
     profiles     list the named scan profiles (stealth/aggressive/web/default)
 
 Discover, fingerprint, and cruise accept a `--profile NAME` flag selecting a
@@ -24,8 +25,8 @@ import sys
 
 from . import __version__, cruise as cruise_mod, cves, db, discover as discover_mod
 from . import dump as dump_mod, fingerprint as fingerprint_mod, probe as probe_mod
-from . import profiles as profiles_mod, stats as stats_mod, tags as tags_mod
-from . import watch as watch_mod
+from . import findingdiff as findingdiff_mod, profiles as profiles_mod
+from . import stats as stats_mod, tags as tags_mod, watch as watch_mod
 
 
 def _add_db_arg(parser: argparse.ArgumentParser) -> None:
@@ -288,6 +289,59 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_diff = sub.add_parser(
+        "diff",
+        help="compare two engagement DBs to show new / resolved CVE findings",
+    )
+    p_diff.add_argument(
+        "--db",
+        required=True,
+        metavar="PATH",
+        help="baseline engagement DB (the earlier scan)",
+    )
+    p_diff.add_argument(
+        "--against",
+        required=True,
+        metavar="PATH",
+        help="current engagement DB to compare against the baseline (the later scan)",
+    )
+    p_diff.add_argument(
+        "--format",
+        default="text",
+        choices=["text", "json"],
+        help="output format: text (human-readable) or json (same structure)",
+    )
+    p_diff.add_argument(
+        "--min-epss",
+        type=float,
+        default=None,
+        metavar="P",
+        help=(
+            "only diff findings with an EPSS exploit-probability >= P (0-1) on "
+            "each side; findings without an EPSS score are excluded (the same "
+            "filter `dump --min-epss` applies)"
+        ),
+    )
+    p_diff.add_argument(
+        "--min-severity",
+        type=float,
+        default=None,
+        metavar="SCORE",
+        help=(
+            "only diff findings with a numeric severity (CVSS) >= SCORE on each "
+            "side; blank/non-numeric severities are excluded (the same filter "
+            "`dump --min-severity` applies)"
+        ),
+    )
+    p_diff.add_argument(
+        "--kev-only",
+        action="store_true",
+        help=(
+            "only diff findings in CISA's Known Exploited Vulnerabilities catalog "
+            "on each side (the same filter `dump --kev-only` applies)"
+        ),
+    )
+
     p_probe = sub.add_parser(
         "probe", help="HTTP/web layer discovery — probe web ports on known assets"
     )
@@ -518,6 +572,20 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_diff(args: argparse.Namespace) -> int:
+    print(
+        findingdiff_mod.diff(
+            args.db,
+            args.against,
+            args.format,
+            min_epss=args.min_epss,
+            min_severity=args.min_severity,
+            kev_only=args.kev_only,
+        )
+    )
+    return 0
+
+
 def _cmd_probe(args: argparse.Namespace) -> int:
     try:
         ports = {int(p.strip()) for p in args.ports.split(",") if p.strip()}
@@ -569,6 +637,7 @@ _DISPATCH = {
     "watch": _cmd_watch,
     "dump": _cmd_dump,
     "stats": _cmd_stats,
+    "diff": _cmd_diff,
     "probe": _cmd_probe,
     "tag": _cmd_tag,
     "profiles": _cmd_profiles,
