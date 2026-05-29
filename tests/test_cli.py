@@ -457,6 +457,43 @@ def test_cli_dump_sort_by_priority(tmp_path, monkeypatch, capsys):
     assert cves == ["CVE-HOT", "CVE-COLD"]
 
 
+def test_cli_dump_since_until_recency_window(tmp_path, monkeypatch, capsys):
+    import sqlite3
+
+    db_file = str(tmp_path / "engagement-test.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("INSERT INTO assets (id, ip, state) VALUES (1, '10.10.0.5', 'up')")
+        conn.execute(
+            "INSERT INTO services (id, asset_id, port, protocol, name, product, "
+            "version) VALUES (1, 1, 80, 'tcp', 'http', 'nginx', '1.18.0')"
+        )
+        conn.execute(
+            "INSERT INTO findings (service_id, cve_id, summary, severity, matched_at) "
+            "VALUES (1, 'CVE-OLD', 'x', '5.0', '2026-01-10 09:00:00')"
+        )
+        conn.execute(
+            "INSERT INTO findings (service_id, cve_id, summary, severity, matched_at) "
+            "VALUES (1, 'CVE-NEW', 'y', '5.0', '2026-05-29 14:30:00')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    rc = cli.main(["dump", "--db", db_file, "--since", "2026-05-01"])
+    assert rc == 0
+    state = json.loads(capsys.readouterr().out)
+    cves = [
+        f["cve_id"]
+        for a in state["assets"]
+        for s in a["services"]
+        for f in s["findings"]
+    ]
+    assert cves == ["CVE-NEW"]
+
+
 def test_cli_cruise_reports_tag_changes(tmp_path, monkeypatch, capsys):
     db_file = str(tmp_path / "engagement-test.db")
     monkeypatch.setattr(

@@ -487,6 +487,35 @@ The flag applies identically to `json`, `csv`, `markdown`, `html`, and `sarif`, 
 `--tag` and the actionability filters. Without it, ordering is the historical
 alphabetical-by-CVE-id, byte-for-byte unchanged.
 
+#### Recency window — `--since`, `--until`
+
+`cruise` (and the `watch` daemon looping it) re-scan the same engagement over
+time, so a finding's `matched_at` timestamp records *when* it was recorded.
+`--since DATE` and `--until DATE` trim the export to the findings recorded inside
+a window — the slice for "what's new since my last pass" rather than the whole
+history. Both bounds are **inclusive**, and either may be given alone (open-ended
+on the other side):
+
+```bash
+# only the findings recorded on or after a date (e.g. since the last cruise)
+ossuary dump --db engagement-acme.db --since 2026-05-01
+
+# only the findings recorded up to and including a date
+ossuary dump --db engagement-acme.db --until 2026-05-29
+
+# bound a window: findings recorded in May 2026
+ossuary dump --db engagement-acme.db --since 2026-05-01 --until 2026-05-31
+```
+
+Dates may be a bare `YYYY-MM-DD` or a full `'YYYY-MM-DD HH:MM:SS'`. A bare-date
+`--until` covers the **whole** day (a finding matched at `2026-05-29 14:30:00`
+survives `--until 2026-05-29`). A finding with no recorded `matched_at` is
+excluded once either bound is set, and services / assets left with no surviving
+findings are pruned — exactly like the actionability filters. The window applies
+identically to `json`, `csv`, `markdown`, `html`, and `sarif`, and composes with
+`--tag`, the actionability filters, and `--sort-by-priority`. With neither bound
+set, the export is unchanged.
+
 ### Engagement summary (`ossuary stats`)
 
 `dump` emits the full per-finding inventory; `stats` gives the top-of-funnel

@@ -701,3 +701,185 @@ def test_dump_sarif_omits_service_with_no_findings(db_path):
     # a service with no finding produces no result.
     run = _sarif_run(dump.dump(db_path, "sarif"))
     assert run["results"] == []
+
+
+# --------------------------------------------------------------------------
+# Recency filtering: --since / --until on matched_at (POST_V01 Rank 16)
+# --------------------------------------------------------------------------
+
+def _seed_dated_findings(db_path):
+    """Three findings on one service, each with an explicit matched_at date.
+
+    matched_at is normally stamped by datetime('now'); these tests override it
+    so the recency window can be exercised deterministically.
+
+      CVE-OLD  matched 2026-01-10
+      CVE-MID  matched 2026-03-15
+      CVE-NEW  matched 2026-05-29 14:30:00 (with a time component)
+    """
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.18.0", None)
+        db.upsert_finding(conn, sid, "CVE-OLD", "x", "5.0")
+        db.upsert_finding(conn, sid, "CVE-MID", "y", "5.0")
+        db.upsert_finding(conn, sid, "CVE-NEW", "z", "5.0")
+        conn.execute(
+            "UPDATE findings SET matched_at = ? WHERE cve_id = ?",
+            ("2026-01-10 09:00:00", "CVE-OLD"),
+        )
+        conn.execute(
+            "UPDATE findings SET matched_at = ? WHERE cve_id = ?",
+            ("2026-03-15 12:00:00", "CVE-MID"),
+        )
+        conn.execute(
+            "UPDATE findings SET matched_at = ? WHERE cve_id = ?",
+            ("2026-05-29 14:30:00", "CVE-NEW"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_dump_no_recency_window_returns_all(db_path):
+    _seed_dated_findings(db_path)
+    state = json.loads(dump.dump(db_path, "json"))
+    assert _cve_ids(state) == {"CVE-OLD", "CVE-MID", "CVE-NEW"}
+
+
+def test_dump_since_keeps_findings_on_or_after_date(db_path):
+    _seed_dated_findings(db_path)
+    state = json.loads(dump.dump(db_path, "json", since="2026-03-15"))
+    # CVE-OLD (Jan) drops; CVE-MID (exactly the bound) and CVE-NEW survive.
+    assert _cve_ids(state) == {"CVE-MID", "CVE-NEW"}
+
+
+def test_dump_until_keeps_findings_on_or_before_date(db_path):
+    _seed_dated_findings(db_path)
+    state = json.loads(dump.dump(db_path, "json", until="2026-03-15"))
+    # CVE-NEW (May) drops; CVE-OLD and CVE-MID survive.
+    assert _cve_ids(state) == {"CVE-OLD", "CVE-MID"}
+
+
+def test_dump_bare_date_until_covers_the_whole_day(db_path):
+    _seed_dated_findings(db_path)
+    # CVE-NEW is matched at 14:30 on 2026-05-29; a bare-date upper bound must
+    # include that day's later timestamps, not exclude them.
+    state = json.loads(dump.dump(db_path, "json", until="2026-05-29"))
+    assert "CVE-NEW" in _cve_ids(state)
+
+
+def test_dump_since_and_until_bound_a_window(db_path):
+    _seed_dated_findings(db_path)
+    state = json.loads(
+        dump.dump(db_path, "json", since="2026-02-01", until="2026-04-01")
+    )
+    # Only CVE-MID (2026-03-15) falls inside the window.
+    assert _cve_ids(state) == {"CVE-MID"}
+
+
+def test_dump_recency_window_with_datetime_bound(db_path):
+    _seed_dated_findings(db_path)
+    # A full datetime upper bound just after noon on the MID day excludes the
+    # 12:00 MID timestamp's same-second boundary inclusively.
+    state = json.loads(dump.dump(db_path, "json", until="2026-03-15 12:00:00"))
+    assert _cve_ids(state) == {"CVE-OLD", "CVE-MID"}
+
+
+def test_dump_recency_excludes_finding_with_blank_matched_at(db_path):
+    _seed_dated_findings(db_path)
+    conn = db.connect(db_path)
+    try:
+        # matched_at is NOT NULL in the schema, but a blank string is just as
+        # un-placeable on the timeline — a window must exclude it.
+        conn.execute("UPDATE findings SET matched_at = '' WHERE cve_id = 'CVE-MID'")
+        conn.commit()
+    finally:
+        conn.close()
+    state = json.loads(dump.dump(db_path, "json", since="2026-01-01"))
+    assert "CVE-MID" not in _cve_ids(state)
+    assert _cve_ids(state) == {"CVE-OLD", "CVE-NEW"}
+
+
+def test_dump_recency_prunes_empty_services_and_assets(db_path):
+    _seed_dated_findings(db_path)
+    # A window that no finding falls into prunes the service and asset entirely.
+    state = json.loads(
+        dump.dump(db_path, "json", since="2027-01-01")
+    )
+    assert state == {"assets": []}
+
+
+def test_dump_recency_composes_with_actionability_filters(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.18.0", None)
+        # Recent + KEV -> survives both filters.
+        db.upsert_finding(conn, sid, "CVE-RECENT-KEV", "x", "9.8",
+                          epss_score=0.9, kev=1)
+        # Recent but not KEV -> dropped by kev_only.
+        db.upsert_finding(conn, sid, "CVE-RECENT-COLD", "y", "3.0",
+                          epss_score=0.01, kev=0)
+        # Old + KEV -> dropped by the recency window.
+        db.upsert_finding(conn, sid, "CVE-OLD-KEV", "z", "9.0",
+                          epss_score=0.8, kev=1)
+        conn.execute(
+            "UPDATE findings SET matched_at = '2026-05-29 10:00:00' "
+            "WHERE cve_id IN ('CVE-RECENT-KEV', 'CVE-RECENT-COLD')"
+        )
+        conn.execute(
+            "UPDATE findings SET matched_at = '2026-01-01 10:00:00' "
+            "WHERE cve_id = 'CVE-OLD-KEV'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    state = json.loads(
+        dump.dump(db_path, "json", kev_only=True, since="2026-05-01")
+    )
+    assert _cve_ids(state) == {"CVE-RECENT-KEV"}
+
+
+def test_dump_recency_applies_to_csv_export(db_path):
+    _seed_dated_findings(db_path)
+    out = dump.dump(db_path, "csv", since="2026-05-01")
+    rows = list(csv.reader(io.StringIO(out)))
+    assert rows[0] == FLAT_COLUMNS
+    assert len(rows) == 2  # header + only CVE-NEW
+    row = dict(zip(FLAT_COLUMNS, rows[1]))
+    assert row["cve_id"] == "CVE-NEW"
+
+
+def test_dump_recency_composes_with_sort_by_priority(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.18.0", None)
+        db.upsert_finding(conn, sid, "CVE-A-COLD", "x", "3.0",
+                          epss_score=0.02, kev=0)
+        db.upsert_finding(conn, sid, "CVE-B-HOT", "y", "9.8",
+                          epss_score=0.94, kev=1)
+        conn.execute(
+            "UPDATE findings SET matched_at = '2026-05-29 10:00:00'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    state = json.loads(
+        dump.dump(db_path, "json", since="2026-05-01", sort_by_priority=True)
+    )
+    # Both survive the window; priority order puts the KEV finding first.
+    assert _ordered_cve_ids(state, 80) == ["CVE-B-HOT", "CVE-A-COLD"]
+
+
+def test_normalise_until_extends_bare_date_to_end_of_day():
+    assert dump._normalise_until("2026-05-29") == "2026-05-29 23:59:59"
+
+
+def test_normalise_until_leaves_datetime_untouched():
+    assert dump._normalise_until("2026-05-29 08:00:00") == "2026-05-29 08:00:00"
+
+
+def test_normalise_until_passes_none_through():
+    assert dump._normalise_until(None) is None
