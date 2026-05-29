@@ -32,6 +32,7 @@ FLAT_COLUMNS = [
     "source",
     "epss_score",
     "kev",
+    "exploit",
     "matched_at",
 ]
 

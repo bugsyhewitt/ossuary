@@ -98,6 +98,7 @@ FLAT_COLUMNS = [
     "source",
     "epss_score",
     "kev",
+    "exploit",
     "matched_at",
 ]
 
@@ -281,7 +282,8 @@ def build_state(
         for svc in services:
             findings = conn.execute(
                 "SELECT cve_id, summary, severity, source, epss_score, kev, "
-                "matched_at FROM findings WHERE service_id = ? ORDER BY cve_id",
+                "exploit, matched_at FROM findings WHERE service_id = ? "
+                "ORDER BY cve_id",
                 (svc["id"],),
             ).fetchall()
             findings_out = [dict(f) for f in findings]
@@ -368,6 +370,7 @@ def _flat_rows(state: dict) -> list[dict]:
                         "source": f.get("source"),
                         "epss_score": f.get("epss_score"),
                         "kev": f.get("kev"),
+                        "exploit": f.get("exploit"),
                         "matched_at": f.get("matched_at"),
                     }
                 )

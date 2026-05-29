@@ -10,6 +10,7 @@ Schema (four core tables + one enrichment cache):
     findings      — CVE matches against discovered service versions
     cruise_runs   — snapshots of service state per cruise invocation, for diffing
     kev_cache     — cached CISA KEV catalog ids (TTL'd, for severity enrichment)
+    exploitdb_cache — cached Exploit-DB CVE ids (TTL'd, public-exploit signal)
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS findings (
     source      TEXT    NOT NULL DEFAULT 'osv.dev',
     epss_score  REAL,
     kev         INTEGER NOT NULL DEFAULT 0,
+    exploit     INTEGER NOT NULL DEFAULT 0,
     matched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(service_id, cve_id)
 );
@@ -64,6 +66,12 @@ CREATE TABLE IF NOT EXISTS cruise_runs (
 );
 
 CREATE TABLE IF NOT EXISTS kev_cache (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ids         TEXT    NOT NULL,
+    fetched_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS exploitdb_cache (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ids         TEXT    NOT NULL,
     fetched_at  TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -100,6 +108,7 @@ CREATE TABLE IF NOT EXISTS tags (
 _FINDINGS_MIGRATIONS = (
     ("epss_score", "ALTER TABLE findings ADD COLUMN epss_score REAL"),
     ("kev", "ALTER TABLE findings ADD COLUMN kev INTEGER NOT NULL DEFAULT 0"),
+    ("exploit", "ALTER TABLE findings ADD COLUMN exploit INTEGER NOT NULL DEFAULT 0"),
 )
 
 # Columns added to `cruise_runs` after v0.1. The `tag_snapshot` column stores a
@@ -284,26 +293,29 @@ def upsert_finding(
     source: str = "osv.dev",
     epss_score: float | None = None,
     kev: int = 0,
+    exploit: int = 0,
 ) -> int:
     """Insert or update a finding by (service_id, cve_id).
 
-    `epss_score` (FIRST exploit-probability float) and `kev` (1 if the CVE is in
-    CISA's Known Exploited Vulnerabilities catalog) are enrichment fields; they
+    `epss_score` (FIRST exploit-probability float), `kev` (1 if the CVE is in
+    CISA's Known Exploited Vulnerabilities catalog) and `exploit` (1 if a public
+    exploit for the CVE is catalogued in Exploit-DB) are enrichment fields; they
     default to None/0 so callers that don't enrich behave exactly as before.
     """
     conn.execute(
         """
         INSERT INTO findings (service_id, cve_id, summary, severity, source,
-                              epss_score, kev)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+                              epss_score, kev, exploit)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(service_id, cve_id) DO UPDATE SET
             summary    = excluded.summary,
             severity   = excluded.severity,
             source     = excluded.source,
             epss_score = excluded.epss_score,
-            kev        = excluded.kev
+            kev        = excluded.kev,
+            exploit    = excluded.exploit
         """,
-        (service_id, cve_id, summary, severity, source, epss_score, kev),
+        (service_id, cve_id, summary, severity, source, epss_score, kev, exploit),
     )
     row = conn.execute(
         "SELECT id FROM findings WHERE service_id = ? AND cve_id = ?",
