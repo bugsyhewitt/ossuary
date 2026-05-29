@@ -211,6 +211,7 @@ def build_parser() -> argparse.ArgumentParser:
             "cyclonedx",
             "spdx",
             "vex",
+            "cdx-vex",
         ],
         help=(
             "output format: json (nested), csv or markdown (flat, one finding "
@@ -221,9 +222,14 @@ def build_parser() -> argparse.ArgumentParser:
             "its discovered-service component, for Dependency-Track / DefectDojo), "
             "spdx (SPDX 2.3 SBOM — the ISO/IEC 5962:2021 standard alongside "
             "CycloneDX — one package per service with a SECURITY external "
-            "reference per matched CVE), or vex (a standalone OpenVEX document, "
+            "reference per matched CVE), vex (a standalone OpenVEX document, "
             "one 'affected' statement per finding — the editable triage worksheet "
-            "you flip to not_affected / fixed and feed back in via --vex)"
+            "you flip to not_affected / fixed and feed back in via --vex), or "
+            "cdx-vex (a CycloneDX 1.5 VEX document — the CycloneDX-native "
+            "counterpart to OpenVEX, with an analysis.state of 'in_triage' on "
+            "every vulnerability for a hunter to edit down to not_affected / "
+            "false_positive / resolved before shipping into a Dependency-Track "
+            "/ Anchore / CycloneDX-consuming pipeline)"
         ),
     )
     p_dump.add_argument(
