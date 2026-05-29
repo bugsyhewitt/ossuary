@@ -461,6 +461,39 @@ fully offline-tested.
 
 ---
 
+## Rank 17 — Age-staleness flagging (`ossuary stale`)  ✅ IMPLEMENTED
+
+> Shipped: new `ossuary.stale` module + `ossuary stale` subcommand. It flags
+> every finding whose `matched_at` is older than a threshold (`--max-age-days`,
+> default 30) relative to "now" — findings not re-confirmed by a recent scan.
+> `--format text|json`; the text report is ordered oldest-first so the
+> most-neglected finding leads, and reports each finding's computed `age_days`
+> alongside its host:port location and EPSS / KEV / severity signal. A finding
+> with no recorded `matched_at` is always flagged (unknown age, sorts last). The
+> candidate set is read through `dump.build_state`, so `stale` honours the same
+> `--tag` scoping and `--kev-only` / `--min-epss` / `--min-severity` actionability
+> filters as `dump` / `stats` / `diff`; the age threshold applies on top. Pure
+> Python, no new schema, no new dependency, no network. +25 tests.
+
+**What:** Rank 16 added `dump --since/--until` — an *absolute* scan-time window
+over findings. The complementary axis is *relative* age: which findings have gone
+cold, i.e. haven't been re-seen since some number of days ago? `match-cves`
+refreshes a finding's `matched_at` each time it re-matches the CVE on the service,
+so a stale `matched_at` is a high-signal marker — either the service was patched /
+removed (prune the noise) or it's a weeks-old unresolved exposure (escalate it).
+
+**Why now:** It's the natural companion to the `cruise` / `watch` re-scan loop
+the suite already encourages. A hunter running a long engagement accumulates
+findings whose age is the question — "what's gone stale since I last looked?" —
+and nothing answered it. Reusing `build_state` means the flagged set can't drift
+from a filtered `dump`, so it's a thin age-comparison layer over proven logic.
+
+**Effort:** Small. A pure-Python age comparison over the existing `matched_at`
+column + one subcommand; no new dependencies, no schema change, no network, fully
+offline-tested.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |
