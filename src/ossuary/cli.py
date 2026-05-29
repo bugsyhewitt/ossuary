@@ -393,6 +393,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="output format: text (human-readable) or json (same structure)",
     )
     p_diff.add_argument(
+        "--tag",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "only diff assets carrying this tag on each side (the same scoping "
+            "`dump --tag` applies; see `ossuary tag`)"
+        ),
+    )
+    p_diff.add_argument(
         "--min-epss",
         type=float,
         default=None,
@@ -676,6 +685,7 @@ def _cmd_diff(args: argparse.Namespace) -> int:
             args.db,
             args.against,
             args.format,
+            tag=args.tag,
             min_epss=args.min_epss,
             min_severity=args.min_severity,
             kev_only=args.kev_only,
