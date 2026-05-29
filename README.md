@@ -56,6 +56,7 @@ ossuary init         create the engagement DB and its tables
 ossuary discover     ping/host-discover targets -> assets table
 ossuary fingerprint  service/version detect known assets -> services table
 ossuary probe        HTTP/web-layer probe of web ports -> web_probes table
+ossuary web          list the recorded web-probe inventory (read companion to probe)
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
@@ -170,6 +171,45 @@ findings — no new table, no schema change. `--web` honours the same `--source`
 
 Without `--web`, `match-cves` behaves exactly as before and never touches the
 `web_probes` table.
+
+### Reviewing the web layer (`ossuary web`)
+
+`ossuary probe` *writes* the web layer (status codes, `Server` banners, page
+titles, redirect chains, and tech fingerprints) into the `web_probes` table, but
+its live stdout summary scrolls past once. `ossuary web` is the *read* companion:
+it lists the persisted web inventory at any time after probing — the same way
+`stats` / `stale` read what `match-cves` wrote.
+
+```bash
+# review every recorded web endpoint, grouped per host
+ossuary web --db engagement-acme.db
+#   web inventory
+#     count: 2
+#     https://10.0.0.5:443  [200]
+#       hostname: portal.acme
+#       server: nginx/1.24.0
+#       title: Acme Portal
+#       tech: nginx, wordpress
+#     http://10.0.0.5:80  [301]
+#       redirects: https://portal.acme/
+```
+
+Two filters scope the listing without re-probing:
+
+```bash
+# only one host's web surface
+ossuary web --db engagement-acme.db --host portal.acme
+
+# only endpoints running a given technology (case-insensitive substring)
+ossuary web --db engagement-acme.db --tech wordpress
+
+# machine-readable, for piping into other tooling (filters compose)
+ossuary web --db engagement-acme.db --tech nginx --format json
+```
+
+`--format json` emits the same rows as a structured array, with `redirect_chain`
+and `tech_fingerprints` decoded back into lists. No network, no schema change —
+it reads only what `probe` already stored.
 
 ### Asset tagging (`ossuary tag`)
 
