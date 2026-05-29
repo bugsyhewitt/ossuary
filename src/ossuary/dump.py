@@ -54,6 +54,18 @@ findings) to one of four shapes:
                    matched-vulnerability inventory into an SPDX pipeline. Like
                    the other formats it reads off ``build_state``, so it honours
                    the same filters and priority order.
+  * ``vex``      — a standalone OpenVEX (Vulnerability Exploitability eXchange)
+                   JSON document. One ``statement`` per finding declares the
+                   matched ``vulnerability`` (the CVE) ``affected`` on the
+                   ``products`` it was found on (each product carries an ``@id``
+                   service location and, where known, a ``cpe`` identifier). This
+                   is the inverse of the suppression-import path (``dump --vex``):
+                   export emits the triage worksheet a hunter edits — flipping
+                   statements to ``not_affected`` / ``fixed`` as they rule findings
+                   out — and feeds back in to suppress the cleared rows. The
+                   emitted shape round-trips through ``ossuary.vex.parse``. Like
+                   the other formats it reads off ``build_state``, so it honours
+                   the same filters and priority order.
   * ``jira``     — an issue-tracker import CSV: one row per finding, shaped as a
                    ticket (``Summary`` title, rich ``Description``, mapped
                    ``Priority``, ``Labels``) rather than the raw inventory the
@@ -117,6 +129,7 @@ SUPPORTED_FORMATS = (
     "jira",
     "cyclonedx",
     "spdx",
+    "vex",
 )
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
@@ -1248,6 +1261,99 @@ def to_spdx(state: dict) -> str:
     return json.dumps(spdx, indent=2, sort_keys=False)
 
 
+# --------------------------------------------------------------------------
+# OpenVEX export (standalone VEX document — the inverse of the import path)
+# --------------------------------------------------------------------------
+
+# The OpenVEX status a freshly-discovered, matched finding carries. A finding in
+# the DB is, by construction, a vulnerability that *matched* a discovered service
+# — i.e. the product is present and the CVE applies until a human triages it
+# away. So export defaults every statement to `affected`; the hunter edits the
+# document, flipping the ones they rule out to `not_affected` / `fixed`, and
+# feeds it back through `dump --vex` (which suppresses exactly those two
+# statuses). `affected` is one of the spec's four statuses and round-trips
+# cleanly through `ossuary.vex.parse` (it's accepted but contributes no
+# suppression — correct for an un-triaged finding).
+_VEX_EXPORT_STATUS = "affected"
+
+
+def _vex_product(ip: str, protocol, port, cpe) -> dict:
+    """Build one OpenVEX ``product`` entry locating a finding's service.
+
+    Carries an ``@id`` of the ``ip:proto/port`` service location (the same
+    locator SARIF / SBOM use) so a scoped statement matches the finding's
+    location on re-import, plus a ``cpe`` identifier under ``identifiers`` when
+    the service has one — the two strings ``ossuary.vex`` extracts to scope a
+    suppression. The shape is exactly what ``vex._product_identifiers`` parses,
+    so an exported document round-trips through the import path.
+    """
+    location = _bom_ref(ip, protocol, port)
+    product: dict = {"@id": location}
+    if cpe:
+        product["identifiers"] = {"cpe": str(cpe)}
+    return product
+
+
+def _vex_statements(state: dict) -> list[dict]:
+    """Build the OpenVEX ``statements`` list — one statement per finding.
+
+    Each statement declares the matched ``vulnerability`` (the CVE, as the
+    spec's ``{"name": ...}`` object), an ``affected`` ``status`` (the un-triaged
+    default; the hunter edits these), and the ``products`` the CVE was found on
+    (the service location + CPE). A finding's free-text summary rides along as
+    ``status_notes`` so the triage context isn't lost in the worksheet.
+    Statements follow the same per-host / per-service / per-finding walk the
+    other formats use, so any requested priority ordering is preserved.
+    """
+    statements: list[dict] = []
+    for asset in state["assets"]:
+        ip = asset["ip"]
+        for svc in asset["services"]:
+            port = svc["port"]
+            protocol = svc["protocol"]
+            cpe = svc.get("cpe")
+            product = _vex_product(ip, protocol, port, cpe)
+            for f in svc["findings"]:
+                cve_id = f.get("cve_id") or "UNKNOWN"
+                statement: dict = {
+                    "vulnerability": {"name": cve_id},
+                    "status": _VEX_EXPORT_STATUS,
+                    "products": [dict(product)],
+                }
+                summary = f.get("summary")
+                if summary:
+                    statement["status_notes"] = str(summary)
+                statements.append(statement)
+    return statements
+
+
+def to_vex(state: dict) -> str:
+    """Serialise the engagement state as a standalone OpenVEX JSON document.
+
+    Emits an OpenVEX ``@context`` / ``@id`` document whose ``statements`` carry
+    one ruling per finding — the matched CVE declared ``affected`` on the
+    product (service location + CPE) it was found on. This is the inverse of the
+    suppression-import path (``dump --vex``): export produces the triage
+    worksheet a hunter edits down (flipping statements to ``not_affected`` /
+    ``fixed`` as they rule findings out) and re-imports to suppress the cleared
+    rows. The emitted shape round-trips through ``ossuary.vex.parse``. An empty
+    engagement still yields a valid document with an empty ``statements`` array.
+    """
+    statements = _vex_statements(state)
+    document = {
+        "@context": "https://openvex.dev/ns/v0.2.0",
+        "@id": "https://github.com/bugsyhewitt/ossuary/vex/ossuary-engagement",
+        "author": f"ossuary-{__version__}",
+        "role": "tool",
+        # A fixed sentinel keeps the document byte-stable for tests; OpenVEX
+        # requires the field but accepts any valid ISO-8601 instant.
+        "timestamp": "1970-01-01T00:00:00Z",
+        "version": 1,
+        "statements": statements,
+    }
+    return json.dumps(document, indent=2, sort_keys=False)
+
+
 def dump(
     db_path: str | Path,
     fmt: str = "json",
@@ -1265,10 +1371,12 @@ def dump(
 
     `fmt` is one of ``json``, ``csv``, ``markdown``, ``html``, ``sarif``,
     ``jira`` (an issue-tracker import CSV for Jira / Linear), ``cyclonedx``
-    (a CycloneDX 1.5 SBOM linking each finding back to its component), or
+    (a CycloneDX 1.5 SBOM linking each finding back to its component),
     ``spdx`` (an SPDX 2.3 SBOM — the ISO/IEC 5962:2021 standard alongside
     CycloneDX — one package per service with a SECURITY external reference per
-    matched CVE).
+    matched CVE), or ``vex`` (a standalone OpenVEX document, one ``affected``
+    statement per finding — the editable triage worksheet that is the inverse of
+    the ``--vex`` suppression-import path and round-trips through it).
     `tag`, when set,
     restricts the export to assets carrying that tag label. `min_epss`,
     `min_severity`, and `kev_only` are actionability filters: each restricts the
@@ -1319,4 +1427,6 @@ def dump(
         return to_cyclonedx(state)
     if fmt == "spdx":
         return to_spdx(state)
+    if fmt == "vex":
+        return to_vex(state)
     return json.dumps(state, indent=2, sort_keys=False)

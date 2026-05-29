@@ -1442,3 +1442,181 @@ def test_dump_spdx_honours_tag_scope(db_path):
     # Only the tagged host's services appear; the ftp service is excluded.
     names = {p["name"] for p in doc["packages"]}
     assert names == {"nginx", "OpenSSH"}
+
+
+# --------------------------------------------------------------------------
+# OpenVEX export (standalone VEX document — the inverse of the import path)
+# --------------------------------------------------------------------------
+
+def _vex(out):
+    """Parse a VEX dump and assert its document-level invariants."""
+    doc = json.loads(out)
+    assert doc["@context"].startswith("https://openvex.dev/ns/")
+    assert "@id" in doc
+    assert doc["author"].startswith("ossuary-")
+    assert "timestamp" in doc
+    assert "statements" in doc
+    return doc
+
+
+def _vex_cves(doc):
+    """The set of CVE ids carried by a VEX document's statements."""
+    return {s["vulnerability"]["name"] for s in doc["statements"]}
+
+
+def test_dump_vex_is_listed_as_supported_format():
+    assert "vex" in dump.SUPPORTED_FORMATS
+
+
+def test_dump_vex_rejected_format_still_errors(db_path):
+    db.init_db(db_path).close()
+    with pytest.raises(ValueError, match="unsupported dump format"):
+        dump.dump(db_path, "yaml")
+
+
+def test_dump_vex_is_valid_openvex_document(db_path):
+    _seed_one_finding(db_path)
+    doc = _vex(dump.dump(db_path, "vex"))
+    # One statement per finding.
+    assert len(doc["statements"]) == 1
+    stmt = doc["statements"][0]
+    assert stmt["vulnerability"]["name"] == "CVE-2021-23017"
+    assert stmt["status"] == "affected"
+
+
+def test_dump_vex_empty_db_has_empty_statements(db_path):
+    db.init_db(db_path).close()
+    doc = _vex(dump.dump(db_path, "vex"))
+    assert doc["statements"] == []
+
+
+def test_dump_vex_statement_products_locate_the_finding(db_path):
+    _seed_one_finding(db_path)  # nginx 1.18.0 cpe:/a:nginx on 10.10.0.5:tcp/80
+    doc = _vex(dump.dump(db_path, "vex"))
+    products = doc["statements"][0]["products"]
+    assert len(products) == 1
+    product = products[0]
+    assert product["@id"] == "10.10.0.5:tcp/80"
+    assert product["identifiers"]["cpe"] == "cpe:/a:nginx"
+
+
+def test_dump_vex_product_omits_cpe_when_service_has_none(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-2021-23017", "x", "7.7")
+        conn.commit()
+    finally:
+        conn.close()
+    doc = _vex(dump.dump(db_path, "vex"))
+    product = doc["statements"][0]["products"][0]
+    assert product["@id"] == "10.10.0.5:tcp/80"
+    assert "identifiers" not in product
+
+
+def test_dump_vex_statement_carries_summary_as_status_notes(db_path):
+    _seed_one_finding(db_path)  # summary "off-by-one"
+    doc = _vex(dump.dump(db_path, "vex"))
+    assert doc["statements"][0]["status_notes"] == "off-by-one"
+
+
+def test_dump_vex_one_statement_per_finding(db_path):
+    _seed_mixed_findings(db_path)  # 3 findings across 2 services
+    doc = _vex(dump.dump(db_path, "vex"))
+    assert len(doc["statements"]) == 3
+    assert _vex_cves(doc) == {"CVE-HOT", "CVE-COLD", "CVE-MID"}
+
+
+def test_dump_vex_omits_service_with_no_findings(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.9", None, "up")
+        db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        conn.commit()
+    finally:
+        conn.close()
+    # VEX is a per-vulnerability ruling list (like SARIF): a service with no
+    # finding contributes no statement.
+    doc = _vex(dump.dump(db_path, "vex"))
+    assert doc["statements"] == []
+
+
+def test_dump_vex_filters_apply(db_path):
+    _seed_mixed_findings(db_path)
+    doc = _vex(dump.dump(db_path, "vex", kev_only=True))
+    # Only the KEV finding produces a statement.
+    assert _vex_cves(doc) == {"CVE-HOT"}
+
+
+def test_dump_vex_honours_tag_scope(db_path):
+    _seed_mixed_findings(db_path)  # all on 10.10.0.5
+    conn = db.init_db(db_path)
+    try:
+        db.upsert_asset(conn, "10.10.0.9", "other", "up")
+        aid = conn.execute(
+            "SELECT id FROM assets WHERE ip = '10.10.0.9'"
+        ).fetchone()["id"]
+        sid = db.upsert_service(conn, aid, 21, "tcp", "ftp", "vsftpd", "3.0", None)
+        db.upsert_finding(conn, sid, "CVE-FTP", "x", "5.0")
+        conn.commit()
+    finally:
+        conn.close()
+    tags.add_tag(db_path, "10.10.0.5", "in-scope")
+    doc = _vex(dump.dump(db_path, "vex", tag="in-scope"))
+    # The untagged ftp host's finding is excluded.
+    assert "CVE-FTP" not in _vex_cves(doc)
+    assert _vex_cves(doc) == {"CVE-HOT", "CVE-COLD", "CVE-MID"}
+
+
+def test_dump_vex_sort_by_priority_orders_statements(db_path):
+    _seed_one_service_many_findings(db_path)
+    doc = _vex(dump.dump(db_path, "vex", sort_by_priority=True))
+    order = [s["vulnerability"]["name"] for s in doc["statements"]]
+    assert order == [
+        "CVE-2020-KEVHI",
+        "CVE-2020-KEVLO",
+        "CVE-2020-WARM",
+        "CVE-2020-COLD",
+    ]
+
+
+def test_dump_vex_round_trips_through_the_import_parser(db_path):
+    # The exported document must parse back through ossuary.vex (the import
+    # path), so a hunter can edit it and feed it to `dump --vex`. As exported,
+    # every statement is `affected` (un-triaged), which the parser accepts but
+    # treats as no suppression — nothing is cleared yet.
+    from ossuary import vex as vex_mod
+
+    _seed_mixed_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "vex"))
+    suppressions = vex_mod.parse(doc)
+    assert len(suppressions) == 0  # affected statements suppress nothing
+
+    # Flip one statement to a clearing status, as a triaging hunter would, and
+    # re-parse: the cleared CVE is now suppressed for its product location.
+    hot = next(s for s in doc["statements"] if s["vulnerability"]["name"] == "CVE-HOT")
+    hot["status"] = "not_affected"
+    suppressions = vex_mod.parse(doc)
+    assert suppressions.is_suppressed(
+        "CVE-HOT", identifiers={"10.10.0.5:tcp/80"}
+    )
+    # And feeding the edited document back into a dump suppresses that row.
+    import json as _json
+    edited = tmp_vex_file(db_path, doc, _json)
+    state = _json.loads(dump.dump(db_path, "json", vex_path=edited))
+    remaining = {
+        f["cve_id"]
+        for a in state["assets"]
+        for s in a["services"]
+        for f in s["findings"]
+    }
+    assert "CVE-HOT" not in remaining
+    assert "CVE-COLD" in remaining
+
+
+def tmp_vex_file(db_path, doc, json_mod):
+    """Write a VEX doc next to the test DB and return its path (helper)."""
+    path = db_path.parent / "edited.vex.json"
+    path.write_text(json_mod.dumps(doc), encoding="utf-8")
+    return str(path)

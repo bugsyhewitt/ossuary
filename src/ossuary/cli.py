@@ -8,7 +8,7 @@ Subcommands (v0.1):
     match-cves   query OSV.dev for service versions -> findings table
     cruise       re-fingerprint, diff against last state, report changes
     watch        run cruise on an interval, emitting a diff summary each pass
-    dump         export full engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX
+    dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX/VEX
     web          list the recorded web-probe inventory (read companion to probe)
     stats        print a top-of-funnel engagement summary (counts + top hits)
     stale        flag findings not re-confirmed within N days (age staleness)
@@ -210,6 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
             "jira",
             "cyclonedx",
             "spdx",
+            "vex",
         ],
         help=(
             "output format: json (nested), csv or markdown (flat, one finding "
@@ -218,9 +219,11 @@ def build_parser() -> argparse.ArgumentParser:
             "jira (issue-tracker import CSV for Jira / Linear, one ticket per "
             "finding), cyclonedx (CycloneDX 1.5 SBOM linking each finding to "
             "its discovered-service component, for Dependency-Track / DefectDojo), "
-            "or spdx (SPDX 2.3 SBOM — the ISO/IEC 5962:2021 standard alongside "
+            "spdx (SPDX 2.3 SBOM — the ISO/IEC 5962:2021 standard alongside "
             "CycloneDX — one package per service with a SECURITY external "
-            "reference per matched CVE)"
+            "reference per matched CVE), or vex (a standalone OpenVEX document, "
+            "one 'affected' statement per finding — the editable triage worksheet "
+            "you flip to not_affected / fixed and feed back in via --vex)"
         ),
     )
     p_dump.add_argument(
