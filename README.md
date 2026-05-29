@@ -60,7 +60,7 @@ ossuary web          list the recorded web-probe inventory (read companion to pr
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
-ossuary dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira (filterable by KEV/EPSS/severity)
+ossuary dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX (filterable by KEV/EPSS/severity)
 ossuary stats        print an at-a-glance engagement summary (counts + top hits)
 ossuary stale        flag findings not re-confirmed within N days (age staleness)
 ossuary diff         compare two engagement DBs -> new / resolved / persisting findings
@@ -436,15 +436,16 @@ ossuary dump --db engagement-acme.db --format json > acme-state.json
 
 ### Export formats
 
-`dump` speaks six formats via `--format`:
+`dump` speaks seven formats via `--format`:
 
 ```bash
-ossuary dump --db engagement-acme.db --format json     > acme-state.json
-ossuary dump --db engagement-acme.db --format csv      > acme-findings.csv
-ossuary dump --db engagement-acme.db --format markdown > acme-findings.md
-ossuary dump --db engagement-acme.db --format html     > acme-report.html
-ossuary dump --db engagement-acme.db --format sarif    > acme-findings.sarif
-ossuary dump --db engagement-acme.db --format jira     > acme-tickets.csv
+ossuary dump --db engagement-acme.db --format json      > acme-state.json
+ossuary dump --db engagement-acme.db --format csv       > acme-findings.csv
+ossuary dump --db engagement-acme.db --format markdown  > acme-findings.md
+ossuary dump --db engagement-acme.db --format html      > acme-report.html
+ossuary dump --db engagement-acme.db --format sarif     > acme-findings.sarif
+ossuary dump --db engagement-acme.db --format jira      > acme-tickets.csv
+ossuary dump --db engagement-acme.db --format cyclonedx > acme-sbom.cdx.json
 ```
 
 - **`json`** (default) — the nested `assets → services → findings` structure,
@@ -479,6 +480,21 @@ ossuary dump --db engagement-acme.db --format jira     > acme-tickets.csv
   Each row's `Labels` carries the host's tags plus `kev` when confirmed
   exploited. Like SARIF it is finding-centric (a service with no finding produces
   no ticket).
+- **`cyclonedx`** — a **CycloneDX 1.5 SBOM** (Software Bill of Materials) JSON
+  document. Each discovered service becomes a `component` (with a stable
+  `bom-ref` of `ip:proto/port`, a `cpe` when nmap supplied one, and a
+  `pkg:generic/<product>@<version>` `purl`), and each matched CVE becomes a
+  `vulnerability` whose `affects[].ref` points back at the owning component's
+  `bom-ref` — that back-reference is the **SBOM-to-findings link**. The CVSS
+  severity rides in the vulnerability's `ratings` (bucketed
+  `critical`/`high`/`medium`/`low`/`none`, or `unknown` for a blank score) and
+  the live **EPSS** / **KEV** signal in its `properties`. Unlike the
+  finding-centric SARIF / Jira formats, an SBOM is a component inventory: a
+  service with **no** finding still appears as a component (a discovered piece of
+  software with no known vulnerability). This is the artifact
+  **Dependency-Track**, DefectDojo, and the wider supply-chain tooling ingest
+  natively, so you can fold an engagement's discovered-software + matched-CVE
+  inventory into an SBOM pipeline.
 
 The `json`, `csv`, and `markdown` formats cover the same fields; CSV and
 Markdown flatten the JSON nesting into these columns: `ip, hostname,
@@ -493,9 +509,12 @@ post-NIST-retreat CVSS), then numeric severity drives it (`>= 7.0` → `error`,
 defaulting to `warning`. The `jira` CSV is likewise finding-centric (one ticket
 per finding, no row for a finding-less service) and uses *issue-tracker* column
 names (`Summary` / `Description` / `Priority` / `Labels` …) rather than the raw
-inventory columns the plain `csv` format emits. `--tag LABEL` filters every
-format to the assets carrying that label (for `jira`, the tags also flow into
-each ticket's `Labels`).
+inventory columns the plain `csv` format emits. The `cyclonedx` SBOM, by
+contrast, is **component-centric** — every discovered service is a component
+whether or not it carries a finding — and links each finding back to its
+component, so it doubles as a discovered-software inventory. `--tag LABEL`
+filters every format to the assets carrying that label (for `jira`, the tags
+also flow into each ticket's `Labels`).
 
 #### Actionability filters — `--kev-only`, `--min-epss`, `--min-severity`
 
@@ -527,7 +546,7 @@ Semantics:
 
 The flags **compose** (a finding must clear every threshold given) and combine
 with `--tag` (e.g. `--tag in-scope --kev-only`). They apply identically to
-`json`, `csv`, `markdown`, `html`, `sarif`, and `jira`. When a filter is active, services and assets left
+`json`, `csv`, `markdown`, `html`, `sarif`, `jira`, and `cyclonedx`. When a filter is active, services and assets left
 with no surviving findings are pruned, so the output collapses to a clean list
 of actionable hits. With no filter flags, `dump` returns the full inventory
 exactly as before (services with no findings still appear).
@@ -553,7 +572,7 @@ ossuary dump --db engagement-acme.db --kev-only --sort-by-priority
 
 Findings with no EPSS score or a blank/non-numeric severity sink to the bottom
 of their tier rather than being dropped (use the filters above to drop them).
-The flag applies identically to `json`, `csv`, `markdown`, `html`, `sarif`, and `jira`, and composes with
+The flag applies identically to `json`, `csv`, `markdown`, `html`, `sarif`, `jira`, and `cyclonedx`, and composes with
 `--tag` and the actionability filters. Without it, ordering is the historical
 alphabetical-by-CVE-id, byte-for-byte unchanged.
 
@@ -582,7 +601,7 @@ Dates may be a bare `YYYY-MM-DD` or a full `'YYYY-MM-DD HH:MM:SS'`. A bare-date
 survives `--until 2026-05-29`). A finding with no recorded `matched_at` is
 excluded once either bound is set, and services / assets left with no surviving
 findings are pruned — exactly like the actionability filters. The window applies
-identically to `json`, `csv`, `markdown`, `html`, `sarif`, and `jira`, and composes with
+identically to `json`, `csv`, `markdown`, `html`, `sarif`, `jira`, and `cyclonedx`, and composes with
 `--tag`, the actionability filters, and `--sort-by-priority`. With neither bound
 set, the export is unchanged.
 
@@ -634,7 +653,7 @@ Suppression semantics:
 
 Suppression composes with `--tag`, the actionability filters, `--since/--until`,
 and `--sort-by-priority`, and applies identically to `json`, `csv`, `markdown`,
-`html`, `sarif`, and `jira`; services / assets left with no surviving finding are
+`html`, `sarif`, `jira`, and `cyclonedx`; services / assets left with no surviving finding are
 pruned. With no `--vex`, the export is unchanged. A missing or malformed VEX file
 fails loudly with a clear error.
 

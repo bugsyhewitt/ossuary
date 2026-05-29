@@ -463,6 +463,40 @@ def test_cli_dump_jira_format(tmp_path, monkeypatch, capsys):
     assert "kev" in row["Labels"].split(";")
 
 
+def test_cli_dump_cyclonedx_format(tmp_path, monkeypatch, capsys):
+    import json
+    import sqlite3
+
+    db_file = str(tmp_path / "engagement-test.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("INSERT INTO assets (id, ip, state) VALUES (1, '10.10.0.5', 'up')")
+        conn.execute(
+            "INSERT INTO services (id, asset_id, port, protocol, name, product, "
+            "version) VALUES (1, 1, 80, 'tcp', 'http', 'nginx', '1.18.0')"
+        )
+        conn.execute(
+            "INSERT INTO findings (service_id, cve_id, summary, severity, epss_score, "
+            "kev) VALUES (1, 'CVE-2021-23017', 'off-by-one', '7.7', 0.5, 1)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    rc = cli.main(["dump", "--db", db_file, "--format", "cyclonedx"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["bomFormat"] == "CycloneDX"
+    assert doc["specVersion"] == "1.5"
+    assert doc["components"][0]["bom-ref"] == "10.10.0.5:tcp/80"
+    vuln = doc["vulnerabilities"][0]
+    assert vuln["id"] == "CVE-2021-23017"
+    # The vulnerability links back to the component it was matched against.
+    assert vuln["affects"][0]["ref"] == "10.10.0.5:tcp/80"
+
+
 def test_cli_dump_sort_by_priority(tmp_path, monkeypatch, capsys):
     import sqlite3
 

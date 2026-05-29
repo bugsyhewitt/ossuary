@@ -24,6 +24,21 @@ findings) to one of four shapes:
                    engagement's actionable findings straight into the tooling
                    ecosystem. Like the other formats it reads off ``build_state``,
                    so it honours the same filters and priority order.
+  * ``cyclonedx`` — a CycloneDX 1.5 SBOM (Software Bill of Materials) JSON
+                   document. Each fingerprinted service becomes a ``component``
+                   (with a stable ``bom-ref``, a ``cpe`` / ``purl`` package
+                   identifier where derivable) and each finding becomes a
+                   ``vulnerability`` whose ``affects[].ref`` points back at the
+                   owning component's ``bom-ref`` — that back-reference is the
+                   SBOM-to-findings link. Vulnerability ratings carry the CVSS
+                   severity and the live EPSS / KEV signal rides along in
+                   ``properties``. This is the standard machine artifact that
+                   Dependency-Track, DefectDojo, and the wider supply-chain
+                   tooling ingest natively, so a hunter can pipe an engagement's
+                   discovered-component + matched-vulnerability inventory straight
+                   into an SBOM pipeline. Like the other formats it reads off
+                   ``build_state``, so it honours the same filters and priority
+                   order.
   * ``jira``     — an issue-tracker import CSV: one row per finding, shaped as a
                    ticket (``Summary`` title, rich ``Description``, mapped
                    ``Priority``, ``Labels``) rather than the raw inventory the
@@ -72,12 +87,13 @@ import io
 import json
 import sqlite3
 from pathlib import Path
+from urllib.parse import quote
 
 from . import __version__, db, tags
 from .vex import VexSuppressions
 from .vex import load as vex_load
 
-SUPPORTED_FORMATS = ("json", "csv", "markdown", "html", "sarif", "jira")
+SUPPORTED_FORMATS = ("json", "csv", "markdown", "html", "sarif", "jira", "cyclonedx")
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
 # the asset-, service-, and finding-level fields the JSON dump exposes.
@@ -874,6 +890,164 @@ def to_jira(state: dict) -> str:
     return buf.getvalue()
 
 
+# --------------------------------------------------------------------------
+# CycloneDX 1.5 SBOM export (SBOM-linked findings)
+# --------------------------------------------------------------------------
+
+# CycloneDX maps a numeric CVSS base score to one of five named severities. We
+# bucket the same way the `stats` / HTML tiering does so a hunter reads one
+# consistent severity taxonomy across every surface; a blank / non-numeric score
+# (common post-NIST-retreat) is reported as the CycloneDX `unknown` severity
+# rather than silently dropped.
+def _cyclonedx_severity(value) -> str:
+    """Map a finding's severity to a CycloneDX rating severity label."""
+    sev = _parse_severity(value)
+    if sev is None:
+        return "unknown"
+    if sev >= 9.0:
+        return "critical"
+    if sev >= 7.0:
+        return "high"
+    if sev >= 4.0:
+        return "medium"
+    if sev > 0.0:
+        return "low"
+    return "none"
+
+
+def _bom_ref(ip: str, protocol, port) -> str:
+    """Stable component bom-ref for a service: ``ip:proto/port``.
+
+    Mirrors the SARIF location URI so the two machine artifacts locate a service
+    the same way, and is unique per service row (the schema's UNIQUE key).
+    """
+    return f"{ip}:{protocol}/{port}"
+
+
+def _purl(product, version) -> str | None:
+    """Best-effort Package URL (purl) for a discovered service component.
+
+    A purl is the supply-chain ecosystem's portable package identifier. ossuary
+    discovers *generic* software at the network layer (not a language-ecosystem
+    package), so we emit a ``pkg:generic/<product>@<version>`` purl — the purl
+    spec's escape hatch for software with no specific package type. Returns None
+    when there's no product to name (no usable identifier).
+    """
+    if not product:
+        return None
+    name = quote(str(product), safe="")
+    if version:
+        return f"pkg:generic/{name}@{quote(str(version), safe='')}"
+    return f"pkg:generic/{name}"
+
+
+def _cyclonedx_components_and_vulns(
+    state: dict,
+) -> tuple[list[dict], list[dict]]:
+    """Build the CycloneDX ``components`` and ``vulnerabilities`` lists.
+
+    One ``component`` is emitted per service (every fingerprinted host:port),
+    carrying a stable ``bom-ref``, the service name/version, and a ``cpe`` /
+    ``purl`` package identifier where derivable. One ``vulnerability`` is emitted
+    per finding; its ``affects[].ref`` points back at the owning component's
+    ``bom-ref`` — the SBOM-to-findings link. The CVSS severity rides in
+    ``ratings`` and the live EPSS / KEV signal in ``properties``. Components and
+    vulnerabilities follow the same per-host / per-service / per-finding walk the
+    other formats use, so the priority ordering (when requested) is preserved.
+    """
+    components: list[dict] = []
+    vulnerabilities: list[dict] = []
+
+    for asset in state["assets"]:
+        ip = asset["ip"]
+        host = asset.get("hostname")
+        for svc in asset["services"]:
+            port = svc["port"]
+            protocol = svc["protocol"]
+            ref = _bom_ref(ip, protocol, port)
+            name = svc.get("product") or svc.get("name") or f"{protocol}/{port}"
+            component: dict = {
+                "type": "application",
+                "bom-ref": ref,
+                "name": str(name),
+            }
+            if svc.get("version"):
+                component["version"] = str(svc["version"])
+            if svc.get("cpe"):
+                component["cpe"] = str(svc["cpe"])
+            purl = _purl(svc.get("product"), svc.get("version"))
+            if purl:
+                component["purl"] = purl
+            host_label = f"{ip} ({host})" if host else ip
+            component["properties"] = [
+                {"name": "ossuary:host", "value": host_label},
+                {"name": "ossuary:port", "value": f"{protocol}/{port}"},
+            ]
+            components.append(component)
+
+            for f in svc["findings"]:
+                cve_id = f.get("cve_id") or "UNKNOWN"
+                vuln: dict = {
+                    "bom-ref": f"{ref}#{cve_id}",
+                    "id": cve_id,
+                    "affects": [{"ref": ref}],
+                }
+                if cve_id.upper().startswith("CVE-"):
+                    vuln["source"] = {
+                        "name": "NVD",
+                        "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+                    }
+                if f.get("summary"):
+                    vuln["description"] = str(f["summary"])
+                sev = _parse_severity(f.get("severity"))
+                rating: dict = {"severity": _cyclonedx_severity(f.get("severity"))}
+                if sev is not None:
+                    rating["score"] = sev
+                    rating["method"] = "CVSSv3"
+                vuln["ratings"] = [rating]
+                props = [{"name": "ossuary:kev", "value": "true" if f.get("kev") else "false"}]
+                if f.get("epss_score") is not None:
+                    props.append(
+                        {"name": "ossuary:epss", "value": f"{f['epss_score']}"}
+                    )
+                if f.get("source"):
+                    props.append({"name": "ossuary:source", "value": str(f["source"])})
+                vuln["properties"] = props
+                vulnerabilities.append(vuln)
+
+    return components, vulnerabilities
+
+
+def to_cyclonedx(state: dict) -> str:
+    """Serialise the engagement state as a CycloneDX 1.5 SBOM document.
+
+    Emits a ``bomFormat: CycloneDX`` / ``specVersion: 1.5`` JSON document: one
+    ``component`` per discovered service and one ``vulnerability`` per finding,
+    each vulnerability linked back to its component via ``affects[].ref``. The
+    document is ingestible by Dependency-Track, DefectDojo, and the wider
+    supply-chain tooling ecosystem. An empty engagement still yields a valid
+    document with empty ``components`` / ``vulnerabilities`` arrays.
+    """
+    components, vulnerabilities = _cyclonedx_components_and_vulns(state)
+    bom = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "version": 1,
+        "metadata": {
+            "tools": [
+                {
+                    "vendor": "bugsyhewitt",
+                    "name": "ossuary",
+                    "version": __version__,
+                }
+            ],
+        },
+        "components": components,
+        "vulnerabilities": vulnerabilities,
+    }
+    return json.dumps(bom, indent=2, sort_keys=False)
+
+
 def dump(
     db_path: str | Path,
     fmt: str = "json",
@@ -889,8 +1063,9 @@ def dump(
 ) -> str:
     """Return the engagement state as a serialised string in the given format.
 
-    `fmt` is one of ``json``, ``csv``, ``markdown``, ``html``, ``sarif``, or
-    ``jira`` (an issue-tracker import CSV for Jira / Linear).
+    `fmt` is one of ``json``, ``csv``, ``markdown``, ``html``, ``sarif``,
+    ``jira`` (an issue-tracker import CSV for Jira / Linear), or ``cyclonedx``
+    (a CycloneDX 1.5 SBOM linking each finding back to its component).
     `tag`, when set,
     restricts the export to assets carrying that tag label. `min_epss`,
     `min_severity`, and `kev_only` are actionability filters: each restricts the
@@ -937,4 +1112,6 @@ def dump(
         return to_sarif(state)
     if fmt == "jira":
         return to_jira(state)
+    if fmt == "cyclonedx":
+        return to_cyclonedx(state)
     return json.dumps(state, indent=2, sort_keys=False)
