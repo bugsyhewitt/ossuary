@@ -26,9 +26,12 @@ new DB (or keep a dated copy of the baseline), then ``ossuary diff`` to see
 exactly what changed in the *vulnerability* surface, not just the service one.
 
 Both DBs are read through ``dump.build_state``, so the diff honours the same
-actionability filters (``min_epss`` / ``min_severity`` / ``kev_only``) the rest
-of the suite applies — letting a hunter scope the diff to "only the new
-*actionable* findings." The current DB's finding detail (severity / EPSS / KEV /
+``--tag`` scoping and actionability filters (``min_epss`` / ``min_severity`` /
+``kev_only``) the rest of the suite applies — letting a hunter scope the diff to
+"only the new *actionable* findings on my in-scope hosts." ``--tag`` scopes each
+side to assets carrying that label *in that DB*, mirroring how ``dump --tag`` /
+``stats --tag`` / ``stale --tag`` scope a single DB. The current DB's finding
+detail (severity / EPSS / KEV /
 summary) is reported for ``new`` and ``persisting`` entries; the baseline's is
 reported for ``resolved`` ones (the current DB no longer has them). Pure Python,
 no new schema, no new dependency, no network.
@@ -137,21 +140,24 @@ def diff_states(baseline: dict, current: dict) -> dict:
 def _read_state(
     db_path: str | Path,
     *,
+    tag: str | None,
     min_epss: float | None,
     min_severity: float | None,
     kev_only: bool,
 ) -> dict:
-    """Open an engagement DB and return its filtered ``build_state``.
+    """Open an engagement DB and return its scoped / filtered ``build_state``.
 
-    The actionability filters are applied here, so a diff scoped with them
-    compares only the findings that clear the thresholds on *each* side — i.e.
-    "what's new among the findings worth reporting." With no filters this is the
-    full finding inventory of the DB.
+    ``tag`` scopes the side to assets carrying that label in *this* DB; the
+    actionability filters are applied on top. So a diff scoped with either
+    compares only the findings that survive the scope on *each* side — i.e.
+    "what's new among the in-scope / actionable findings." With neither this is
+    the full finding inventory of the DB.
     """
     conn = db.require_initialised(db_path)
     try:
         return dump.build_state(
             conn,
+            tag=tag,
             min_epss=min_epss,
             min_severity=min_severity,
             kev_only=kev_only,
@@ -164,6 +170,7 @@ def build_diff(
     baseline_db: str | Path,
     current_db: str | Path,
     *,
+    tag: str | None = None,
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
@@ -171,19 +178,23 @@ def build_diff(
     """Compute the finding-level diff between two engagement DB files.
 
     ``baseline_db`` is the earlier scan, ``current_db`` the later one. Returns
-    the ``diff_states`` dict (``new`` / ``resolved`` / ``persisting``). The
+    the ``diff_states`` dict (``new`` / ``resolved`` / ``persisting``). ``tag``
+    scopes each side to assets carrying that label *in that DB*, and the
     actionability filters (``min_epss`` / ``min_severity`` / ``kev_only``) are
-    applied identically to both sides before diffing, so the diff describes the
-    change within the scoped (actionable) subset.
+    applied identically to both sides before diffing — so the diff describes the
+    change within the scoped (in-scope / actionable) subset. ``tag`` composes
+    with the actionability filters.
     """
     baseline = _read_state(
         baseline_db,
+        tag=tag,
         min_epss=min_epss,
         min_severity=min_severity,
         kev_only=kev_only,
     )
     current = _read_state(
         current_db,
+        tag=tag,
         min_epss=min_epss,
         min_severity=min_severity,
         kev_only=kev_only,
@@ -238,6 +249,7 @@ def diff(
     current_db: str | Path,
     fmt: str = "text",
     *,
+    tag: str | None = None,
     min_epss: float | None = None,
     min_severity: float | None = None,
     kev_only: bool = False,
@@ -245,7 +257,8 @@ def diff(
     """Return the finding diff between two DBs as a serialised string.
 
     ``fmt`` is ``text`` (human-readable) or ``json`` (the same structure, for
-    piping). The actionability filters scope both sides before diffing. See
+    piping). ``tag`` scopes each side to assets carrying that label, and the
+    actionability filters scope both sides before diffing. See
     :func:`build_diff` for the comparison semantics.
     """
     if fmt not in SUPPORTED_FORMATS:
@@ -254,6 +267,7 @@ def diff(
     result = build_diff(
         baseline_db,
         current_db,
+        tag=tag,
         min_epss=min_epss,
         min_severity=min_severity,
         kev_only=kev_only,

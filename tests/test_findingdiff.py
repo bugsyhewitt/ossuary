@@ -13,23 +13,23 @@ import json
 
 import pytest
 
-from ossuary import cli, db, findingdiff
+from ossuary import cli, db, findingdiff, tags
 
 
 # --------------------------------------------------------------------------
 # Seed helpers — two engagement DBs with overlapping but differing findings.
 # --------------------------------------------------------------------------
 
-def _seed(db_path, findings):
+def _seed(db_path, findings, *, ip="10.10.0.5", hostname="host-a"):
     """Build an engagement DB with one asset and the given findings.
 
     `findings` is a list of (port, product, version, cve_id, severity, epss,
-    kev) tuples. All hang off a single asset 10.10.0.5 / host-a so the location
-    key is driven purely by port + cve_id.
+    kev) tuples. All hang off a single asset (default 10.10.0.5 / host-a) so the
+    location key is driven purely by port + cve_id.
     """
     conn = db.init_db(db_path)
     try:
-        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        aid = db.upsert_asset(conn, ip, hostname, "up")
         svc_ids: dict[int, int] = {}
         for port, product, version, cve_id, severity, epss, kev in findings:
             if port not in svc_ids:
@@ -45,6 +45,37 @@ def _seed(db_path, findings):
                 epss_score=epss,
                 kev=kev,
             )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_multi(db_path, assets):
+    """Build an engagement DB with several assets.
+
+    `assets` is a list of (ip, hostname, findings) tuples, where `findings` has
+    the same shape as `_seed`. Returns nothing; used for tag-scoping tests where
+    the diff must distinguish in-scope from out-of-scope hosts.
+    """
+    conn = db.init_db(db_path)
+    try:
+        for ip, hostname, findings in assets:
+            aid = db.upsert_asset(conn, ip, hostname, "up")
+            svc_ids: dict[int, int] = {}
+            for port, product, version, cve_id, severity, epss, kev in findings:
+                if port not in svc_ids:
+                    svc_ids[port] = db.upsert_service(
+                        conn, aid, port, "tcp", "svc", product, version, None
+                    )
+                db.upsert_finding(
+                    conn,
+                    svc_ids[port],
+                    cve_id,
+                    f"summary for {cve_id}",
+                    severity,
+                    epss_score=epss,
+                    kev=kev,
+                )
         conn.commit()
     finally:
         conn.close()
@@ -220,6 +251,129 @@ def test_min_severity_filters(baseline_db, current_db):
     # current >=8.0: CVE-NEW-1 (8.8). baseline >=8.0: CVE-PATCHED (9.1).
     assert {e["cve_id"] for e in result["new"]} == {"CVE-NEW-1"}
     assert {e["cve_id"] for e in result["resolved"]} == {"CVE-PATCHED"}
+
+
+# --------------------------------------------------------------------------
+# Tag scoping — restrict each side to assets carrying a label in that DB.
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def tagged_baseline_db(tmp_path):
+    """Baseline: an in-scope host and an out-of-scope host, both with a new CVE.
+
+    Only the in-scope host (.5) is tagged ``in-scope``; the noise host (.9) is
+    left untagged. The two hosts carry *different* CVEs so a tag-scoped diff and
+    an unscoped diff classify visibly different sets.
+    """
+    path = tmp_path / "tagged-baseline.db"
+    _seed_multi(
+        path,
+        [
+            ("10.10.0.5", "scope-host", [
+                (80, "nginx", "1.18.0", "CVE-SCOPE-RESOLVED", "9.1", 0.80, 1),
+                (80, "nginx", "1.18.0", "CVE-SCOPE-KEEP", "7.5", 0.40, 0),
+            ]),
+            ("10.10.0.9", "noise-host", [
+                (80, "apache", "2.4.0", "CVE-NOISE-RESOLVED", "8.0", 0.50, 0),
+            ]),
+        ],
+    )
+    tags.add_tag(path, "10.10.0.5", "in-scope")
+    return path
+
+
+@pytest.fixture
+def tagged_current_db(tmp_path):
+    """Current: same two hosts; the in-scope host bumped + gained a new CVE."""
+    path = tmp_path / "tagged-current.db"
+    _seed_multi(
+        path,
+        [
+            ("10.10.0.5", "scope-host", [
+                (80, "nginx", "1.24.0", "CVE-SCOPE-KEEP", "7.5", 0.40, 0),
+                (80, "nginx", "1.24.0", "CVE-SCOPE-NEW", "8.8", 0.90, 1),
+            ]),
+            ("10.10.0.9", "noise-host", [
+                (80, "apache", "2.4.0", "CVE-NOISE-NEW", "6.0", 0.30, 0),
+            ]),
+        ],
+    )
+    tags.add_tag(path, "10.10.0.5", "in-scope")
+    return path
+
+
+def test_tag_scopes_diff_to_in_scope_assets(tagged_baseline_db, tagged_current_db):
+    # With --tag in-scope the noise host's findings vanish from every bucket.
+    result = findingdiff.build_diff(
+        tagged_baseline_db, tagged_current_db, tag="in-scope"
+    )
+    assert {e["cve_id"] for e in result["new"]} == {"CVE-SCOPE-NEW"}
+    assert {e["cve_id"] for e in result["resolved"]} == {"CVE-SCOPE-RESOLVED"}
+    assert {e["cve_id"] for e in result["persisting"]} == {"CVE-SCOPE-KEEP"}
+
+
+def test_untagged_diff_includes_noise_host(tagged_baseline_db, tagged_current_db):
+    # Without --tag the noise host's CVEs show up too — the scope flag matters.
+    result = findingdiff.build_diff(tagged_baseline_db, tagged_current_db)
+    assert {e["cve_id"] for e in result["new"]} == {"CVE-SCOPE-NEW", "CVE-NOISE-NEW"}
+    assert {e["cve_id"] for e in result["resolved"]} == {
+        "CVE-SCOPE-RESOLVED",
+        "CVE-NOISE-RESOLVED",
+    }
+
+
+def test_unknown_tag_diffs_empty(tagged_baseline_db, tagged_current_db):
+    # A tag no asset carries scopes both sides to nothing -> empty diff.
+    result = findingdiff.build_diff(
+        tagged_baseline_db, tagged_current_db, tag="does-not-exist"
+    )
+    assert result == {"new": [], "resolved": [], "persisting": []}
+
+
+def test_tag_composes_with_kev_only(tagged_baseline_db, tagged_current_db):
+    # in-scope KEV findings only: baseline CVE-SCOPE-RESOLVED(kev),
+    # current CVE-SCOPE-NEW(kev); CVE-SCOPE-KEEP is non-KEV so it drops.
+    result = findingdiff.build_diff(
+        tagged_baseline_db, tagged_current_db, tag="in-scope", kev_only=True
+    )
+    assert {e["cve_id"] for e in result["new"]} == {"CVE-SCOPE-NEW"}
+    assert {e["cve_id"] for e in result["resolved"]} == {"CVE-SCOPE-RESOLVED"}
+    assert result["persisting"] == []
+
+
+def test_tag_only_on_one_side_scopes_per_db(tmp_path):
+    # The same label may be present in one DB and absent in the other; each side
+    # is scoped independently. Here only the baseline tags the host, so the
+    # current side scopes to nothing -> every baseline finding reads as resolved.
+    base = tmp_path / "b.db"
+    cur = tmp_path / "c.db"
+    _seed(base, [(80, "nginx", "1.18.0", "CVE-X", "7.5", 0.4, 0)])
+    _seed(cur, [(80, "nginx", "1.24.0", "CVE-X", "7.5", 0.4, 0)])
+    tags.add_tag(base, "10.10.0.5", "in-scope")  # current left untagged
+    result = findingdiff.build_diff(base, cur, tag="in-scope")
+    assert {e["cve_id"] for e in result["resolved"]} == {"CVE-X"}
+    assert result["new"] == []
+    assert result["persisting"] == []
+
+
+def test_cli_diff_tag_json(tagged_baseline_db, tagged_current_db, capsys):
+    rc = cli.main(
+        [
+            "diff",
+            "--db",
+            str(tagged_baseline_db),
+            "--against",
+            str(tagged_current_db),
+            "--tag",
+            "in-scope",
+            "--format",
+            "json",
+        ]
+    )
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert {e["cve_id"] for e in parsed["new"]} == {"CVE-SCOPE-NEW"}
+    assert {e["cve_id"] for e in parsed["resolved"]} == {"CVE-SCOPE-RESOLVED"}
 
 
 # --------------------------------------------------------------------------

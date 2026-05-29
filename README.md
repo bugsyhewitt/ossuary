@@ -738,6 +738,22 @@ for piping.
 EPSS / KEV / summary); `resolved` entries carry the **baseline**'s (the current
 DB no longer holds them).
 
+**Tag scoping.** `diff` accepts the same `--tag LABEL` as `dump` / `stats` /
+`stale`, scoping the comparison to assets carrying that label — so you can diff
+just your in-scope (or VIP / priority) hosts instead of the whole engagement:
+
+```bash
+# only diff the hosts tagged "in-scope" on each side
+ossuary diff --db baseline.db --against engagement-acme.db --tag in-scope
+```
+
+`--tag` scopes **each side independently**, using the tags recorded *in that
+DB* — exactly how `dump --tag` scopes a single DB. So a host tagged `in-scope`
+in the current scan but not (yet) in the baseline is scoped per-DB, and a tag no
+asset carries scopes both sides to nothing (an empty diff). This is the diff
+companion to a tagged export: `dump --tag in-scope` gives you the in-scope rows,
+`diff --tag in-scope` gives you what changed among them.
+
 **Actionability filters.** `diff` accepts the same `--kev-only`, `--min-epss`,
 and `--min-severity` filters as `dump` and `stats`. They scope *both* sides
 before diffing, so you can ask "what's new among the findings worth reporting":
@@ -748,11 +764,15 @@ ossuary diff --db baseline.db --against engagement-acme.db --kev-only
 
 # only the high-EPSS exposure that changed
 ossuary diff --db baseline.db --against engagement-acme.db --min-epss 0.5 --format json
+
+# compose: what's new among the in-scope, actively-exploited findings
+ossuary diff --db baseline.db --against engagement-acme.db --tag in-scope --kev-only
 ```
 
 > **Design note.** `diff` reads each DB through the same `build_state` the
-> exports use, so the filtered, location-keyed view it diffs is identical to what
-> a filtered `dump` of each DB would show. Pure Python, no new schema, no network.
+> exports use, so the tag-scoped / filtered, location-keyed view it diffs is
+> identical to what a tag-scoped / filtered `dump` of each DB would show. Pure
+> Python, no new schema, no network.
 
 ### Age staleness (`ossuary stale`)
 
