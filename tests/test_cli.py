@@ -577,6 +577,56 @@ def test_cli_dump_trivy_table_format(tmp_path, monkeypatch, capsys):
     assert "│" in out and "─" in out
 
 
+def test_cli_dump_dependency_check_format(tmp_path, capsys):
+    """The CLI exposes `--format dependency-check` and emits the native shape."""
+    import json as _json
+    import sqlite3
+
+    db_file = str(tmp_path / "engagement-test.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute(
+            "INSERT INTO assets (id, ip, hostname, state) "
+            "VALUES (1, '10.10.0.5', 'host-a', 'up')"
+        )
+        conn.execute(
+            "INSERT INTO services (id, asset_id, port, protocol, name, product, "
+            "version, cpe) VALUES (1, 1, 80, 'tcp', 'http', 'nginx', '1.18.0', "
+            "'cpe:/a:nginx')"
+        )
+        conn.execute(
+            "INSERT INTO findings (service_id, cve_id, summary, severity, "
+            "epss_score, kev) VALUES (1, 'CVE-2021-23017', 'off-by-one', "
+            "'7.7', 0.5, 1)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    rc = cli.main(["dump", "--db", db_file, "--format", "dependency-check"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    doc = _json.loads(out)
+    # Native Dependency-Check top-level shape.
+    assert doc["reportSchema"] == "1.1"
+    # One dependency per discovered service, located by ip:proto/port.
+    assert len(doc["dependencies"]) == 1
+    dep = doc["dependencies"][0]
+    assert dep["fileName"] == "10.10.0.5:tcp/80"
+    # One vulnerability per matched CVE, with the upper-case severity bucket
+    # and the cvssv3 block downstream parsers (DefectDojo et al.) read.
+    v = dep["vulnerabilities"][0]
+    assert v["name"] == "CVE-2021-23017"
+    assert v["severity"] == "HIGH"
+    assert v["cvssv3"]["baseScore"] == 7.7
+    # KEV rides as a labelled CISA-KEV reference for parsers that don't
+    # read the ossuary `properties` map.
+    ref_sources = {r["source"] for r in v["references"]}
+    assert "CISA-KEV" in ref_sources
+
+
 def test_cli_dump_sort_by_priority(tmp_path, monkeypatch, capsys):
     import sqlite3
 

@@ -8,7 +8,7 @@ Subcommands (v0.1):
     match-cves   query OSV.dev for service versions -> findings table
     cruise       re-fingerprint, diff against last state, report changes
     watch        run cruise on an interval, emitting a diff summary each pass
-    dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX/VEX/Trivy-table
+    dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX/VEX/Trivy-table/Dependency-Check
     web          list the recorded web-probe inventory (read companion to probe)
     stats        print a top-of-funnel engagement summary (counts + top hits)
     stale        flag findings not re-confirmed within N days (age staleness)
@@ -214,6 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
             "cdx-vex",
             "trivy-table",
             "grype-json",
+            "dependency-check",
         ],
         help=(
             "output format: json (nested), csv or markdown (flat, one finding "
@@ -242,6 +243,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Grype GitHub Action, Anchore Enterprise, Harbor, DefectDojo's "
             "Grype parser, so an engagement's findings drop into either the "
             "Trivy or the Grype CI pipeline without learning a new layout)"
+            "in a workflow already tuned for Trivy output), or "
+            "dependency-check (an OWASP Dependency-Check JSON report — one "
+            "'dependency' per discovered service and one 'vulnerability' per "
+            "matched CVE, ingestible by DefectDojo's Dependency Check Scan "
+            "parser, the Jenkins Dependency-Check plugin, SonarQube's "
+            "dependency-check plugin, and GitLab's dependency-check converter)"
         ),
     )
     p_dump.add_argument(
