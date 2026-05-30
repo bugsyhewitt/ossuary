@@ -436,7 +436,7 @@ ossuary dump --db engagement-acme.db --format json > acme-state.json
 
 ### Export formats
 
-`dump` speaks twelve formats via `--format`:
+`dump` speaks fifteen formats via `--format`:
 
 ```bash
 ossuary dump --db engagement-acme.db --format json         > acme-state.json
@@ -462,6 +462,8 @@ ossuary dump --db engagement-acme.db --format spdx              > acme-sbom.spdx
 ossuary dump --db engagement-acme.db --format vex               > acme-triage.openvex.json
 ossuary dump --db engagement-acme.db --format cdx-vex           > acme-triage.cdx-vex.json
 ossuary dump --db engagement-acme.db --format trivy-table       > acme-findings.trivy.txt
+ossuary dump --db engagement-acme.db --format trivy-json        > acme-findings.trivy.json
+ossuary dump --db engagement-acme.db --format grype-json        > acme-findings.grype.json
 ossuary dump --db engagement-acme.db --format dependency-check  > acme-dependency-check-report.json
 ossuary dump --db engagement-acme.db --format syft              > acme-sbom.syft.json
 ```
@@ -573,6 +575,28 @@ ossuary dump --db engagement-acme.db --format syft              > acme-sbom.syft
   **component-centric**: a service with no finding still emits a target
   section with `No vulnerabilities found` (Trivy's own wording), so the
   inventory is preserved.
+- **`trivy-json`** — Trivy's **`-f json` machine artifact**, the JSON shape
+  every Trivy-aware downstream consumer parses (where `trivy-table` is the
+  human-readable terminal view of the same data). A top-level wrapper with
+  `SchemaVersion: 2`, `ArtifactName`, `ArtifactType`, and a `Results[]`
+  array of one entry per discovered service (component-centric — a service
+  with no findings still appears as a Result entry without a
+  `Vulnerabilities` field, matching Trivy's own convention for an empty
+  target). Each Result carries `Target` (the same `<host> (<ip>):<port>/<proto>
+  (<product> <version>)` label `trivy-table` uses), `Class: "lang-pkgs"`,
+  `Type: "generic"`, and a `Vulnerabilities[]` list with Trivy's canonical
+  per-finding fields (`VulnerabilityID`, `PkgName`, `InstalledVersion`,
+  `FixedVersion`, upper-case `Severity`, `Title`, `Description`,
+  `PrimaryURL`, `CVSS`, `VendorSeverity`, `References`).
+  **Byte-recognisable** to every Trivy consumer — the
+  [Trivy GitHub Action](https://github.com/aquasecurity/trivy-action),
+  [DefectDojo](https://www.defectdojo.org/)'s `Trivy Scan` parser,
+  `trivy convert`, AccuKnox, and the wider Trivy-aware CI ecosystem — so
+  an engagement's findings drop into a Trivy JSON workflow without a
+  translation step. KEV (confirmed-exploited) rides as a CISA-KEV URL in
+  `References[]`; EPSS rides under `CustomAdvisoryData.epss_score` (the
+  open vendor-extension slot Trivy itself reserves), so parsers ignoring
+  unknown fields still get the full Trivy shape.
 - **`grype-json`** — the **Anchore-ecosystem counterpart** to `trivy-table`:
   [Grype](https://github.com/anchore/grype)'s own `-o json` output shape — a
   top-level `matches` array with one entry per finding, each carrying a
@@ -693,8 +717,7 @@ Semantics:
 
 The flags **compose** (a finding must clear every threshold given) and combine
 with `--tag` (e.g. `--tag in-scope --kev-only`). They apply identically to
-`json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, `trivy-table`, and `grype-json`. When a filter is active, services and assets left
-`json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, `trivy-table`, `dependency-check`, and `syft`. When a filter is active, services and assets left
+`json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, `trivy-table`, `trivy-json`, `grype-json`, `dependency-check`, and `syft`. When a filter is active, services and assets left
 with no surviving findings are pruned, so the output collapses to a clean list
 of actionable hits. With no filter flags, `dump` returns the full inventory
 exactly as before (services with no findings still appear).

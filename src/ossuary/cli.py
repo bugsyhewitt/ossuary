@@ -213,6 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
             "vex",
             "cdx-vex",
             "trivy-table",
+            "trivy-json",
             "grype-json",
             "dependency-check",
             "syft",
@@ -237,7 +238,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Trivy-style text-table report — one per-target section per "
             "discovered service, with Trivy's familiar Unicode-box-drawn table "
             "and 'Total: N (UNKNOWN: a, ...)' summary line, byte-recognisable "
-            "in a workflow already tuned for Trivy output), or grype-json "
+            "in a workflow already tuned for Trivy output), trivy-json "
+            "(Trivy's '-f json' machine artifact — a Results[] array of one "
+            "entry per discovered service, each carrying a Vulnerabilities[] "
+            "list of Trivy-recognised per-finding entries, byte-recognisable "
+            "to the Trivy GitHub Action, DefectDojo's Trivy Scan parser, "
+            "trivy convert, and the wider Trivy-aware CI ecosystem), or "
+            "grype-json "
             "(the Anchore-ecosystem counterpart — Grype's own '-o json' "
             "shape: a top-level matches[] array of one vulnerability + "
             "artifact + matchDetails per finding, byte-recognisable to the "
