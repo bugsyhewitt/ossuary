@@ -177,6 +177,7 @@ SUPPORTED_FORMATS = (
     "trivy-table",
     "grype-json",
     "dependency-check",
+    "syft",
 )
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
@@ -2387,4 +2388,172 @@ def dump(
         return to_grype_json(state)
     if fmt == "dependency-check":
         return to_dependency_check(state)
+    if fmt == "syft":
+        return to_syft(state)
     return json.dumps(state, indent=2, sort_keys=False)
+
+
+# --------------------------------------------------------------------------
+# Syft JSON SBOM export (`--format syft`)
+# --------------------------------------------------------------------------
+#
+# Syft (anchore/syft) is the de-facto Anchore-ecosystem SBOM producer: it
+# walks an image / filesystem and emits a JSON catalogue of discovered
+# components. Its native JSON shape is the upstream artifact every
+# Syft-aware downstream consumer reads — Grype ingests it to match CVEs,
+# Anchore Enterprise / Harbor / dependency-track-Syft policy-gate from it,
+# DefectDojo's `Anchore Engine Scan` and `Syft` parsers ingest it directly,
+# and the wider Syft ecosystem (the Syft GitHub Action, sbom-utility,
+# bomctl) round-trips it as a canonical SBOM exchange format.
+#
+# Where `grype-json` is finding-centric (one entry per matched CVE), Syft
+# is **component-centric** — an SBOM, not a vulnerability report — so a
+# discovered service appears as an artifact whether or not it carries a
+# finding. This mirrors the `cyclonedx` / `spdx` SBOM exports: an SBOM
+# describes the discovered software inventory, full stop. CVEs ride
+# nowhere in the document (Grype is the consumer that adds them).
+#
+# The shape is byte-recognisable to Syft consumers: a top-level
+# `artifacts` array (one entry per discovered service — id, name, version,
+# type=`binary`, locations[], cpes[], purl, foundBy, language=""),
+# `artifactRelationships` (empty — ossuary doesn't fingerprint
+# inter-service dependencies), `files` (empty — ossuary scans network
+# services, not filesystem files), `source` (the engagement as a Syft
+# `directory` source), `distro` (empty — ossuary doesn't fingerprint the
+# host OS), `descriptor` (`ossuary` + version + configuration block), and
+# `schema` (Syft's own schema marker so a parser can pin the wire shape).
+# A service with no findings still appears as an artifact — that is the
+# defining property of an SBOM versus a finding report.
+
+_SYFT_SCHEMA_VERSION = "16.0.4"
+_SYFT_SCHEMA_URL = (
+    "https://raw.githubusercontent.com/anchore/syft/main/schema/json/"
+    f"schema-{_SYFT_SCHEMA_VERSION}.json"
+)
+
+
+def _syft_artifact_id(ip: str, protocol, port) -> str:
+    return f"{ip}-{port}-{protocol}"
+
+
+def _syft_purl(product: str | None, version: str | None) -> str | None:
+    if not product:
+        return None
+    if version:
+        return f"pkg:generic/{product}@{version}"
+    return f"pkg:generic/{product}"
+
+
+def _syft_artifact(asset: dict, service: dict) -> dict:
+    """Render one discovered service as a Syft ``artifacts[]`` entry.
+
+    Mirrors Syft's own catalogue shape: id (stable per host:port/proto),
+    name (the nmap-derived product, falling back to the service name and
+    finally the bare ``proto/port``), version, type=``binary`` (the slot
+    Syft itself uses for native binaries — closest fit for a network
+    service since ossuary doesn't scan language manifests), locations[]
+    (the host:port the service lives at), cpes[], purl, language, and
+    foundBy (the cataloguer that produced the entry — ``ossuary-cataloger``
+    so a consumer can tell which scanner contributed the entry).
+    """
+    ip = asset["ip"]
+    port = service["port"]
+    protocol = service["protocol"]
+    product = service.get("product")
+    version = service.get("version")
+    cpe = service.get("cpe")
+    location = f"{ip}:{port}/{protocol}"
+    name = product or service.get("name") or f"{protocol}/{port}"
+
+    artifact: dict = {
+        "id": _syft_artifact_id(ip, protocol, port),
+        "name": str(name),
+        "version": str(version) if version else "",
+        "type": "binary",
+        "foundBy": "ossuary-cataloger",
+        "locations": [{"path": location}],
+        "licenses": [],
+        "language": "",
+        "cpes": [str(cpe)] if cpe else [],
+        "purl": _syft_purl(product, version) or "",
+        "metadataType": "",
+        "metadata": None,
+    }
+    return artifact
+
+
+def _syft_source(state: dict) -> dict:
+    """Build the top-level ``source`` block describing what was scanned.
+
+    Syft's ``source.type`` taxonomy (image / directory / file) doesn't have
+    a "network engagement" entry, so we use ``directory`` — the same slot
+    Grype uses for non-image sources — and let the target string carry the
+    engagement identity so a consumer can still tell sources apart.
+    """
+    assets = state.get("assets", [])
+    return {
+        "id": "ossuary-engagement",
+        "type": "directory",
+        "target": "ossuary-engagement",
+        "metadata": {
+            "assetCount": len(assets),
+            "serviceCount": sum(len(a.get("services", [])) for a in assets),
+        },
+    }
+
+
+def to_syft(state: dict) -> str:
+    """Serialise the engagement state as a Syft JSON SBOM document.
+
+    Emits the byte-recognisable Syft JSON shape every Anchore-ecosystem
+    SBOM consumer reads — the Syft GitHub Action, Grype (which ingests
+    Syft SBOMs to match CVEs), Anchore Enterprise, Harbor,
+    DefectDojo's Anchore / Syft parsers, dependency-track-Syft,
+    sbom-utility, bomctl.
+
+    The document is **component-centric** (like ``cyclonedx`` / ``spdx``,
+    unlike ``grype-json`` / ``sarif`` / ``jira``): every discovered service
+    appears as an artifact, regardless of whether it carries a finding. An
+    SBOM describes the discovered-software inventory; CVE matches are a
+    separate document (the ``grype-json`` export, or a Grype run consuming
+    this SBOM).
+
+    Like every other dump format this reads off ``build_state``, so the
+    document honours ``--tag``, the actionability filters (``--kev-only``
+    / ``--min-epss`` / ``--min-severity``), ``--since`` / ``--until``,
+    ``--sort-by-priority`` and ``--vex`` suppression identically — the
+    filters scope which services / assets appear in the SBOM (a service
+    pruned by a filter for having no surviving findings is absent from
+    ``artifacts``, exactly as it would be absent from the other
+    component-centric exports). An empty engagement still yields a valid
+    document with an empty ``artifacts`` array.
+    """
+    artifacts: list[dict] = []
+    for asset in state["assets"]:
+        for svc in asset["services"]:
+            artifacts.append(_syft_artifact(asset, svc))
+
+    document = {
+        "artifacts": artifacts,
+        "artifactRelationships": [],
+        "files": [],
+        "source": _syft_source(state),
+        "distro": {
+            "name": "",
+            "version": "",
+            "idLike": [],
+        },
+        "descriptor": {
+            "name": "ossuary",
+            "version": __version__,
+            "configuration": {
+                "output": ["json"],
+                "scope": "engagement",
+            },
+        },
+        "schema": {
+            "version": _SYFT_SCHEMA_VERSION,
+            "url": _SYFT_SCHEMA_URL,
+        },
+    }
+    return json.dumps(document, indent=2, sort_keys=False)

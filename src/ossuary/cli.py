@@ -215,6 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
             "trivy-table",
             "grype-json",
             "dependency-check",
+            "syft",
         ],
         help=(
             "output format: json (nested), csv or markdown (flat, one finding "
@@ -248,7 +249,13 @@ def build_parser() -> argparse.ArgumentParser:
             "'dependency' per discovered service and one 'vulnerability' per "
             "matched CVE, ingestible by DefectDojo's Dependency Check Scan "
             "parser, the Jenkins Dependency-Check plugin, SonarQube's "
-            "dependency-check plugin, and GitLab's dependency-check converter)"
+            "dependency-check plugin, and GitLab's dependency-check converter), "
+            "or syft (Syft's own JSON SBOM shape — a top-level artifacts[] "
+            "array of one entry per discovered service, byte-recognisable to "
+            "the Syft GitHub Action, Grype, Anchore Enterprise, Harbor, "
+            "DefectDojo's Anchore / Syft parsers, dependency-track-Syft — "
+            "component-centric like cyclonedx / spdx, so services with no "
+            "findings still appear)"
         ),
     )
     p_dump.add_argument(

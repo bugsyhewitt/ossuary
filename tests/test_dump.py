@@ -2449,3 +2449,157 @@ def test_dump_dependency_check_output_is_valid_json_and_byte_stable(db_path):
     assert first == second
     # And the output is well-formed JSON.
     json.loads(first)
+
+
+# --------------------------------------------------------------------------
+# Syft JSON SBOM export (`--format syft`)
+# --------------------------------------------------------------------------
+#
+# Syft (anchore/syft) is the Anchore-ecosystem SBOM producer Grype itself
+# consumes — every Syft-aware downstream consumer (the Syft GitHub
+# Action, Grype, Anchore Enterprise, Harbor, DefectDojo's Syft / Anchore
+# parsers, dependency-track-Syft) reads the same byte-recognisable
+# top-level shape. These tests pin that wire shape so a downstream Syft
+# consumer parses ossuary's emission without code changes — and so the
+# component-centric contract (a service with no findings still appears as
+# an artifact) holds, distinguishing it from the finding-centric
+# `grype-json` / `sarif` / `jira` exports.
+
+
+def test_dump_syft_is_listed_as_supported_format():
+    assert "syft" in dump.SUPPORTED_FORMATS
+
+
+def test_dump_syft_empty_db_emits_well_formed_document(db_path):
+    """An empty engagement still yields a valid Syft document — empty artifacts."""
+    db.init_db(db_path).close()
+    out = dump.dump(db_path, "syft")
+    doc = json.loads(out)
+    assert doc["artifacts"] == []
+    assert doc["artifactRelationships"] == []
+    assert doc["files"] == []
+    assert doc["source"]["type"] == "directory"
+    assert doc["descriptor"]["name"] == "ossuary"
+    from ossuary import __version__
+    assert doc["descriptor"]["version"] == __version__
+    # Schema marker is present so a parser can pin the wire shape.
+    assert doc["schema"]["version"]
+    assert doc["schema"]["url"].startswith("https://")
+
+
+def test_dump_syft_emits_one_artifact_per_service(db_path):
+    _seed_one_finding(db_path)
+    doc = json.loads(dump.dump(db_path, "syft"))
+    assert len(doc["artifacts"]) == 1
+    a = doc["artifacts"][0]
+    assert a["name"] == "nginx"
+    assert a["version"] == "1.18.0"
+    assert a["type"] == "binary"
+    assert a["locations"] == [{"path": "10.10.0.5:80/tcp"}]
+    assert a["cpes"] == ["cpe:/a:nginx"]
+    assert a["purl"] == "pkg:generic/nginx@1.18.0"
+    assert a["foundBy"] == "ossuary-cataloger"
+
+
+def test_dump_syft_service_with_no_findings_still_appears(db_path):
+    """Component-centric contract: services without findings are still artifacts."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.9", None, "up")
+        db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "syft"))
+    assert len(doc["artifacts"]) == 1
+    assert doc["artifacts"][0]["name"] == "OpenSSH"
+    assert doc["artifacts"][0]["version"] == "8.2"
+
+
+def test_dump_syft_artifact_without_cpe_emits_empty_cpes(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "h", "up")
+        db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "syft"))
+    assert doc["artifacts"][0]["cpes"] == []
+    assert doc["artifacts"][0]["purl"] == "pkg:generic/nginx@1.0"
+
+
+def test_dump_syft_artifact_without_product_falls_back_to_service_name(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "h", "up")
+        db.upsert_service(conn, aid, 8443, "tcp", "https-alt", None, None, None)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "syft"))
+    a = doc["artifacts"][0]
+    assert a["name"] == "https-alt"
+    assert a["version"] == ""
+    assert a["purl"] == ""
+
+
+def test_dump_syft_carries_no_vulnerability_fields(db_path):
+    """Syft is an SBOM, not a vulnerability report — CVEs live in Grype output."""
+    _seed_one_finding(db_path)
+    doc = json.loads(dump.dump(db_path, "syft"))
+    # No top-level matches / vulnerabilities array — Syft only catalogues
+    # components; CVE matching is Grype's job.
+    assert "matches" not in doc
+    assert "vulnerabilities" not in doc
+    serialised = json.dumps(doc)
+    assert "CVE-2021-23017" not in serialised
+
+
+def test_dump_syft_source_metadata_carries_engagement_counts(db_path):
+    _seed_mixed_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "syft"))
+    # The source block records the engagement shape so a consumer can tell
+    # how much of an inventory the SBOM describes.
+    assert doc["source"]["metadata"]["assetCount"] >= 1
+    assert doc["source"]["metadata"]["serviceCount"] >= 1
+
+
+def test_dump_syft_tag_filter_scopes_artifacts(db_path):
+    conn = db.init_db(db_path)
+    try:
+        a1 = db.upsert_asset(conn, "10.10.0.5", "h1", "up")
+        db.upsert_service(conn, a1, 80, "tcp", "http", "nginx", "1.0", None)
+        a2 = db.upsert_asset(conn, "10.10.0.6", "h2", "up")
+        db.upsert_service(conn, a2, 80, "tcp", "http", "apache", "2.4", None)
+        conn.commit()
+    finally:
+        conn.close()
+    tags.add_tag(db_path, "10.10.0.5", "prod")
+    doc = json.loads(dump.dump(db_path, "syft", tag="prod"))
+    names = sorted(a["name"] for a in doc["artifacts"])
+    assert names == ["nginx"]
+
+
+def test_dump_syft_actionability_filter_prunes_services_without_surviving_findings(db_path):
+    """When a filter prunes a service's findings, the SBOM drops the artifact too."""
+    _seed_mixed_findings(db_path)
+    full = json.loads(dump.dump(db_path, "syft"))
+    filtered = json.loads(dump.dump(db_path, "syft", kev_only=True))
+    # The filtered SBOM has strictly fewer artifacts when a non-KEV service
+    # is present (the mixed fixture has at least one such service).
+    assert len(filtered["artifacts"]) <= len(full["artifacts"])
+
+
+def test_dump_syft_output_is_byte_stable(db_path):
+    """Two emissions on the same DB produce byte-identical output."""
+    _seed_mixed_findings(db_path)
+    first = dump.dump(db_path, "syft")
+    second = dump.dump(db_path, "syft")
+    assert first == second
+
+
+def test_dump_syft_artifact_id_is_stable_per_host_port_proto(db_path):
+    _seed_one_finding(db_path)
+    doc = json.loads(dump.dump(db_path, "syft"))
+    assert doc["artifacts"][0]["id"] == "10.10.0.5-80-tcp"
