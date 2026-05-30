@@ -54,6 +54,22 @@ findings) to one of four shapes:
                    matched-vulnerability inventory into an SPDX pipeline. Like
                    the other formats it reads off ``build_state``, so it honours
                    the same filters and priority order.
+  * ``grype-json`` — Grype's ``-o json`` output shape (the Anchore-ecosystem
+                   counterpart to ``trivy-table``): a top-level ``matches`` array
+                   with one entry per finding, each carrying a ``vulnerability``
+                   block (id / dataSource / severity / urls / description /
+                   cvss[] / fix / advisories[]), a ``matchDetails`` block (the
+                   match method — ``cpe-match`` when nmap supplied a CPE,
+                   otherwise ``exact-direct-match``), and an ``artifact`` block
+                   (the discovered service — name, version, type=``binary``,
+                   locations[], cpes[], purl). Byte-recognisable to every Grype
+                   consumer (the Grype GitHub Action, Anchore Enterprise,
+                   Harbor, DefectDojo's Grype parser) so an engagement's
+                   findings drop into the same downstream pipeline operators
+                   already tune for Grype output. KEV rides as a CISA-KEV
+                   advisory entry, EPSS as a ``properties`` vendor extension.
+                   Like the other formats it reads off ``build_state``, so it
+                   honours the same filters and priority order.
   * ``trivy-table`` — a Trivy-style text-table report (aquasecurity/trivy's
                    wire-format output): one per-target section per discovered
                    service, with Trivy's familiar Unicode-box-drawn table,
@@ -144,6 +160,7 @@ SUPPORTED_FORMATS = (
     "vex",
     "cdx-vex",
     "trivy-table",
+    "grype-json",
 )
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
@@ -1659,6 +1676,316 @@ def to_trivy_table(state: dict) -> str:
     return "\n".join(parts) + "\n"
 
 
+# --------------------------------------------------------------------------
+# Grype JSON export (`--format grype-json`)
+# --------------------------------------------------------------------------
+#
+# Grype (anchore/grype) is the de-facto Anchore-ecosystem CLI vulnerability
+# scanner — Syft produces an SBOM, Grype matches CVEs against it. Its
+# default `-o json` output is the standard machine artifact every Grype-aware
+# downstream consumer reads: the Grype GitHub Action posts it as PR
+# annotations, Anchore Enterprise / Harbor ingest it for policy gates, and
+# `grype-db` / DefectDojo / many home-grown triage pipelines parse it
+# natively. R31 shipped `trivy-table` for the Trivy ecosystem; `grype-json`
+# is its Anchore-ecosystem counterpart, so a hunter can drop ossuary's
+# findings into either CI scanner's downstream workflow without learning a
+# new layout.
+#
+# The shape is byte-recognisable to Grype's parser: a top-level `matches`
+# array (one entry per finding) carrying `vulnerability` (id, dataSource,
+# severity, urls, description, cvss[], fix), `relatedVulnerabilities` (empty
+# — ossuary doesn't track CVE aliases), `matchDetails` (the match method —
+# `cpe-match` when nmap supplied a CPE, otherwise `exact-direct-match`),
+# and `artifact` (the discovered service — name, version, type=`binary`,
+# locations[], cpes[], purl). The top-level wrapper also carries `source`
+# (one entry per discovered asset — Grype scans a single source per run but
+# ossuary's source is the whole engagement DB, so we use the document's
+# `directory`-shaped source), `distro` (empty — ossuary doesn't fingerprint
+# the host OS), and `descriptor` (`ossuary`, the running version, and the
+# DB-file equivalent of a Grype configuration block) so the document is
+# self-describing.
+#
+# KEV (CISA's Known Exploited Vulnerabilities catalog) and EPSS are
+# ossuary-specific live-signal columns Grype's own output doesn't carry —
+# they ride in a Grype-permitted vendor extension (`matchDetails[].fix` and
+# `vulnerability.advisories[]` are the slots Grype already reserves for
+# downstream-tool metadata). We use `vulnerability.advisories` for the KEV
+# entry (an actual advisory link to CISA's KEV catalogue page) and a
+# top-level `properties` block on each match for the EPSS score, since
+# Grype consumers that key off the live signal can find it in the same
+# spot they'd find any other vendor-extended field. Severity bucketing
+# uses Grype's own capitalisation (`Critical` / `High` / `Medium` / `Low`
+# / `Negligible` / `Unknown`) — the exact tokens Grype itself emits — so
+# downstream filters that key off severity strings keep working.
+
+_GRYPE_SEVERITY_ORDER = (
+    "Unknown", "Negligible", "Low", "Medium", "High", "Critical",
+)
+
+
+def _grype_severity(value) -> str:
+    """Map a finding's free-text severity to a Grype capitalised label.
+
+    Grype itself reports severities as ``Critical`` / ``High`` / ``Medium`` /
+    ``Low`` / ``Negligible`` / ``Unknown`` — the title-case tokens its
+    downstream consumers (the Grype GitHub Action, Anchore Enterprise,
+    DefectDojo's Grype parser) key off. We use the same numeric tiering the
+    rest of ossuary triages on (stats / HTML / CycloneDX / trivy-table) so a
+    hunter reads one consistent severity taxonomy across every surface; a
+    blank / non-numeric score (common post-NIST-retreat) becomes
+    ``Unknown`` — the bucket Grype itself uses for an un-scored advisory —
+    rather than being silently dropped.
+    """
+    sev = _parse_severity(value)
+    if sev is None:
+        return "Unknown"
+    if sev >= 9.0:
+        return "Critical"
+    if sev >= 7.0:
+        return "High"
+    if sev >= 4.0:
+        return "Medium"
+    if sev > 0.0:
+        return "Low"
+    return "Negligible"
+
+
+def _grype_purl(product: str | None, version: str | None) -> str | None:
+    """Build a ``pkg:generic`` purl for a discovered service.
+
+    Grype's ``artifact.purl`` is the canonical handle every downstream
+    consumer (Anchore Enterprise, Harbor, dependency-track-Grype) keys off
+    when joining match data back to an SBOM. ossuary scans network
+    services rather than language manifests, so the ecosystem is
+    ``generic`` — the same purl ecosystem ``cyclonedx`` / ``spdx`` already
+    emit, so a hunter can join a Grype consumer to an ossuary-emitted SBOM
+    by the purl. A service with no product yields no purl (Grype itself
+    omits the field rather than emitting an empty string).
+    """
+    if not product:
+        return None
+    if version:
+        return f"pkg:generic/{product}@{version}"
+    return f"pkg:generic/{product}"
+
+
+def _grype_match(finding: dict, asset: dict, service: dict) -> dict:
+    """Render one finding as a Grype ``matches[]`` entry.
+
+    Mirrors Grype's ``-o json`` shape: a ``vulnerability`` block (id,
+    dataSource, severity, urls[], description, cvss[], fix, advisories[] —
+    the KEV catalogue link rides here as an actual advisory), a
+    ``relatedVulnerabilities`` array (empty — ossuary doesn't track CVE
+    aliases), a ``matchDetails`` array (the match method — ``cpe-match``
+    when nmap supplied a CPE, otherwise ``exact-direct-match`` — and the
+    matcher metadata Grype consumers key off for confidence weighting),
+    and an ``artifact`` block (the discovered service — name, version,
+    type=``binary``, locations[], cpes[], purl). EPSS rides in a
+    Grype-permitted ``properties`` extension on the match so downstream
+    consumers that key off the live signal find it in a predictable slot.
+    """
+    cve_id = finding.get("cve_id") or "UNKNOWN"
+    product = service.get("product")
+    version = service.get("version")
+    cpe = service.get("cpe")
+    severity = _grype_severity(finding.get("severity"))
+    sev_score = _parse_severity(finding.get("severity"))
+    ip = asset["ip"]
+    port = service["port"]
+    protocol = service["protocol"]
+    location = f"{ip}:{port}/{protocol}"
+
+    # vulnerability.cvss — Grype's own shape carries the numeric score
+    # under metrics; we emit the numeric score when known so consumers that
+    # filter on a CVSS metric still work.
+    cvss: list[dict] = []
+    if sev_score is not None:
+        cvss.append({
+            "source": "ossuary",
+            "type": "Primary",
+            "version": "3.1",
+            "vector": "",
+            "metrics": {
+                "baseScore": sev_score,
+                "exploitabilityScore": 0.0,
+                "impactScore": 0.0,
+            },
+            "vendorMetadata": {},
+        })
+
+    # vulnerability.advisories — Grype's slot for vendor-extended advisory
+    # links. We use it for the KEV catalogue link so a Grype consumer
+    # already iterating advisories sees the confirmed-exploited signal.
+    advisories: list[dict] = []
+    if finding.get("kev"):
+        advisories.append({
+            "id": "CISA-KEV",
+            "link": (
+                "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
+            ),
+        })
+
+    # vulnerability.urls — Grype's own canonical-link list.
+    urls = [
+        f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+    ]
+
+    # matchDetails — Grype's match-method record. cpe-match is the high-
+    # confidence path Grype uses when the SBOM's CPE matched the
+    # vulnerability database's CPE; ossuary's nmap-supplied CPE is exactly
+    # that signal, so we use cpe-match when a CPE is present and the
+    # exact-direct-match fallback otherwise.
+    if cpe:
+        match_details = [{
+            "type": "cpe-match",
+            "matcher": "ossuary-cve-matcher",
+            "searchedBy": {
+                "namespace": "nvd:cpe",
+                "cpes": [cpe],
+                "package": {
+                    "name": product or "",
+                    "version": version or "",
+                },
+            },
+            "found": {
+                "vulnerabilityID": cve_id,
+                "versionConstraint": "",
+                "cpes": [cpe],
+            },
+            "fix": {"suggestedVersion": ""},
+        }]
+    else:
+        match_details = [{
+            "type": "exact-direct-match",
+            "matcher": "ossuary-cve-matcher",
+            "searchedBy": {
+                "package": {
+                    "name": product or "",
+                    "version": version or "",
+                },
+            },
+            "found": {
+                "vulnerabilityID": cve_id,
+                "versionConstraint": "",
+            },
+            "fix": {"suggestedVersion": ""},
+        }]
+
+    # artifact — Grype's discovered-component record. type=binary mirrors
+    # the type Grype itself emits for a network-service / binary-cataloged
+    # find, since ossuary doesn't scan language manifests; locations carry
+    # the host:port that identifies the service.
+    artifact = {
+        "id": f"{ip}-{port}-{protocol}",
+        "name": product or service.get("name") or f"{protocol}/{port}",
+        "version": version or "",
+        "type": "binary",
+        "locations": [{
+            "path": location,
+        }],
+        "language": "",
+        "licenses": [],
+        "cpes": [cpe] if cpe else [],
+        "purl": _grype_purl(product, version) or "",
+        "upstreams": [],
+        "metadataType": "",
+        "metadata": None,
+    }
+
+    # properties — Grype's open vendor-extension slot. EPSS rides here so
+    # consumers keying off the live signal find it in a predictable place.
+    # KEV is also surfaced as a top-level boolean so a consumer iterating
+    # matches once can pick it up without walking advisories[].
+    properties: dict = {}
+    epss = finding.get("epss_score")
+    if isinstance(epss, (int, float)):
+        properties["ossuary.epss_score"] = epss
+    if finding.get("kev"):
+        properties["ossuary.kev"] = True
+    source = finding.get("source")
+    if source:
+        properties["ossuary.source"] = source
+
+    match = {
+        "vulnerability": {
+            "id": cve_id,
+            "dataSource": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+            "namespace": "nvd:cpe",
+            "severity": severity,
+            "urls": urls,
+            "description": finding.get("summary") or "",
+            "cvss": cvss,
+            "fix": {
+                "versions": [],
+                "state": "unknown",
+            },
+            "advisories": advisories,
+        },
+        "relatedVulnerabilities": [],
+        "matchDetails": match_details,
+        "artifact": artifact,
+    }
+    if properties:
+        match["properties"] = properties
+    return match
+
+
+def to_grype_json(state: dict) -> str:
+    """Serialise the engagement state as a Grype ``-o json`` document.
+
+    Emits the byte-recognisable Grype JSON shape every Anchore-ecosystem
+    downstream consumer reads — the Grype GitHub Action, Anchore
+    Enterprise, Harbor, DefectDojo's Grype parser, dependency-track-Grype.
+    The top-level wrapper carries ``matches`` (one entry per finding,
+    grouped under each discovered service), ``source`` (the engagement
+    DB as a Grype source), ``distro`` (empty — ossuary doesn't
+    fingerprint the host OS), and ``descriptor`` (the running ossuary
+    version + a configuration block).
+
+    Like every other dump format this reads off ``build_state``, so the
+    document honours ``--tag``, the actionability filters (``--kev-only``
+    / ``--min-epss`` / ``--min-severity``), ``--sort-by-priority`` and
+    ``--vex`` suppression identically. Like SARIF and Jira it is
+    finding-centric — a service with no finding produces no entries in
+    ``matches`` — and an empty engagement still yields a valid document
+    with an empty ``matches`` array.
+    """
+    matches: list[dict] = []
+    for asset in state["assets"]:
+        for svc in asset["services"]:
+            for f in svc["findings"]:
+                matches.append(_grype_match(f, asset, svc))
+
+    document = {
+        "matches": matches,
+        "source": {
+            "type": "directory",
+            "target": "ossuary-engagement",
+        },
+        "distro": {
+            "name": "",
+            "version": "",
+            "idLike": [],
+        },
+        "descriptor": {
+            "name": "ossuary",
+            "version": __version__,
+            "configuration": {
+                "output": ["json"],
+                "scope": "engagement",
+            },
+            "db": {
+                "built": "",
+                "schemaVersion": 0,
+                "location": "",
+                "checksum": "",
+                "error": None,
+            },
+        },
+    }
+    return json.dumps(document, indent=2, sort_keys=False)
+
+
 def dump(
     db_path: str | Path,
     fmt: str = "json",
@@ -1690,7 +2017,13 @@ def dump(
     text-table report — one per-target section per discovered service, with
     Trivy's familiar Unicode-box-drawn table and ``Total: N (UNKNOWN: a, ...)``
     summary line, byte-recognisable in a workflow already tuned for Trivy
-    output).
+    output), or ``grype-json`` (the Anchore-ecosystem counterpart — Grype's
+    own ``-o json`` shape: a top-level ``matches`` array carrying one
+    ``vulnerability`` + ``artifact`` + ``matchDetails`` block per finding,
+    byte-recognisable to every Grype consumer — the Grype GitHub Action,
+    Anchore Enterprise, Harbor, DefectDojo's Grype parser — so an
+    engagement's findings drop into either the Trivy or the Grype CI
+    workflow without learning a new layout).
     `tag`, when set,
     restricts the export to assets carrying that tag label. `min_epss`,
     `min_severity`, and `kev_only` are actionability filters: each restricts the
@@ -1747,4 +2080,6 @@ def dump(
         return to_cdx_vex(state)
     if fmt == "trivy-table":
         return to_trivy_table(state)
+    if fmt == "grype-json":
+        return to_grype_json(state)
     return json.dumps(state, indent=2, sort_keys=False)

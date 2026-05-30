@@ -2003,3 +2003,231 @@ def test_dump_trivy_table_output_is_byte_stable(db_path):
     first = dump.dump(db_path, "trivy-table")
     second = dump.dump(db_path, "trivy-table")
     assert first == second
+
+
+# --------------------------------------------------------------------------
+# Grype JSON export (`--format grype-json`)
+# --------------------------------------------------------------------------
+#
+# Grype (anchore/grype) is the Anchore-ecosystem counterpart to Trivy: its
+# default `-o json` shape is the standard machine artifact every
+# Grype-aware consumer reads (the Grype GitHub Action, Anchore Enterprise,
+# Harbor, DefectDojo's Grype parser, dependency-track-Grype). These tests
+# pin the byte-recognisable wire shape so a downstream Grype consumer can
+# parse ossuary's emission without code changes.
+
+
+def test_dump_grype_json_is_listed_as_supported_format():
+    assert "grype-json" in dump.SUPPORTED_FORMATS
+
+
+def test_dump_grype_json_empty_db_emits_well_formed_document(db_path):
+    """An empty engagement yields a valid Grype document with no matches."""
+    db.init_db(db_path).close()
+    out = dump.dump(db_path, "grype-json")
+    doc = json.loads(out)
+    # Every top-level slot Grype consumers iterate is present.
+    assert doc["matches"] == []
+    assert doc["source"]["type"] == "directory"
+    assert doc["descriptor"]["name"] == "ossuary"
+    # The version threaded through the descriptor matches the package version
+    # so a consumer can tell which scanner produced the document.
+    from ossuary import __version__
+    assert doc["descriptor"]["version"] == __version__
+
+
+def test_dump_grype_json_emits_one_match_per_finding(db_path):
+    _seed_one_finding(db_path)
+    doc = json.loads(dump.dump(db_path, "grype-json"))
+    assert len(doc["matches"]) == 1
+    m = doc["matches"][0]
+    # vulnerability block — the bits Grype consumers key off.
+    assert m["vulnerability"]["id"] == "CVE-2021-23017"
+    assert m["vulnerability"]["severity"] == "High"  # CVSS 7.7 → High
+    assert m["vulnerability"]["description"] == "off-by-one"
+    assert (
+        m["vulnerability"]["dataSource"]
+        == "https://nvd.nist.gov/vuln/detail/CVE-2021-23017"
+    )
+    # artifact block — the discovered service rendered as a Grype artifact.
+    assert m["artifact"]["name"] == "nginx"
+    assert m["artifact"]["version"] == "1.18.0"
+    assert m["artifact"]["type"] == "binary"
+    assert m["artifact"]["locations"] == [{"path": "10.10.0.5:80/tcp"}]
+    # cpe-match path: nmap supplied a CPE, so the matcher records cpe-match.
+    assert m["matchDetails"][0]["type"] == "cpe-match"
+    assert m["matchDetails"][0]["searchedBy"]["cpes"] == ["cpe:/a:nginx"]
+
+
+def test_dump_grype_json_match_method_falls_back_to_exact_when_no_cpe(db_path):
+    """Without nmap-supplied CPE the matcher records exact-direct-match."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-NOCPE", "x", "5.0")
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "grype-json"))
+    md = doc["matches"][0]["matchDetails"][0]
+    assert md["type"] == "exact-direct-match"
+    # No cpes[] when the service didn't carry one.
+    assert doc["matches"][0]["artifact"]["cpes"] == []
+
+
+def test_dump_grype_json_severity_buckets_map_to_grype_labels(db_path):
+    """The numeric tiering matches Grype's title-case label vocabulary."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "h", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-CRIT", "x", "9.8")  # Critical
+        db.upsert_finding(conn, sid, "CVE-HI",   "x", "7.5")  # High
+        db.upsert_finding(conn, sid, "CVE-MED",  "x", "5.0")  # Medium
+        db.upsert_finding(conn, sid, "CVE-LO",   "x", "2.0")  # Low
+        db.upsert_finding(conn, sid, "CVE-UNK",  "x", "")     # Unknown (blank)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "grype-json"))
+    by_id = {m["vulnerability"]["id"]: m["vulnerability"]["severity"]
+             for m in doc["matches"]}
+    assert by_id == {
+        "CVE-CRIT": "Critical",
+        "CVE-HI": "High",
+        "CVE-MED": "Medium",
+        "CVE-LO": "Low",
+        "CVE-UNK": "Unknown",
+    }
+
+
+def test_dump_grype_json_kev_rides_as_advisory_entry(db_path):
+    """KEV (confirmed-exploited) surfaces as a CISA-KEV advisory link."""
+    _seed_mixed_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "grype-json"))
+    hot = next(m for m in doc["matches"]
+               if m["vulnerability"]["id"] == "CVE-HOT")
+    cold = next(m for m in doc["matches"]
+                if m["vulnerability"]["id"] == "CVE-COLD")
+    # KEV finding: an advisory entry pointing to CISA's KEV catalogue.
+    assert any(
+        a["id"] == "CISA-KEV" and "cisa.gov" in a["link"]
+        for a in hot["vulnerability"]["advisories"]
+    )
+    # And on the match's properties block, the boolean is present.
+    assert hot["properties"]["ossuary.kev"] is True
+    # Non-KEV finding carries no KEV advisory entry, no kev property.
+    assert cold["vulnerability"]["advisories"] == []
+    assert "ossuary.kev" not in cold.get("properties", {})
+
+
+def test_dump_grype_json_epss_rides_as_match_property(db_path):
+    """EPSS is exposed as a vendor-extension property on the match."""
+    _seed_mixed_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "grype-json"))
+    hot = next(m for m in doc["matches"]
+               if m["vulnerability"]["id"] == "CVE-HOT")
+    assert hot["properties"]["ossuary.epss_score"] == 0.94
+    # A finding with no EPSS score yields no EPSS property (rather than null).
+    mid = next(m for m in doc["matches"]
+               if m["vulnerability"]["id"] == "CVE-MID")
+    assert "ossuary.epss_score" not in mid.get("properties", {})
+
+
+def test_dump_grype_json_cvss_metrics_emit_only_when_numeric(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "h", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-SCORED", "x", "7.7")
+        db.upsert_finding(conn, sid, "CVE-BLANK",  "x", "")
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "grype-json"))
+    scored = next(m for m in doc["matches"]
+                  if m["vulnerability"]["id"] == "CVE-SCORED")
+    blank = next(m for m in doc["matches"]
+                 if m["vulnerability"]["id"] == "CVE-BLANK")
+    assert scored["vulnerability"]["cvss"][0]["metrics"]["baseScore"] == 7.7
+    assert blank["vulnerability"]["cvss"] == []
+
+
+def test_dump_grype_json_purl_uses_generic_ecosystem(db_path):
+    """The artifact purl mirrors the cyclonedx / spdx pkg:generic shape."""
+    _seed_one_finding(db_path)
+    doc = json.loads(dump.dump(db_path, "grype-json"))
+    assert doc["matches"][0]["artifact"]["purl"] == "pkg:generic/nginx@1.18.0"
+
+
+def test_dump_grype_json_service_with_no_findings_emits_no_match(db_path):
+    """grype-json is finding-centric (like SARIF / Jira)."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.9", None, "up")
+        db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "grype-json"))
+    assert doc["matches"] == []
+
+
+def test_dump_grype_json_actionability_filters_apply(db_path):
+    _seed_mixed_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "grype-json", kev_only=True))
+    ids = {m["vulnerability"]["id"] for m in doc["matches"]}
+    assert ids == {"CVE-HOT"}
+
+
+def test_dump_grype_json_sort_by_priority_orders_matches(db_path):
+    _seed_one_service_many_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "grype-json", sort_by_priority=True))
+    ids = [m["vulnerability"]["id"] for m in doc["matches"]]
+    assert ids == [
+        "CVE-2020-KEVHI",
+        "CVE-2020-KEVLO",
+        "CVE-2020-WARM",
+        "CVE-2020-COLD",
+    ]
+
+
+def test_dump_grype_json_tag_filter_scopes_matches(db_path):
+    conn = db.init_db(db_path)
+    try:
+        a1 = db.upsert_asset(conn, "10.10.0.5", "h1", "up")
+        s1 = db.upsert_service(conn, a1, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s1, "CVE-IN", "x", "7.0")
+        a2 = db.upsert_asset(conn, "10.10.0.6", "h2", "up")
+        s2 = db.upsert_service(conn, a2, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s2, "CVE-OUT", "x", "7.0")
+        conn.commit()
+    finally:
+        conn.close()
+    tags.add_tag(db_path, "10.10.0.5", "prod")
+    doc = json.loads(dump.dump(db_path, "grype-json", tag="prod"))
+    ids = {m["vulnerability"]["id"] for m in doc["matches"]}
+    assert ids == {"CVE-IN"}
+
+
+def test_dump_grype_json_output_is_byte_stable(db_path):
+    """Two emissions on the same DB produce byte-identical output."""
+    _seed_mixed_findings(db_path)
+    first = dump.dump(db_path, "grype-json")
+    second = dump.dump(db_path, "grype-json")
+    assert first == second
+
+
+def test_dump_grype_json_unscored_non_kev_is_negligible_when_zero(db_path):
+    """Edge: explicit zero severity (rare but possible) → Negligible bucket."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "h", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-ZERO", "x", "0.0")
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "grype-json"))
+    assert doc["matches"][0]["vulnerability"]["severity"] == "Negligible"

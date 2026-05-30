@@ -213,6 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
             "vex",
             "cdx-vex",
             "trivy-table",
+            "grype-json",
         ],
         help=(
             "output format: json (nested), csv or markdown (flat, one finding "
@@ -234,7 +235,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Trivy-style text-table report — one per-target section per "
             "discovered service, with Trivy's familiar Unicode-box-drawn table "
             "and 'Total: N (UNKNOWN: a, ...)' summary line, byte-recognisable "
-            "in a workflow already tuned for Trivy output)"
+            "in a workflow already tuned for Trivy output), or grype-json "
+            "(the Anchore-ecosystem counterpart — Grype's own '-o json' "
+            "shape: a top-level matches[] array of one vulnerability + "
+            "artifact + matchDetails per finding, byte-recognisable to the "
+            "Grype GitHub Action, Anchore Enterprise, Harbor, DefectDojo's "
+            "Grype parser, so an engagement's findings drop into either the "
+            "Trivy or the Grype CI pipeline without learning a new layout)"
         ),
     )
     p_dump.add_argument(
