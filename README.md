@@ -436,7 +436,7 @@ ossuary dump --db engagement-acme.db --format json > acme-state.json
 
 ### Export formats
 
-`dump` speaks eleven formats via `--format`:
+`dump` speaks twelve formats via `--format`:
 
 ```bash
 ossuary dump --db engagement-acme.db --format json         > acme-state.json
@@ -450,6 +450,7 @@ ossuary dump --db engagement-acme.db --format spdx         > acme-sbom.spdx.json
 ossuary dump --db engagement-acme.db --format vex          > acme-triage.openvex.json
 ossuary dump --db engagement-acme.db --format cdx-vex      > acme-triage.cdx-vex.json
 ossuary dump --db engagement-acme.db --format trivy-table  > acme-findings.trivy.txt
+ossuary dump --db engagement-acme.db --format grype-json   > acme-findings.grype.json
 ```
 
 - **`json`** (default) — the nested `assets → services → findings` structure,
@@ -559,6 +560,26 @@ ossuary dump --db engagement-acme.db --format trivy-table  > acme-findings.trivy
   **component-centric**: a service with no finding still emits a target
   section with `No vulnerabilities found` (Trivy's own wording), so the
   inventory is preserved.
+- **`grype-json`** — the **Anchore-ecosystem counterpart** to `trivy-table`:
+  [Grype](https://github.com/anchore/grype)'s own `-o json` output shape — a
+  top-level `matches` array with one entry per finding, each carrying a
+  `vulnerability` block (id / dataSource / severity / urls / description /
+  cvss[] / fix / advisories[]), a `matchDetails` block (the match method —
+  `cpe-match` when nmap supplied a CPE, otherwise `exact-direct-match`), and
+  an `artifact` block (the discovered service — name, version, `type=binary`,
+  `locations[]`, `cpes[]`, `purl`). **Byte-recognisable** to every Grype
+  consumer — the Grype GitHub Action, Anchore Enterprise, Harbor,
+  DefectDojo's Grype parser, dependency-track-Grype — so an engagement's
+  findings drop into the same downstream pipeline operators already tune for
+  Grype output. KEV (confirmed-exploited) rides as a **CISA-KEV advisory
+  entry** on the vulnerability (the slot Grype itself reserves for
+  vendor-extended advisory links); EPSS rides as an `ossuary.epss_score`
+  entry on the match's `properties` block. Severity bucketing uses Grype's
+  own title-case vocabulary (`Critical` / `High` / `Medium` / `Low` /
+  `Negligible` / `Unknown`) so downstream filters that key off severity
+  strings keep working. Like SARIF and Jira this is **finding-centric** (a
+  service with no finding produces no match); an empty engagement still
+  yields a valid document with an empty `matches` array.
 
 The `json`, `csv`, and `markdown` formats cover the same fields; CSV and
 Markdown flatten the JSON nesting into these columns: `ip, hostname,
@@ -611,7 +632,7 @@ Semantics:
 
 The flags **compose** (a finding must clear every threshold given) and combine
 with `--tag` (e.g. `--tag in-scope --kev-only`). They apply identically to
-`json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, and `trivy-table`. When a filter is active, services and assets left
+`json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, `trivy-table`, and `grype-json`. When a filter is active, services and assets left
 with no surviving findings are pruned, so the output collapses to a clean list
 of actionable hits. With no filter flags, `dump` returns the full inventory
 exactly as before (services with no findings still appear).

@@ -590,6 +590,58 @@ offline-tested.
 
 ---
 
+## Rank 20 — Grype `-o json` export (`dump --format grype-json`)  ✅ IMPLEMENTED
+
+> Shipped: `dump` gains `--format grype-json`, a twelfth export format
+> alongside json / csv / markdown / html / sarif / jira / cyclonedx / spdx /
+> vex / cdx-vex / trivy-table. It emits Grype (anchore/grype)'s own `-o json`
+> output shape — a top-level `matches` array (one entry per finding) carrying
+> a `vulnerability` block (id / dataSource / severity / urls / description /
+> cvss[] / fix / advisories[]), a `matchDetails` block (the match method —
+> `cpe-match` when nmap supplied a CPE, otherwise `exact-direct-match`), and
+> an `artifact` block (the discovered service — name, version, `type=binary`,
+> `locations[]`, `cpes[]`, `purl`). Byte-recognisable to every Grype consumer
+> — the Grype GitHub Action, Anchore Enterprise, Harbor, DefectDojo's Grype
+> parser, dependency-track-Grype. KEV rides as a CISA-KEV advisory entry on
+> the vulnerability; EPSS rides as a vendor-extension property on the match.
+> Severity bucketing uses Grype's own title-case vocabulary
+> (`Critical` / `High` / `Medium` / `Low` / `Negligible` / `Unknown`).
+> Rendering happens off the same `dump.build_state`, so the document respects
+> `--tag`, the R8 actionability filters, R9 `--sort-by-priority`, and `--vex`
+> suppression identically to every other format. An empty engagement still
+> yields a valid document with an empty `matches` array. Pure-Python
+> (`json`), no new dependencies, no schema change, no network calls, fully
+> offline-tested. +15 tests.
+
+**What:** R31 shipped `trivy-table` for the Trivy ecosystem — the terminal-
+facing layout every operator already running Trivy in CI recognises. The
+missing companion is the **Anchore-ecosystem counterpart**: Grype's `-o json`
+shape, the standard machine artifact every Grype-aware downstream consumer
+reads. Together they let an engagement's findings drop into either of the
+two de-facto-standard CLI vulnerability-scanner pipelines without learning a
+new layout — Trivy for terminal/CI viewing, Grype for the broader
+Anchore/Harbor/DefectDojo SBOM-and-policy pipeline.
+
+**Why now:** It closes the dump-format lineage at the other CI-scanner end.
+trivy-table addresses the Trivy operator surface; grype-json addresses the
+Grype operator surface — the two ecosystems most CI / supply-chain tooling
+integrates with today. Reusing `build_state` means it inherits every filter
+and ordering control for free, so it's a thin presentation layer over
+proven logic.
+
+**Pivot note (during implementation):** The original lap goal proposed
+`grype-json` or `depscan` as the next SBOM/vulnerability export format.
+Grype is more widely deployed in 2025–2026 CI than OWASP dep-scan (Anchore
+sits in the same de-facto-standard tier as Aquasecurity), so a single Grype
+emission unlocks a broader downstream pipeline than dep-scan would.
+Implementation went with `grype-json` accordingly.
+
+**Effort:** Small. A pure-Python serialiser over the existing nested state +
+one `--format` choice; no new dependencies, no schema change, fully
+offline-tested.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |
