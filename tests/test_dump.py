@@ -2231,3 +2231,221 @@ def test_dump_grype_json_unscored_non_kev_is_negligible_when_zero(db_path):
         conn.close()
     doc = json.loads(dump.dump(db_path, "grype-json"))
     assert doc["matches"][0]["vulnerability"]["severity"] == "Negligible"
+# OWASP Dependency-Check JSON report export (`--format dependency-check`)
+# --------------------------------------------------------------------------
+
+
+def test_dump_dependency_check_is_listed_as_supported_format():
+    assert "dependency-check" in dump.SUPPORTED_FORMATS
+
+
+def test_dump_dependency_check_empty_db_emits_valid_report(db_path):
+    db.init_db(db_path).close()
+    out = dump.dump(db_path, "dependency-check")
+    doc = json.loads(out)
+    # The canonical Dependency-Check top-level shape is present even when the
+    # engagement is empty — downstream parsers (DefectDojo et al.) key off
+    # `reportSchema` + `dependencies`, so an empty engagement must still emit
+    # a well-formed report rather than `{}` or no output.
+    assert doc["reportSchema"] == "1.1"
+    assert "scanInfo" in doc
+    assert "projectInfo" in doc
+    assert doc["dependencies"] == []
+
+
+def test_dump_dependency_check_emits_one_dependency_per_service(db_path):
+    _seed_mixed_findings(db_path)  # two services on one asset
+    doc = json.loads(dump.dump(db_path, "dependency-check"))
+    assert len(doc["dependencies"]) == 2
+    # Each dependency carries the synthetic ip:proto/port location as its
+    # fileName / filePath — the same identifier the SARIF / CycloneDX
+    # exports use, so downstream consumers de-dup consistently.
+    locations = {d["fileName"] for d in doc["dependencies"]}
+    assert "10.10.0.5:tcp/80" in locations
+    assert "10.10.0.5:tcp/22" in locations
+    for d in doc["dependencies"]:
+        assert d["fileName"] == d["filePath"]
+
+
+def test_dump_dependency_check_dependency_carries_evidence_and_package(db_path):
+    _seed_one_finding(db_path)
+    doc = json.loads(dump.dump(db_path, "dependency-check"))
+    dep = doc["dependencies"][0]
+    # `evidenceCollected` is the Dependency-Check field that records HOW
+    # the dependency was identified — we populate it from the nmap product
+    # / version so a triager can see the provenance.
+    ev = dep["evidenceCollected"]
+    product_vals = {e["value"] for e in ev["productEvidence"]}
+    version_vals = {e["value"] for e in ev["versionEvidence"]}
+    assert "nginx" in product_vals
+    assert "1.18.0" in version_vals
+    # A `packages[]` entry with a purl is the portable supply-chain identifier
+    # — pkg:generic for nmap-discovered software (the purl spec's escape
+    # hatch for non-language-ecosystem software).
+    assert dep["packages"][0]["id"].startswith("pkg:generic/nginx@1.18.0")
+
+
+def test_dump_dependency_check_vulnerability_carries_severity_and_cvss(db_path):
+    _seed_one_finding(db_path)  # CVE-2021-23017, CVSS 7.7
+    doc = json.loads(dump.dump(db_path, "dependency-check"))
+    vulns = doc["dependencies"][0]["vulnerabilities"]
+    assert len(vulns) == 1
+    v = vulns[0]
+    assert v["name"] == "CVE-2021-23017"
+    # Severity is bucketed into the upper-case Dependency-Check tier the
+    # downstream parsers expect — 7.7 -> HIGH.
+    assert v["severity"] == "HIGH"
+    # cvssv3 is the canonical Dependency-Check CVSS block; the score lands
+    # in baseScore and the bucket in baseSeverity.
+    assert v["cvssv3"]["baseScore"] == 7.7
+    assert v["cvssv3"]["baseSeverity"] == "HIGH"
+    # The CVE description rides through.
+    assert v["description"] == "off-by-one"
+    # And the NVD reference is auto-attached for CVE-* ids.
+    ref_urls = {r["url"] for r in v["references"]}
+    assert "https://nvd.nist.gov/vuln/detail/CVE-2021-23017" in ref_urls
+
+
+def test_dump_dependency_check_severity_buckets_map_cvss_correctly(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "h", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-CRIT", "x", "9.8")  # CRITICAL
+        db.upsert_finding(conn, sid, "CVE-HI",   "x", "7.5")  # HIGH
+        db.upsert_finding(conn, sid, "CVE-MED",  "x", "5.0")  # MEDIUM
+        db.upsert_finding(conn, sid, "CVE-LO",   "x", "2.0")  # LOW
+        db.upsert_finding(conn, sid, "CVE-UNK",  "x", "")     # UNKNOWN
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "dependency-check"))
+    by_name = {v["name"]: v["severity"] for v in doc["dependencies"][0]["vulnerabilities"]}
+    assert by_name == {
+        "CVE-CRIT": "CRITICAL",
+        "CVE-HI": "HIGH",
+        "CVE-MED": "MEDIUM",
+        "CVE-LO": "LOW",
+        "CVE-UNK": "UNKNOWN",
+    }
+
+
+def test_dump_dependency_check_kev_surfaces_as_reference_and_property(db_path):
+    _seed_mixed_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "dependency-check"))
+    # Find the HOT (KEV) finding across dependencies.
+    hot = None
+    for dep in doc["dependencies"]:
+        for v in dep.get("vulnerabilities", []):
+            if v["name"] == "CVE-HOT":
+                hot = v
+    assert hot is not None
+    # KEV rides as a clearly-labelled CISA-KEV reference (downstream
+    # parsers that don't read ossuary's `properties` map still see it).
+    ref_sources = {r["source"] for r in hot["references"]}
+    assert "CISA-KEV" in ref_sources
+    # And in the `properties` map (the CycloneDX convention).
+    props = {p["name"]: p["value"] for p in hot["properties"]}
+    assert props["ossuary:kev"] == "true"
+    assert props["ossuary:epss"] == "0.94"
+
+
+def test_dump_dependency_check_non_kev_finding_has_no_kev_reference(db_path):
+    _seed_mixed_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "dependency-check"))
+    cold = None
+    for dep in doc["dependencies"]:
+        for v in dep.get("vulnerabilities", []):
+            if v["name"] == "CVE-COLD":
+                cold = v
+    assert cold is not None
+    ref_sources = {r["source"] for r in cold.get("references", [])}
+    assert "CISA-KEV" not in ref_sources
+    props = {p["name"]: p["value"] for p in cold["properties"]}
+    assert props["ossuary:kev"] == "false"
+
+
+def test_dump_dependency_check_includes_cpe_in_vulnerable_software(db_path):
+    _seed_one_finding(db_path)  # service has cpe "cpe:/a:nginx"
+    doc = json.loads(dump.dump(db_path, "dependency-check"))
+    v = doc["dependencies"][0]["vulnerabilities"][0]
+    # `vulnerableSoftware[].software.id` is the Dependency-Check field for
+    # the affected CPE — DefectDojo's parser surfaces it as the matched
+    # component identifier.
+    assert v["vulnerableSoftware"][0]["software"]["id"] == "cpe:/a:nginx"
+
+
+def test_dump_dependency_check_service_without_findings_is_still_a_dependency(db_path):
+    """Component-centric: a service with no CVE matches still appears."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.9", None, "up")
+        db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "dependency-check"))
+    assert len(doc["dependencies"]) == 1
+    dep = doc["dependencies"][0]
+    assert dep["fileName"] == "10.10.0.9:tcp/22"
+    # No `vulnerabilities` key (or an empty list) — both are valid
+    # Dependency-Check shapes for a clean dependency.
+    assert not dep.get("vulnerabilities")
+
+
+def test_dump_dependency_check_actionability_filters_apply(db_path):
+    _seed_mixed_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "dependency-check", kev_only=True))
+    # Only the KEV (CVE-HOT) finding survives, so the cold and mid CVEs
+    # must not appear, and the service hosting only those (svc-22) is pruned.
+    all_cves = [v["name"] for dep in doc["dependencies"] for v in dep.get("vulnerabilities", [])]
+    assert all_cves == ["CVE-HOT"]
+    # svc-22 had only CVE-MID -> pruned; only one dependency remains.
+    assert len(doc["dependencies"]) == 1
+    assert doc["dependencies"][0]["fileName"] == "10.10.0.5:tcp/80"
+
+
+def test_dump_dependency_check_tag_filter_scopes_dependencies(db_path):
+    conn = db.init_db(db_path)
+    try:
+        a1 = db.upsert_asset(conn, "10.10.0.5", "h1", "up")
+        s1 = db.upsert_service(conn, a1, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s1, "CVE-IN", "x", "7.0")
+        a2 = db.upsert_asset(conn, "10.10.0.6", "h2", "up")
+        s2 = db.upsert_service(conn, a2, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s2, "CVE-OUT", "x", "7.0")
+        conn.commit()
+    finally:
+        conn.close()
+    tags.add_tag(db_path, "10.10.0.5", "prod")
+    doc = json.loads(dump.dump(db_path, "dependency-check", tag="prod"))
+    assert len(doc["dependencies"]) == 1
+    cves = [v["name"] for v in doc["dependencies"][0]["vulnerabilities"]]
+    assert cves == ["CVE-IN"]
+
+
+def test_dump_dependency_check_sort_by_priority_orders_vulnerabilities(db_path):
+    """KEV-first / descending-EPSS ordering propagates into the report."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "h", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-COLD", "x", "3.0", epss_score=0.01, kev=0)
+        db.upsert_finding(conn, sid, "CVE-HOT", "x", "9.0", epss_score=0.95, kev=1)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "dependency-check", sort_by_priority=True))
+    names = [v["name"] for v in doc["dependencies"][0]["vulnerabilities"]]
+    assert names == ["CVE-HOT", "CVE-COLD"]
+
+
+def test_dump_dependency_check_output_is_valid_json_and_byte_stable(db_path):
+    _seed_mixed_findings(db_path)
+    first = dump.dump(db_path, "dependency-check")
+    second = dump.dump(db_path, "dependency-check")
+    # Byte-stability is a contract the other formats meet; downstream
+    # diff-on-output workflows depend on it.
+    assert first == second
+    # And the output is well-formed JSON.
+    json.loads(first)

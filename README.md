@@ -60,7 +60,7 @@ ossuary web          list the recorded web-probe inventory (read companion to pr
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
-ossuary dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX/VEX/CDX-VEX/Trivy-table (filterable by KEV/EPSS/severity)
+ossuary dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX/VEX/CDX-VEX/Trivy-table/Dependency-Check (filterable by KEV/EPSS/severity)
 ossuary stats        print an at-a-glance engagement summary (counts + top hits)
 ossuary stale        flag findings not re-confirmed within N days (age staleness)
 ossuary diff         compare two engagement DBs -> new / resolved / persisting findings
@@ -451,6 +451,18 @@ ossuary dump --db engagement-acme.db --format vex          > acme-triage.openvex
 ossuary dump --db engagement-acme.db --format cdx-vex      > acme-triage.cdx-vex.json
 ossuary dump --db engagement-acme.db --format trivy-table  > acme-findings.trivy.txt
 ossuary dump --db engagement-acme.db --format grype-json   > acme-findings.grype.json
+ossuary dump --db engagement-acme.db --format json              > acme-state.json
+ossuary dump --db engagement-acme.db --format csv               > acme-findings.csv
+ossuary dump --db engagement-acme.db --format markdown          > acme-findings.md
+ossuary dump --db engagement-acme.db --format html              > acme-report.html
+ossuary dump --db engagement-acme.db --format sarif             > acme-findings.sarif
+ossuary dump --db engagement-acme.db --format jira              > acme-tickets.csv
+ossuary dump --db engagement-acme.db --format cyclonedx         > acme-sbom.cdx.json
+ossuary dump --db engagement-acme.db --format spdx              > acme-sbom.spdx.json
+ossuary dump --db engagement-acme.db --format vex               > acme-triage.openvex.json
+ossuary dump --db engagement-acme.db --format cdx-vex           > acme-triage.cdx-vex.json
+ossuary dump --db engagement-acme.db --format trivy-table       > acme-findings.trivy.txt
+ossuary dump --db engagement-acme.db --format dependency-check  > acme-dependency-check-report.json
 ```
 
 - **`json`** (default) — the nested `assets → services → findings` structure,
@@ -580,6 +592,31 @@ ossuary dump --db engagement-acme.db --format grype-json   > acme-findings.grype
   strings keep working. Like SARIF and Jira this is **finding-centric** (a
   service with no finding produces no match); an empty engagement still
   yields a valid document with an empty `matches` array.
+- **`dependency-check`** — an **OWASP Dependency-Check JSON report**
+  (`dependency-check-report.json`) with the native top-level `reportSchema`
+  / `scanInfo` / `projectInfo` / `dependencies[]` shape Dependency-Check
+  itself produces. One `dependency` is emitted per discovered service
+  (its `fileName` / `filePath` is the same `ip:proto/port` location the
+  SARIF / CycloneDX exports use, with the nmap-derived product / version
+  carried in `evidenceCollected` and a `purl` package identifier in
+  `packages[]`), and each matched CVE becomes a `vulnerability` on that
+  dependency, carrying the upper-case `severity` bucket, a `cvssv3` base
+  score block, the CVE `description`, an NVD `reference`, and the
+  matched CPE in `vulnerableSoftware`. This is the artifact
+  [DefectDojo](https://www.defectdojo.org/)'s `Dependency Check Scan`
+  parser, the [Jenkins Dependency-Check
+  plugin](https://plugins.jenkins.io/dependency-check-jenkins-plugin/),
+  SonarQube's dependency-check plugin, and GitLab's dependency-check
+  converter all ingest **by name** — distinct from CycloneDX / SARIF
+  because each of those consumers keys off the Dependency-Check report
+  shape specifically rather than translating from another SBOM /
+  scan-result format. KEV (CISA's Known Exploited Vulnerabilities
+  catalog) and EPSS — fields the upstream schema doesn't carry — ride
+  as a clearly-labelled `CISA-KEV` reference and in a CycloneDX-style
+  `properties` map on each vulnerability, so parsers that ignore unknown
+  fields still get the full Dependency-Check shape. Like the SBOM
+  exports it is **component-centric**: a service with no finding still
+  appears as a dependency.
 
 The `json`, `csv`, and `markdown` formats cover the same fields; CSV and
 Markdown flatten the JSON nesting into these columns: `ip, hostname,
@@ -633,6 +670,7 @@ Semantics:
 The flags **compose** (a finding must clear every threshold given) and combine
 with `--tag` (e.g. `--tag in-scope --kev-only`). They apply identically to
 `json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, `trivy-table`, and `grype-json`. When a filter is active, services and assets left
+`json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, `trivy-table`, and `dependency-check`. When a filter is active, services and assets left
 with no surviving findings are pruned, so the output collapses to a clean list
 of actionable hits. With no filter flags, `dump` returns the full inventory
 exactly as before (services with no findings still appear).
@@ -658,7 +696,7 @@ ossuary dump --db engagement-acme.db --kev-only --sort-by-priority
 
 Findings with no EPSS score or a blank/non-numeric severity sink to the bottom
 of their tier rather than being dropped (use the filters above to drop them).
-The flag applies identically to `json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, and `trivy-table`, and composes with
+The flag applies identically to `json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, `trivy-table`, and `dependency-check`, and composes with
 `--tag` and the actionability filters. Without it, ordering is the historical
 alphabetical-by-CVE-id, byte-for-byte unchanged.
 
@@ -687,7 +725,7 @@ Dates may be a bare `YYYY-MM-DD` or a full `'YYYY-MM-DD HH:MM:SS'`. A bare-date
 survives `--until 2026-05-29`). A finding with no recorded `matched_at` is
 excluded once either bound is set, and services / assets left with no surviving
 findings are pruned — exactly like the actionability filters. The window applies
-identically to `json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, and `trivy-table`, and composes with
+identically to `json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, `trivy-table`, and `dependency-check`, and composes with
 `--tag`, the actionability filters, and `--sort-by-priority`. With neither bound
 set, the export is unchanged.
 
@@ -739,7 +777,7 @@ Suppression semantics:
 
 Suppression composes with `--tag`, the actionability filters, `--since/--until`,
 and `--sort-by-priority`, and applies identically to `json`, `csv`, `markdown`,
-`html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, and `cdx-vex`; services / assets left with no surviving finding are
+`html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, `trivy-table`, and `dependency-check`; services / assets left with no surviving finding are
 pruned. With no `--vex`, the export is unchanged. A missing or malformed VEX file
 fails loudly with a clear error.
 

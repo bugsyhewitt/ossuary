@@ -94,6 +94,21 @@ findings) to one of four shapes:
                    emitted shape round-trips through ``ossuary.vex.parse``. Like
                    the other formats it reads off ``build_state``, so it honours
                    the same filters and priority order.
+  * ``dependency-check`` — an OWASP Dependency-Check JSON report
+                   (``dependency-check-report.json``), one ``dependency``
+                   per discovered service and one ``vulnerability`` per
+                   matched CVE. The native artifact DefectDojo's
+                   ``Dependency Check Scan`` parser, the Jenkins
+                   Dependency-Check plugin, SonarQube's dependency-check
+                   plugin, and GitLab's dependency-check converter all
+                   ingest by name — distinct from CycloneDX / SARIF
+                   because each of those consumers keys off the
+                   Dependency-Check report shape specifically. KEV / EPSS
+                   ride as a labelled CISA-KEV reference and in a
+                   ``properties`` map per vulnerability, so unknown-field-
+                   ignoring parsers still get the full shape. Like the
+                   SBOM exports it is component-centric: a service with no
+                   finding still appears as a dependency.
   * ``jira``     — an issue-tracker import CSV: one row per finding, shaped as a
                    ticket (``Summary`` title, rich ``Description``, mapped
                    ``Priority``, ``Labels``) rather than the raw inventory the
@@ -161,6 +176,7 @@ SUPPORTED_FORMATS = (
     "cdx-vex",
     "trivy-table",
     "grype-json",
+    "dependency-check",
 )
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
@@ -1984,6 +2000,288 @@ def to_grype_json(state: dict) -> str:
         },
     }
     return json.dumps(document, indent=2, sort_keys=False)
+# OWASP Dependency-Check JSON report export (`--format dependency-check`)
+# --------------------------------------------------------------------------
+#
+# OWASP Dependency-Check (https://owasp.org/www-project-dependency-check/) is
+# one of the most widely deployed SCA scanners in 2025 enterprise pipelines.
+# Its native JSON report (``dependency-check-report.json``) is parsed by a long
+# list of downstream consumers — DefectDojo's `Dependency Check Scan` parser,
+# the Jenkins Dependency-Check plugin, SonarQube's dependency-check plugin,
+# the GitLab DAST/SAST converter, and assorted vulnerability-management
+# dashboards. Each of these tools keys off the Dependency-Check report shape
+# specifically; a CycloneDX SBOM or SARIF document does NOT round-trip into
+# them without translation.
+#
+# ossuary scans a different surface (network services rather than language
+# manifests / jars), but the data shape lines up: a "dependency" is a
+# discovered service (host:port + product), and each "vulnerability" on that
+# dependency is a matched CVE. Emitting the report in Dependency-Check's
+# native JSON shape lets a hunter drop an engagement's findings into a
+# triage workflow already tuned for Dependency-Check output without
+# learning a new layout or running a translation step.
+#
+# We emit the JSON form (the modern Dependency-Check report — XML is a
+# legacy serialisation of the same data). The schema fields we populate
+# mirror those Dependency-Check itself emits and DefectDojo's parser reads:
+#   * top-level ``reportSchema``, ``scanInfo``, ``projectInfo``
+#   * a ``dependencies[]`` array, one entry per discovered service
+#   * each dependency carrying ``fileName`` / ``filePath`` (a synthetic
+#     ``ip:proto/port`` location), ``description``, ``evidenceCollected``,
+#     ``packages`` (a purl identifier where derivable), and a
+#     ``vulnerabilities[]`` array.
+#   * each vulnerability carrying ``source``, ``name`` (the CVE id),
+#     ``severity`` (upper-case bucket), ``cvssv3`` (when a numeric score is
+#     present), ``description``, ``references``, and ``vulnerableSoftware``
+#     (the CPE, when known).
+# KEV (CISA's Known Exploited Vulnerabilities catalog) and EPSS are
+# ossuary-specific live signals the upstream schema doesn't carry; we
+# surface them through references (a clearly-labelled KEV reference) and
+# a CycloneDX/SARIF-style ``properties`` map on each vulnerability,
+# preserving the data without breaking parsers that ignore unknown fields.
+
+# Dependency-Check buckets numeric CVSS into the same upper-case tiers Trivy
+# uses (CRITICAL / HIGH / MEDIUM / LOW / UNKNOWN). Mirror the same tiering
+# the rest of the module uses so a hunter reads one consistent severity
+# taxonomy across every surface.
+def _depcheck_severity(value) -> str:
+    """Map a finding's severity to a Dependency-Check upper-case label."""
+    sev = _parse_severity(value)
+    if sev is None:
+        return "UNKNOWN"
+    if sev >= 9.0:
+        return "CRITICAL"
+    if sev >= 7.0:
+        return "HIGH"
+    if sev >= 4.0:
+        return "MEDIUM"
+    if sev > 0.0:
+        return "LOW"
+    return "UNKNOWN"
+
+
+def _depcheck_dependency(asset: dict, svc: dict) -> dict:
+    """Build one Dependency-Check ``dependency`` entry for a discovered service.
+
+    The "dependency" abstraction in the schema is a scanned artifact (a jar /
+    npm package / etc.). ossuary's equivalent is a discovered service: each
+    fingerprinted host:port becomes one dependency. ``fileName`` and
+    ``filePath`` use a synthetic ``ip:proto/port`` location so each entry has
+    a unique, stable identifier the downstream consumers can de-duplicate on
+    — the same identifier the SARIF / CycloneDX exports use for the service.
+    ``evidenceCollected`` carries the nmap-derived product / version
+    evidence the dependency was identified from, and ``packages[]`` carries
+    a portable purl identifier where the product is known.
+    """
+    ip = asset["ip"]
+    host = asset.get("hostname")
+    port = svc["port"]
+    protocol = svc["protocol"]
+    product = svc.get("product")
+    version = svc.get("version")
+    cpe = svc.get("cpe")
+    name = svc.get("name")
+
+    location = f"{ip}:{protocol}/{port}"
+    host_label = f"{ip} ({host})" if host else ip
+    svc_detail = " ".join(p for p in (product, version) if p)
+    description = (
+        f"Network service on {host_label} at {protocol}/{port}"
+        + (f" ({svc_detail})" if svc_detail else "")
+    )
+
+    evidence: dict = {
+        "vendorEvidence": [],
+        "productEvidence": [],
+        "versionEvidence": [],
+    }
+    if product:
+        evidence["productEvidence"].append(
+            {
+                "type": "product",
+                "source": "nmap",
+                "name": "product",
+                "value": str(product),
+                "confidence": "HIGH",
+            }
+        )
+    if version:
+        evidence["versionEvidence"].append(
+            {
+                "type": "version",
+                "source": "nmap",
+                "name": "version",
+                "value": str(version),
+                "confidence": "HIGH",
+            }
+        )
+    if name:
+        evidence["productEvidence"].append(
+            {
+                "type": "product",
+                "source": "nmap",
+                "name": "service",
+                "value": str(name),
+                "confidence": "MEDIUM",
+            }
+        )
+
+    dep: dict = {
+        "fileName": location,
+        "filePath": location,
+        "description": description,
+        "evidenceCollected": evidence,
+    }
+    # Dependency-Check writes an md5 / sha1 / sha256 of the scanned file. We
+    # synthesise a stable identifier from the location string instead of
+    # hashing nothing — this gives consumers a unique key per dependency
+    # while staying clearly synthetic (it's the same string as `fileName`,
+    # not a fake digest of bytes we never scanned).
+    dep["fileSyntheticId"] = location
+
+    purl = _purl(product, version)
+    if purl or cpe:
+        pkg: dict = {"confidence": "HIGH" if product else "LOW"}
+        if purl:
+            pkg["id"] = purl
+        if cpe:
+            pkg["url"] = (
+                "https://nvd.nist.gov/vuln/search/results"
+                f"?cpe_version={quote(str(cpe), safe='')}"
+            )
+        dep["packages"] = [pkg]
+
+    vulns_out: list[dict] = []
+    for f in svc["findings"]:
+        vulns_out.append(_depcheck_vulnerability(f, cpe))
+    if vulns_out:
+        dep["vulnerabilities"] = vulns_out
+    return dep
+
+
+def _depcheck_vulnerability(finding: dict, cpe) -> dict:
+    """Build one Dependency-Check ``vulnerability`` entry for a finding.
+
+    Populates the schema fields downstream parsers (DefectDojo, the Jenkins
+    Dependency-Check plugin) read: ``source`` (where the CVE came from),
+    ``name`` (the CVE id), ``severity`` (upper-case bucket), ``cvssv3``
+    (when a numeric score is present), ``description``, ``references``, and
+    ``vulnerableSoftware`` (the CPE, when known). ossuary's live KEV / EPSS
+    signal — fields the upstream schema doesn't carry — rides as a clearly-
+    labelled CISA-KEV reference and in a ``properties`` map, so parsers
+    that ignore unknown fields still get the full Dependency-Check shape.
+    """
+    cve_id = finding.get("cve_id") or "UNKNOWN"
+    summary = finding.get("summary") or ""
+    sev = _parse_severity(finding.get("severity"))
+    severity_label = _depcheck_severity(finding.get("severity"))
+    source_name = (finding.get("source") or "OSV").upper()
+
+    vuln: dict = {
+        "source": source_name,
+        "name": cve_id,
+        "severity": severity_label,
+        "description": summary,
+    }
+    if sev is not None:
+        # Dependency-Check's `cvssv3` field carries the CVSS v3 base score
+        # block. We don't know the upstream vector, so populate the score +
+        # the bucket (the two fields DefectDojo's parser actually reads).
+        vuln["cvssv3"] = {
+            "baseScore": sev,
+            "baseSeverity": severity_label,
+        }
+
+    references: list[dict] = []
+    if cve_id.upper().startswith("CVE-"):
+        references.append(
+            {
+                "source": "NVD",
+                "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+                "name": cve_id,
+            }
+        )
+    if finding.get("kev"):
+        # Surface the CISA KEV signal through a clearly-labelled reference;
+        # the upstream Dependency-Check schema has no first-class KEV field.
+        references.append(
+            {
+                "source": "CISA-KEV",
+                "url": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+                "name": "CISA Known Exploited Vulnerabilities",
+            }
+        )
+    if references:
+        vuln["references"] = references
+
+    if cpe:
+        vuln["vulnerableSoftware"] = [
+            {"software": {"id": str(cpe), "vulnerabilityIdMatched": "true"}}
+        ]
+
+    # Carry the live ossuary signal as `properties` (the same convention the
+    # CycloneDX export uses). Downstream parsers that don't read this field
+    # still get the full Dependency-Check shape; those that do can surface
+    # the KEV / EPSS axes.
+    props: list[dict] = [
+        {"name": "ossuary:kev", "value": "true" if finding.get("kev") else "false"},
+    ]
+    if finding.get("epss_score") is not None:
+        props.append({"name": "ossuary:epss", "value": f"{finding['epss_score']}"})
+    if finding.get("exploit"):
+        props.append({"name": "ossuary:exploit", "value": "true"})
+    if finding.get("matched_at"):
+        props.append(
+            {"name": "ossuary:matched_at", "value": str(finding["matched_at"])}
+        )
+    vuln["properties"] = props
+    return vuln
+
+
+def to_dependency_check(state: dict) -> str:
+    """Serialise the engagement state as an OWASP Dependency-Check JSON report.
+
+    Emits a ``reportSchema: "1.1"`` JSON document with the top-level
+    ``scanInfo`` / ``projectInfo`` / ``dependencies`` shape Dependency-Check
+    itself produces and DefectDojo / the Jenkins Dependency-Check plugin /
+    SonarQube / GitLab's dependency-check converter all parse natively. One
+    ``dependency`` is emitted per discovered service (component-centric, like
+    the SBOM exports — a service with no findings still appears as a
+    dependency with an empty / absent ``vulnerabilities`` array), and one
+    ``vulnerability`` per matched CVE. CVSS severity rides in ``cvssv3`` and
+    the upper-case ``severity`` bucket. KEV / EPSS — fields the upstream
+    schema doesn't carry — ride as a labelled CISA-KEV reference and in a
+    ``properties`` map on each vulnerability, so parsers that ignore unknown
+    fields still get the full Dependency-Check shape. An empty engagement
+    still yields a valid document with an empty ``dependencies`` array.
+    """
+    dependencies = []
+    for asset in state["assets"]:
+        for svc in asset["services"]:
+            dependencies.append(_depcheck_dependency(asset, svc))
+
+    report = {
+        "reportSchema": "1.1",
+        "scanInfo": {
+            "engineVersion": __version__,
+            "dataSource": [
+                {"name": "OSV", "timestamp": ""},
+                {"name": "NVD", "timestamp": ""},
+                {"name": "CISA KEV", "timestamp": ""},
+            ],
+        },
+        "projectInfo": {
+            "name": "ossuary engagement",
+            "reportDate": "",
+            "credits": {
+                "OSV": "https://osv.dev/",
+                "NVD": "https://nvd.nist.gov/",
+                "CISA KEV": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+            },
+        },
+        "dependencies": dependencies,
+    }
+    return json.dumps(report, indent=2, sort_keys=False)
 
 
 def dump(
@@ -2024,6 +2322,11 @@ def dump(
     Anchore Enterprise, Harbor, DefectDojo's Grype parser — so an
     engagement's findings drop into either the Trivy or the Grype CI
     workflow without learning a new layout).
+    output), or ``dependency-check`` (an OWASP Dependency-Check JSON report —
+    one ``dependency`` per discovered service and one ``vulnerability`` per
+    matched CVE, ingestible by DefectDojo's ``Dependency Check Scan`` parser,
+    the Jenkins Dependency-Check plugin, SonarQube's dependency-check plugin,
+    and GitLab's dependency-check converter).
     `tag`, when set,
     restricts the export to assets carrying that tag label. `min_epss`,
     `min_severity`, and `kev_only` are actionability filters: each restricts the
@@ -2082,4 +2385,6 @@ def dump(
         return to_trivy_table(state)
     if fmt == "grype-json":
         return to_grype_json(state)
+    if fmt == "dependency-check":
+        return to_dependency_check(state)
     return json.dumps(state, indent=2, sort_keys=False)
