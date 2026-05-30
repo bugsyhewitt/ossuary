@@ -538,6 +538,45 @@ def test_cli_dump_spdx_format(tmp_path, monkeypatch, capsys):
     assert doc["relationships"][0]["relatedSpdxElement"] == pkg["SPDXID"]
 
 
+def test_cli_dump_trivy_table_format(tmp_path, monkeypatch, capsys):
+    """The CLI exposes `--format trivy-table` and emits Trivy's familiar shape."""
+    import sqlite3
+
+    db_file = str(tmp_path / "engagement-test.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute(
+            "INSERT INTO assets (id, ip, hostname, state) "
+            "VALUES (1, '10.10.0.5', 'host-a', 'up')"
+        )
+        conn.execute(
+            "INSERT INTO services (id, asset_id, port, protocol, name, product, "
+            "version, cpe) VALUES (1, 1, 80, 'tcp', 'http', 'nginx', '1.18.0', "
+            "'cpe:/a:nginx')"
+        )
+        conn.execute(
+            "INSERT INTO findings (service_id, cve_id, summary, severity, epss_score, "
+            "kev) VALUES (1, 'CVE-2021-23017', 'off-by-one', '7.7', 0.5, 1)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    rc = cli.main(["dump", "--db", db_file, "--format", "trivy-table"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Target header reads as host (ip):port/proto (product version).
+    assert "host-a (10.10.0.5):80/tcp (nginx 1.18.0)" in out
+    # Trivy's per-target summary line lands in the output.
+    assert "Total: 1 (UNKNOWN: 0, LOW: 0, MEDIUM: 0, HIGH: 1, CRITICAL: 0)" in out
+    # The KEV signal rides as an inline marker in the Title cell.
+    assert "[KEV]" in out
+    # Trivy's box-drawing glyphs render the table.
+    assert "│" in out and "─" in out
+
+
 def test_cli_dump_sort_by_priority(tmp_path, monkeypatch, capsys):
     import sqlite3
 

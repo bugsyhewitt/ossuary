@@ -8,7 +8,7 @@ Subcommands (v0.1):
     match-cves   query OSV.dev for service versions -> findings table
     cruise       re-fingerprint, diff against last state, report changes
     watch        run cruise on an interval, emitting a diff summary each pass
-    dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX/VEX
+    dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX/VEX/Trivy-table
     web          list the recorded web-probe inventory (read companion to probe)
     stats        print a top-of-funnel engagement summary (counts + top hits)
     stale        flag findings not re-confirmed within N days (age staleness)
@@ -212,6 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
             "spdx",
             "vex",
             "cdx-vex",
+            "trivy-table",
         ],
         help=(
             "output format: json (nested), csv or markdown (flat, one finding "
@@ -224,12 +225,16 @@ def build_parser() -> argparse.ArgumentParser:
             "CycloneDX — one package per service with a SECURITY external "
             "reference per matched CVE), vex (a standalone OpenVEX document, "
             "one 'affected' statement per finding — the editable triage worksheet "
-            "you flip to not_affected / fixed and feed back in via --vex), or "
+            "you flip to not_affected / fixed and feed back in via --vex), "
             "cdx-vex (a CycloneDX 1.5 VEX document — the CycloneDX-native "
             "counterpart to OpenVEX, with an analysis.state of 'in_triage' on "
             "every vulnerability for a hunter to edit down to not_affected / "
             "false_positive / resolved before shipping into a Dependency-Track "
-            "/ Anchore / CycloneDX-consuming pipeline)"
+            "/ Anchore / CycloneDX-consuming pipeline), or trivy-table (a "
+            "Trivy-style text-table report — one per-target section per "
+            "discovered service, with Trivy's familiar Unicode-box-drawn table "
+            "and 'Total: N (UNKNOWN: a, ...)' summary line, byte-recognisable "
+            "in a workflow already tuned for Trivy output)"
         ),
     )
     p_dump.add_argument(

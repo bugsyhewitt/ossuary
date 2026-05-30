@@ -54,6 +54,18 @@ findings) to one of four shapes:
                    matched-vulnerability inventory into an SPDX pipeline. Like
                    the other formats it reads off ``build_state``, so it honours
                    the same filters and priority order.
+  * ``trivy-table`` — a Trivy-style text-table report (aquasecurity/trivy's
+                   wire-format output): one per-target section per discovered
+                   service, with Trivy's familiar Unicode-box-drawn table,
+                   upper-case severity bucketing, and ``Total: N (UNKNOWN: a,
+                   LOW: b, MEDIUM: c, HIGH: d, CRITICAL: e)`` summary line.
+                   Byte-recognisable in a workflow already tuned for Trivy
+                   output (terminal viewing, log scraping, CI annotation).
+                   KEV / EPSS ride as inline ``[KEV]`` / ``[EPSS=0.95]``
+                   markers in the Title cell rather than as extra columns
+                   that would break the recognisable layout. Like the other
+                   formats it reads off ``build_state``, so it honours the
+                   same filters and priority order.
   * ``vex``      — a standalone OpenVEX (Vulnerability Exploitability eXchange)
                    JSON document. One ``statement`` per finding declares the
                    matched ``vulnerability`` (the CVE) ``affected`` on the
@@ -131,6 +143,7 @@ SUPPORTED_FORMATS = (
     "spdx",
     "vex",
     "cdx-vex",
+    "trivy-table",
 )
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
@@ -1424,6 +1437,228 @@ def to_cdx_vex(state: dict) -> str:
     return json.dumps(bom, indent=2, sort_keys=False)
 
 
+# --------------------------------------------------------------------------
+# Trivy-style table export (`--format trivy-table`)
+# --------------------------------------------------------------------------
+#
+# Trivy (aquasecurity/trivy) is the de-facto-standard CLI vulnerability
+# scanner in 2025-2026 CI pipelines, and its classic text-table output is the
+# shape every SRE / AppSec engineer recognises at a glance. ossuary scans a
+# different surface (network services rather than container layers / language
+# manifests) but the data shape lines up: a "Target" is a discovered service
+# (host:port + product), a "Library" is the product, a "Vulnerability" is the
+# CVE, a "Severity" is the CVSS tier. Emitting in this familiar shape lets a
+# hunter drop an engagement's findings into a workflow already tuned for
+# Trivy output (terminal viewing, log scraping, CI annotation) without
+# learning a new layout.
+#
+# We deliberately use Trivy's actual rendering — Unicode box-drawing
+# (┌─┬─┐ │ ├─┼─┤ └─┴─┘), the per-target header + summary line, severity in
+# upper-case, columns aligned to the widest cell — so the output is
+# byte-recognisable, not a "looks-vaguely-like-Trivy" approximation. Pure
+# Python text formatting, no new dependencies, reads off ``build_state`` so
+# the same actionability filters / priority ordering / VEX suppression apply
+# identically to every other format.
+#
+# KEV (CISA's Known Exploited Vulnerabilities catalog) and EPSS are
+# ossuary-specific live-signal columns that Trivy's table doesn't carry; we
+# fold them into the Title cell (``[KEV]`` prefix, ``[EPSS=0.95]`` suffix)
+# rather than adding a sixth column that would break the recognisability.
+# Trivy itself does the same kind of inline marker for its own status tags.
+
+_TRIVY_COLUMNS = (
+    "Library",
+    "Vulnerability",
+    "Severity",
+    "Installed Version",
+    "Fixed Version",
+    "Title",
+)
+
+# Severity tiers, ordered the way Trivy summarises them
+# (Total: N (UNKNOWN: a, LOW: b, MEDIUM: c, HIGH: d, CRITICAL: e)). Lower-case
+# keys mirror the tiering the rest of the module uses (CycloneDX / stats /
+# HTML); the printed labels are upper-case to match Trivy's wire format.
+_TRIVY_SEVERITY_ORDER = ("UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL")
+
+
+def _trivy_severity(value) -> str:
+    """Map a finding's severity to a Trivy upper-case severity label.
+
+    Uses the same numeric tiering the rest of ossuary triages on
+    (``stats`` / HTML / CycloneDX) so a hunter reads one consistent severity
+    taxonomy across every surface; a blank / non-numeric score (common
+    post-NIST-retreat) is reported as ``UNKNOWN`` — the bucket Trivy itself
+    uses for an un-scored advisory — rather than silently dropped.
+    """
+    sev = _parse_severity(value)
+    if sev is None:
+        return "UNKNOWN"
+    if sev >= 9.0:
+        return "CRITICAL"
+    if sev >= 7.0:
+        return "HIGH"
+    if sev >= 4.0:
+        return "MEDIUM"
+    if sev > 0.0:
+        return "LOW"
+    return "UNKNOWN"
+
+
+def _trivy_title(finding: dict) -> str:
+    """Render the Title cell for a finding.
+
+    Trivy's Title column carries the vulnerability's free-text summary. We
+    additionally fold ossuary's live-signal columns (KEV / EPSS) into the
+    cell as inline markers — Trivy itself uses the same kind of inline tag
+    for its own status fields, so the convention is recognisable. KEV
+    (confirmed-exploited) leads as a ``[KEV]`` prefix; EPSS exploit-
+    probability rides as an ``[EPSS=0.95]`` suffix when known. An empty
+    summary collapses to the markers alone, or to an empty string when
+    neither marker fires.
+    """
+    parts: list[str] = []
+    if finding.get("kev"):
+        parts.append("[KEV]")
+    summary = finding.get("summary") or ""
+    if summary:
+        parts.append(str(summary))
+    epss = finding.get("epss_score")
+    if isinstance(epss, (int, float)):
+        parts.append(f"[EPSS={epss:.2f}]")
+    return " ".join(parts)
+
+
+def _trivy_targets(state: dict) -> list[dict]:
+    """Group findings into Trivy-style targets — one per discovered service.
+
+    A Trivy "target" is the scanned artifact (an image, a manifest, a
+    filesystem path). ossuary's equivalent is the discovered service: each
+    host:port + product becomes one target. The target label mirrors how a
+    hunter reads the inventory — ``<host> (<ip>):<port>/<protocol>
+    (<product> <version>)`` — so the same identifier from a Trivy run is
+    immediately legible here. Targets follow the same per-host / per-service
+    walk every other format uses, so any requested priority ordering is
+    preserved.
+    """
+    targets: list[dict] = []
+    for asset in state["assets"]:
+        ip = asset["ip"]
+        host = asset.get("hostname")
+        host_label = f"{host} ({ip})" if host else ip
+        for svc in asset["services"]:
+            port = svc["port"]
+            protocol = svc["protocol"]
+            product = svc.get("product")
+            version = svc.get("version")
+            svc_detail = " ".join(p for p in (product, version) if p)
+            target_label = f"{host_label}:{port}/{protocol}" + (
+                f" ({svc_detail})" if svc_detail else ""
+            )
+            rows: list[dict] = []
+            for f in svc["findings"]:
+                rows.append(
+                    {
+                        "Library": (product or svc.get("name") or f"{protocol}/{port}"),
+                        "Vulnerability": f.get("cve_id") or "UNKNOWN",
+                        "Severity": _trivy_severity(f.get("severity")),
+                        "Installed Version": (version or ""),
+                        # ossuary doesn't track patched-in versions yet; leave
+                        # the column present (Trivy always renders it) but
+                        # blank, the same way Trivy does for "no fix
+                        # available" advisories.
+                        "Fixed Version": "",
+                        "Title": _trivy_title(f),
+                    }
+                )
+            targets.append({"label": target_label, "rows": rows})
+    return targets
+
+
+def _trivy_summary_line(rows: list[dict]) -> str:
+    """Render Trivy's per-target summary line (``Total: N (UNKNOWN: a, ...)``)."""
+    counts = {tier: 0 for tier in _TRIVY_SEVERITY_ORDER}
+    for row in rows:
+        counts[row["Severity"]] += 1
+    breakdown = ", ".join(f"{tier}: {counts[tier]}" for tier in _TRIVY_SEVERITY_ORDER)
+    return f"Total: {len(rows)} ({breakdown})"
+
+
+def _trivy_render_table(rows: list[dict]) -> list[str]:
+    """Render a single target's rows as a Trivy-style box-drawn table.
+
+    Column widths are sized to the widest cell (including the header) so
+    the table renders aligned without word-wrap. Trivy uses Unicode
+    box-drawing glyphs (``┌─┬─┐ │ ├─┼─┤ └─┴─┘``); we mirror that exactly
+    so the output is byte-recognisable from a real Trivy run.
+    """
+    columns = list(_TRIVY_COLUMNS)
+    widths = {col: len(col) for col in columns}
+    for row in rows:
+        for col in columns:
+            widths[col] = max(widths[col], len(str(row[col])))
+
+    def hline(left: str, mid: str, right: str) -> str:
+        return (
+            left
+            + mid.join("─" * (widths[col] + 2) for col in columns)
+            + right
+        )
+
+    def data_line(values: list[str]) -> str:
+        cells = [f" {values[i].ljust(widths[columns[i]])} " for i in range(len(columns))]
+        return "│" + "│".join(cells) + "│"
+
+    return [
+        hline("┌", "┬", "┐"),
+        data_line(columns),
+        hline("├", "┼", "┤"),
+        *(data_line([str(row[col]) for col in columns]) for row in rows),
+        hline("└", "┴", "┘"),
+    ]
+
+
+def to_trivy_table(state: dict) -> str:
+    """Serialise the engagement state as a Trivy-style text-table report.
+
+    Emits one per-target section per discovered service: a target header line
+    (``<host> (<ip>):<port>/<protocol> (<product> <version>)``), a Trivy
+    summary line (``Total: N (UNKNOWN: a, LOW: b, MEDIUM: c, HIGH: d,
+    CRITICAL: e)``), and a Unicode-box-drawn table of the findings on that
+    service — the exact shape ``trivy image`` / ``trivy fs`` print, so the
+    output is byte-recognisable in a workflow already tuned for Trivy. KEV
+    and EPSS ride as inline ``[KEV]`` / ``[EPSS=0.95]`` markers in the Title
+    cell (Trivy's own convention for inline status tags) rather than as
+    extra columns that would break the recognisable layout.
+
+    Targets with no findings emit just the header + ``No vulnerabilities
+    found`` (Trivy's own wording). An empty engagement still yields a valid
+    single-line report.
+    """
+    targets = _trivy_targets(state)
+    if not targets:
+        # Trivy itself prints a brief "no input" line when given nothing;
+        # mirror that so an empty DB produces a well-formed, non-empty
+        # artifact rather than silence.
+        return "ossuary: no targets in engagement\n"
+
+    parts: list[str] = []
+    for i, target in enumerate(targets):
+        if i:
+            parts.append("")  # blank line between targets
+        parts.append(target["label"])
+        parts.append("=" * len(target["label"]))
+        if not target["rows"]:
+            parts.append("Total: 0 (UNKNOWN: 0, LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0)")
+            parts.append("")
+            parts.append("No vulnerabilities found")
+            continue
+        parts.append(_trivy_summary_line(target["rows"]))
+        parts.append("")
+        parts.extend(_trivy_render_table(target["rows"]))
+    return "\n".join(parts) + "\n"
+
+
 def dump(
     db_path: str | Path,
     fmt: str = "json",
@@ -1451,7 +1686,11 @@ def dump(
     to OpenVEX, with an ``analysis.state`` of ``in_triage`` on every
     vulnerability for a hunter to edit down to ``not_affected`` /
     ``false_positive`` / ``resolved``, ready to ship into a Dependency-Track /
-    Anchore / CycloneDX-consuming pipeline).
+    Anchore / CycloneDX-consuming pipeline), or ``trivy-table`` (a Trivy-style
+    text-table report — one per-target section per discovered service, with
+    Trivy's familiar Unicode-box-drawn table and ``Total: N (UNKNOWN: a, ...)``
+    summary line, byte-recognisable in a workflow already tuned for Trivy
+    output).
     `tag`, when set,
     restricts the export to assets carrying that tag label. `min_epss`,
     `min_severity`, and `kev_only` are actionability filters: each restricts the
@@ -1506,4 +1745,6 @@ def dump(
         return to_vex(state)
     if fmt == "cdx-vex":
         return to_cdx_vex(state)
+    if fmt == "trivy-table":
+        return to_trivy_table(state)
     return json.dumps(state, indent=2, sort_keys=False)
