@@ -60,7 +60,7 @@ ossuary web          list the recorded web-probe inventory (read companion to pr
 ossuary match-cves   query OSV.dev for service versions -> findings table
 ossuary cruise       re-fingerprint, diff against last saved state, report changes
 ossuary watch        run cruise on an interval, emitting a diff summary each pass
-ossuary dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX/VEX/CDX-VEX (filterable by KEV/EPSS/severity)
+ossuary dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX/VEX/CDX-VEX/Trivy-table (filterable by KEV/EPSS/severity)
 ossuary stats        print an at-a-glance engagement summary (counts + top hits)
 ossuary stale        flag findings not re-confirmed within N days (age staleness)
 ossuary diff         compare two engagement DBs -> new / resolved / persisting findings
@@ -436,19 +436,20 @@ ossuary dump --db engagement-acme.db --format json > acme-state.json
 
 ### Export formats
 
-`dump` speaks nine formats via `--format`:
+`dump` speaks eleven formats via `--format`:
 
 ```bash
-ossuary dump --db engagement-acme.db --format json      > acme-state.json
-ossuary dump --db engagement-acme.db --format csv       > acme-findings.csv
-ossuary dump --db engagement-acme.db --format markdown  > acme-findings.md
-ossuary dump --db engagement-acme.db --format html      > acme-report.html
-ossuary dump --db engagement-acme.db --format sarif     > acme-findings.sarif
-ossuary dump --db engagement-acme.db --format jira      > acme-tickets.csv
-ossuary dump --db engagement-acme.db --format cyclonedx > acme-sbom.cdx.json
-ossuary dump --db engagement-acme.db --format spdx      > acme-sbom.spdx.json
-ossuary dump --db engagement-acme.db --format vex       > acme-triage.openvex.json
-ossuary dump --db engagement-acme.db --format cdx-vex   > acme-triage.cdx-vex.json
+ossuary dump --db engagement-acme.db --format json         > acme-state.json
+ossuary dump --db engagement-acme.db --format csv          > acme-findings.csv
+ossuary dump --db engagement-acme.db --format markdown     > acme-findings.md
+ossuary dump --db engagement-acme.db --format html         > acme-report.html
+ossuary dump --db engagement-acme.db --format sarif        > acme-findings.sarif
+ossuary dump --db engagement-acme.db --format jira         > acme-tickets.csv
+ossuary dump --db engagement-acme.db --format cyclonedx    > acme-sbom.cdx.json
+ossuary dump --db engagement-acme.db --format spdx         > acme-sbom.spdx.json
+ossuary dump --db engagement-acme.db --format vex          > acme-triage.openvex.json
+ossuary dump --db engagement-acme.db --format cdx-vex      > acme-triage.cdx-vex.json
+ossuary dump --db engagement-acme.db --format trivy-table  > acme-findings.trivy.txt
 ```
 
 - **`json`** (default) — the nested `assets → services → findings` structure,
@@ -538,6 +539,26 @@ ossuary dump --db engagement-acme.db --format cdx-vex   > acme-triage.cdx-vex.js
   component. (The in-house `--vex` suppression-import loop remains
   OpenVEX-shaped — see `--format vex` — so a single engagement can emit
   *both* worksheets and serve both downstream paths.)
+- **`trivy-table`** — a **Trivy-style text-table report** in the wire-format
+  shape `trivy image` / `trivy fs` print: one per-target section per
+  discovered service (target header `<host> (<ip>):<port>/<proto> (<product>
+  <version>)`), a Trivy summary line (`Total: N (UNKNOWN: a, LOW: b, MEDIUM:
+  c, HIGH: d, CRITICAL: e)`), and a Unicode-box-drawn table
+  (`┌─┬─┐ │ ├─┼─┤ └─┴─┘`) with columns
+  `Library | Vulnerability | Severity | Installed Version | Fixed Version | Title`.
+  **Byte-recognisable** to any operator already running [Trivy](https://github.com/aquasecurity/trivy),
+  so an engagement's findings drop straight into a workflow tuned for Trivy
+  output — terminal viewing, log scraping, CI annotation, the GitHub Action
+  that posts Trivy tables as PR comments. KEV (confirmed-exploited) and EPSS
+  ride as **inline `[KEV]` / `[EPSS=0.95]` markers in the Title cell**
+  (Trivy's own convention for inline status tags) rather than as extra
+  columns that would break the recognisable layout. Severity bucketing
+  follows the same numeric tiering the rest of ossuary uses (`>= 9.0`
+  → `CRITICAL`, `>= 7.0` → `HIGH`, `>= 4.0` → `MEDIUM`, `> 0` → `LOW`,
+  blank/non-numeric → `UNKNOWN`). Like the SBOM exports this is
+  **component-centric**: a service with no finding still emits a target
+  section with `No vulnerabilities found` (Trivy's own wording), so the
+  inventory is preserved.
 
 The `json`, `csv`, and `markdown` formats cover the same fields; CSV and
 Markdown flatten the JSON nesting into these columns: `ip, hostname,
@@ -590,7 +611,7 @@ Semantics:
 
 The flags **compose** (a finding must clear every threshold given) and combine
 with `--tag` (e.g. `--tag in-scope --kev-only`). They apply identically to
-`json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, and `cdx-vex`. When a filter is active, services and assets left
+`json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, and `trivy-table`. When a filter is active, services and assets left
 with no surviving findings are pruned, so the output collapses to a clean list
 of actionable hits. With no filter flags, `dump` returns the full inventory
 exactly as before (services with no findings still appear).
@@ -616,7 +637,7 @@ ossuary dump --db engagement-acme.db --kev-only --sort-by-priority
 
 Findings with no EPSS score or a blank/non-numeric severity sink to the bottom
 of their tier rather than being dropped (use the filters above to drop them).
-The flag applies identically to `json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, and `cdx-vex`, and composes with
+The flag applies identically to `json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, and `trivy-table`, and composes with
 `--tag` and the actionability filters. Without it, ordering is the historical
 alphabetical-by-CVE-id, byte-for-byte unchanged.
 
@@ -645,7 +666,7 @@ Dates may be a bare `YYYY-MM-DD` or a full `'YYYY-MM-DD HH:MM:SS'`. A bare-date
 survives `--until 2026-05-29`). A finding with no recorded `matched_at` is
 excluded once either bound is set, and services / assets left with no surviving
 findings are pruned — exactly like the actionability filters. The window applies
-identically to `json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, and `cdx-vex`, and composes with
+identically to `json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, and `trivy-table`, and composes with
 `--tag`, the actionability filters, and `--sort-by-priority`. With neither bound
 set, the export is unchanged.
 

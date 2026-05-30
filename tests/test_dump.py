@@ -1810,3 +1810,196 @@ def test_dump_cdx_vex_round_trip_through_json_parse(db_path):
     # Indented (human-readable) like the other JSON formats.
     assert "\n" in first
     assert doc["bomFormat"] == "CycloneDX"
+
+
+# --------------------------------------------------------------------------
+# Trivy-style text-table export (`--format trivy-table`)
+# --------------------------------------------------------------------------
+
+_TRIVY_COLUMNS = (
+    "Library",
+    "Vulnerability",
+    "Severity",
+    "Installed Version",
+    "Fixed Version",
+    "Title",
+)
+
+
+def test_dump_trivy_table_is_listed_as_supported_format():
+    assert "trivy-table" in dump.SUPPORTED_FORMATS
+
+
+def test_dump_trivy_table_empty_db_emits_no_targets_line(db_path):
+    db.init_db(db_path).close()
+    out = dump.dump(db_path, "trivy-table")
+    # Empty engagement -> a single legible "no targets" line; never empty
+    # bytes (so a CI step that consumes stdout still gets a sensible artifact).
+    assert out.strip() == "ossuary: no targets in engagement"
+
+
+def test_dump_trivy_table_emits_target_header_and_summary(db_path):
+    _seed_one_finding(db_path)
+    out = dump.dump(db_path, "trivy-table")
+    # The target header reads as host (ip):port/proto (product version), the
+    # shape a hunter recognises from a real Trivy run.
+    assert "host-a (10.10.0.5):80/tcp (nginx 1.18.0)" in out
+    # Trivy's per-target summary line, ordered UNKNOWN -> CRITICAL.
+    assert (
+        "Total: 1 (UNKNOWN: 0, LOW: 0, MEDIUM: 0, HIGH: 1, CRITICAL: 0)" in out
+    )
+
+
+def test_dump_trivy_table_uses_box_drawing_glyphs(db_path):
+    _seed_one_finding(db_path)
+    out = dump.dump(db_path, "trivy-table")
+    # Exactly the glyphs Trivy itself emits — keeps the output
+    # byte-recognisable, not a vague approximation.
+    for glyph in ("┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼", "│", "─"):
+        assert glyph in out
+
+
+def test_dump_trivy_table_renders_finding_row(db_path):
+    _seed_one_finding(db_path)
+    out = dump.dump(db_path, "trivy-table")
+    # The expected columns appear in the header row.
+    for col in _TRIVY_COLUMNS:
+        assert col in out
+    # And the CVE + library + version land in the table.
+    assert "CVE-2021-23017" in out
+    assert "nginx" in out
+    assert "1.18.0" in out
+    assert "HIGH" in out  # CVSS 7.7 -> HIGH bucket
+    # The summary text rides in the Title cell.
+    assert "off-by-one" in out
+
+
+def test_dump_trivy_table_severity_buckets_map_cvss_correctly(db_path):
+    # Spread one finding per CVSS tier so every bucket shows up.
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "h", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-CRIT", "x", "9.8")  # CRITICAL
+        db.upsert_finding(conn, sid, "CVE-HI",   "x", "7.5")  # HIGH
+        db.upsert_finding(conn, sid, "CVE-MED",  "x", "5.0")  # MEDIUM
+        db.upsert_finding(conn, sid, "CVE-LO",   "x", "2.0")  # LOW
+        db.upsert_finding(conn, sid, "CVE-UNK",  "x", "")     # UNKNOWN (blank)
+        conn.commit()
+    finally:
+        conn.close()
+    out = dump.dump(db_path, "trivy-table")
+    assert (
+        "Total: 5 (UNKNOWN: 1, LOW: 1, MEDIUM: 1, HIGH: 1, CRITICAL: 1)" in out
+    )
+    # Every upper-case Trivy severity label shows in the rendered table.
+    for label in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"):
+        assert label in out
+
+
+def test_dump_trivy_table_kev_and_epss_ride_in_title_cell(db_path):
+    _seed_mixed_findings(db_path)
+    out = dump.dump(db_path, "trivy-table")
+    # KEV finding (CVE-HOT) carries the [KEV] inline marker and the EPSS
+    # score rides as a [EPSS=...] suffix.
+    assert "[KEV]" in out
+    assert "[EPSS=0.94]" in out
+    # The non-KEV cold finding doesn't get the KEV badge.
+    cold_line = next(line for line in out.splitlines() if "CVE-COLD" in line)
+    assert "[KEV]" not in cold_line
+
+
+def test_dump_trivy_table_target_with_no_findings_says_so(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.9", None, "up")
+        db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        conn.commit()
+    finally:
+        conn.close()
+    out = dump.dump(db_path, "trivy-table")
+    # Service inventory is preserved even when nothing matched, mirroring
+    # Trivy's "No vulnerabilities found" wording per-target.
+    assert "10.10.0.9:22/tcp (OpenSSH 8.2)" in out
+    assert "No vulnerabilities found" in out
+
+
+def test_dump_trivy_table_multiple_targets_separated_by_blank_line(db_path):
+    _seed_mixed_findings(db_path)  # one asset, two services -> two targets
+    out = dump.dump(db_path, "trivy-table")
+    # Each service becomes its own target section.
+    assert "host-a (10.10.0.5):80/tcp (nginx 1.18.0)" in out
+    assert "host-a (10.10.0.5):22/tcp (OpenSSH 8.2)" in out
+    # And there's a blank line between sections (Trivy's separator).
+    assert "\n\n" in out
+
+
+def test_dump_trivy_table_actionability_filters_apply(db_path):
+    _seed_mixed_findings(db_path)
+    out = dump.dump(db_path, "trivy-table", kev_only=True)
+    # Only the KEV finding survives, so cold / mid CVEs must not appear.
+    assert "CVE-HOT" in out
+    assert "CVE-COLD" not in out
+    assert "CVE-MID" not in out
+    # And the host with no surviving finding (svc-22) is pruned.
+    assert "OpenSSH" not in out
+
+
+def test_dump_trivy_table_sort_by_priority_orders_rows(db_path):
+    _seed_one_service_many_findings(db_path)
+    out = dump.dump(db_path, "trivy-table", sort_by_priority=True)
+    # The KEV finding with highest EPSS leads; cold non-KEV trails.
+    positions = {cve: out.find(cve) for cve in (
+        "CVE-2020-KEVHI", "CVE-2020-KEVLO", "CVE-2020-WARM", "CVE-2020-COLD",
+    )}
+    # All four findings made it into the output.
+    assert all(p >= 0 for p in positions.values())
+    ordered = sorted(positions, key=positions.get)
+    assert ordered == [
+        "CVE-2020-KEVHI",
+        "CVE-2020-KEVLO",
+        "CVE-2020-WARM",
+        "CVE-2020-COLD",
+    ]
+
+
+def test_dump_trivy_table_tag_filter_scopes_targets(db_path):
+    conn = db.init_db(db_path)
+    try:
+        a1 = db.upsert_asset(conn, "10.10.0.5", "h1", "up")
+        s1 = db.upsert_service(conn, a1, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s1, "CVE-IN", "x", "7.0")
+        a2 = db.upsert_asset(conn, "10.10.0.6", "h2", "up")
+        s2 = db.upsert_service(conn, a2, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s2, "CVE-OUT", "x", "7.0")
+        conn.commit()
+    finally:
+        conn.close()
+    tags.add_tag(db_path, "10.10.0.5", "prod")
+    out = dump.dump(db_path, "trivy-table", tag="prod")
+    assert "CVE-IN" in out
+    assert "CVE-OUT" not in out
+    assert "h2" not in out
+
+
+def test_dump_trivy_table_table_columns_are_aligned(db_path):
+    """The rendered table's separator rows match the data rows in width."""
+    _seed_one_finding(db_path)
+    out = dump.dump(db_path, "trivy-table")
+    # Every box-drawn line in the table has identical visible length so the
+    # columns line up — the property that makes the format readable.
+    table_lines = [
+        line for line in out.splitlines()
+        if line.startswith(("┌", "├", "└", "│"))
+    ]
+    assert len(table_lines) >= 4  # top + header + sep + at least 1 row + bottom
+    widths = {len(line) for line in table_lines}
+    assert len(widths) == 1, f"misaligned table: widths={widths}"
+
+
+def test_dump_trivy_table_output_is_byte_stable(db_path):
+    """Two emissions on the same DB produce byte-identical output."""
+    _seed_mixed_findings(db_path)
+    first = dump.dump(db_path, "trivy-table")
+    second = dump.dump(db_path, "trivy-table")
+    assert first == second

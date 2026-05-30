@@ -530,6 +530,66 @@ offline-tested.
 
 ---
 
+## Rank 19 — Trivy-style text-table export (`dump --format trivy-table`)  ✅ IMPLEMENTED
+
+> Shipped: `dump` gains `--format trivy-table`, an eleventh export format
+> alongside json / csv / markdown / html / sarif / jira / cyclonedx / spdx / vex
+> / cdx-vex. It emits a Trivy (aquasecurity/trivy) wire-format text-table report
+> — one per-target section per discovered service, with the target header line
+> (`<host> (<ip>):<port>/<proto> (<product> <version>)`), Trivy's
+> `Total: N (UNKNOWN: a, LOW: b, MEDIUM: c, HIGH: d, CRITICAL: e)` summary, and
+> a Unicode-box-drawn (`┌─┬─┐ │ ├─┼─┤ └─┴─┘`) table with columns
+> `Library | Vulnerability | Severity | Installed Version | Fixed Version | Title`.
+> Byte-recognisable to any operator already running Trivy in CI / on a terminal.
+> KEV and EPSS — ossuary-specific live-signal columns Trivy itself doesn't carry
+> — ride as inline `[KEV]` / `[EPSS=0.95]` markers in the Title cell rather than
+> as extra columns that would break the recognisable layout. Severity bucketing
+> reuses the same numeric tiering as `stats` / HTML / CycloneDX. Rendering happens
+> off the same `dump.build_state`, so the report respects `--tag`, the R8
+> actionability filters, R9 `--sort-by-priority`, and `--vex` suppression
+> identically to every other format. A service with no finding still emits a
+> per-target section with Trivy's own "No vulnerabilities found" wording, so the
+> inventory is preserved; an empty engagement yields a single legible
+> `ossuary: no targets in engagement` line. Pure-Python text formatting, no new
+> dependencies, no schema change, no network calls, fully offline-tested. +13
+> tests.
+
+**What:** The eleven dump formats now cover every major downstream consumer
+shape — JSON for tools, CSV / Markdown for spreadsheets / platform submissions,
+HTML for human deliverables, SARIF for code-scanning dashboards, Jira for
+ticketing, CycloneDX / SPDX for SBOM pipelines, OpenVEX / CycloneDX-VEX for
+triage worksheets — except the *terminal* shape an operator reads first. Trivy
+is the de-facto-standard CLI vulnerability scanner in 2025-2026, and its
+text-table output is the layout every SRE / AppSec engineer recognises at a
+glance. Emitting in that shape lets ossuary's findings drop into a workflow
+already tuned for Trivy (terminal viewing, log scraping, CI annotation, the
+GitHub Action that posts Trivy tables as PR comments) without learning a new
+layout.
+
+**Why now:** It closes the dump-format lineage at the operator-facing end. The
+SBOM / VEX / SARIF formats are machine-consumer artifacts; HTML is the
+client deliverable; this is the layout a hunter reads on their own terminal as
+the engagement is running. The data shape lines up cleanly — Trivy's
+`Target / Library / Vulnerability / Severity / Installed Version` columns map
+1:1 onto ossuary's `service / product / cve_id / severity / version` — so the
+format is a thin presentation layer over the existing build_state, with no new
+data model.
+
+**Pivot note (during implementation):** The original lap goal proposed
+`--format attestation` (SLSA provenance) or `--format trivy-table`. SLSA
+provenance requires *build*-system metadata (builder identity, source
+materials, hermetic build details) that ossuary fundamentally lacks — it
+scans the deployed network surface, not build artifacts — so a SLSA wrapper
+would be a misleading attestation with empty build fields. Trivy-table fits
+the data ossuary has and addresses a real operator surface (the terminal),
+so this lap shipped trivy-table.
+
+**Effort:** Small. A pure-Python serialiser over the existing nested state +
+one `--format` choice; no new dependencies, no schema change, fully
+offline-tested.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |
