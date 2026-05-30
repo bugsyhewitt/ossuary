@@ -175,6 +175,7 @@ SUPPORTED_FORMATS = (
     "vex",
     "cdx-vex",
     "trivy-table",
+    "trivy-json",
     "grype-json",
     "dependency-check",
     "syft",
@@ -1694,6 +1695,216 @@ def to_trivy_table(state: dict) -> str:
 
 
 # --------------------------------------------------------------------------
+# Trivy JSON export (`--format trivy-json`)
+# --------------------------------------------------------------------------
+#
+# Trivy's classic terminal table (shipped as `--format trivy-table`) is what an
+# operator reads at a glance; Trivy's `--format json` is the *machine* artifact
+# its downstream consumers actually parse. The Trivy GitHub Action posts
+# findings as PR annotations from this JSON, DefectDojo's `Trivy Scan` parser
+# ingests it natively, AccuKnox / Wiz / many CI converters key off the same
+# wire shape, and `trivy convert` round-trips through it as the canonical
+# Trivy interchange format. The table is human-readable; the JSON is what gets
+# fed into a triage pipeline.
+#
+# Shipping `trivy-json` alongside `trivy-table` mirrors what Grype gives us
+# (`grype-json` is byte-recognisable to the Grype parser ecosystem) for the
+# Trivy ecosystem — the table is for a hunter's eyes, the JSON is for the
+# downstream consumer. A hunter who already has a Trivy JSON workflow can drop
+# ossuary's findings into it without learning a new layout or running a
+# translation step.
+#
+# The shape is byte-recognisable to Trivy's parser: a top-level wrapper with
+# `SchemaVersion` (Trivy's own wire-version marker — `2` is the current
+# stable schema all 2025-era Trivy consumers read), `CreatedAt` (a fixed
+# sentinel for byte-stability across emissions), `ArtifactName` /
+# `ArtifactType` (Trivy's own "what was scanned" labels — we use
+# `ossuary-engagement` / `filesystem` since Trivy has no first-class
+# network-engagement type, mirroring how `directory` stands in for it on the
+# `source.type` slot in the Grype / Syft exports), and a `Results[]` array
+# carrying one entry per discovered service (Trivy's per-target grouping —
+# component-centric, like the SBOM exports and unlike the finding-centric
+# `grype-json` / `sarif` / `jira`, so a service with no findings still emits
+# a Result entry with an absent `Vulnerabilities` field). Each Result entry
+# carries `Target` (Trivy's human-readable target label, the same string
+# `trivy-table` uses in its target header), `Class` (Trivy's taxonomy slot —
+# `lang-pkgs` is the closest fit for a discovered network service, the same
+# class Trivy itself uses for non-OS language-ecosystem packages), `Type`
+# (the ecosystem — `generic`, matching our purl ecosystem), and
+# `Vulnerabilities[]` with the Trivy-recognised per-finding shape
+# (`VulnerabilityID`, `PkgName`, `InstalledVersion`, `FixedVersion`,
+# `Severity` upper-cased, `Title`, `Description`, `PrimaryURL`, `CVSS`,
+# `References`, `PublishedDate`, `LastModifiedDate`).
+#
+# KEV (CISA's Known Exploited Vulnerabilities catalog) and EPSS are
+# ossuary-specific live signals Trivy's own JSON doesn't carry — they ride
+# in a labelled `CISA-KEV` reference under `References[]` (the slot Trivy
+# itself reserves for vendor-extended advisory links) and as
+# `CustomAdvisoryData` / `VendorSeverity` extension fields on each
+# vulnerability that downstream parsers ignoring unknown fields safely skip.
+# Severity bucketing uses Trivy's own upper-case vocabulary (`CRITICAL` /
+# `HIGH` / `MEDIUM` / `LOW` / `UNKNOWN`) — the exact tokens Trivy itself
+# emits — so downstream filters that key off severity strings keep working.
+
+_TRIVY_JSON_SCHEMA_VERSION = 2
+
+
+def _trivy_json_vulnerability(finding: dict, svc: dict) -> dict:
+    """Render one finding as a Trivy ``Results[].Vulnerabilities[]`` entry.
+
+    Mirrors Trivy's ``-f json`` per-finding shape: the fields downstream
+    Trivy parsers (DefectDojo's Trivy Scan parser, the Trivy GitHub Action,
+    Trivy-aware CI converters) key off. KEV rides as a labelled
+    ``CISA-KEV`` reference under ``References[]`` (Trivy's slot for vendor-
+    extended advisory links); EPSS rides in a ``CustomAdvisoryData`` field
+    that ignored-on-unknown parsers skip without breaking.
+    """
+    cve_id = finding.get("cve_id") or "UNKNOWN"
+    severity = _trivy_severity(finding.get("severity"))
+    sev_score = _parse_severity(finding.get("severity"))
+    summary = finding.get("summary") or ""
+    product = svc.get("product")
+    version = svc.get("version")
+    name = svc.get("name")
+    pkg_name = product or name or f"{svc.get('protocol')}/{svc.get('port')}"
+    primary_url = (
+        f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+        if cve_id.upper().startswith("CVE-") else ""
+    )
+
+    references: list[str] = []
+    if primary_url:
+        references.append(primary_url)
+    if finding.get("kev"):
+        references.append(
+            "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
+        )
+
+    vuln: dict = {
+        "VulnerabilityID": cve_id,
+        "PkgName": str(pkg_name),
+        "InstalledVersion": str(version) if version else "",
+        # Trivy keeps `FixedVersion` present-but-blank for advisories with no
+        # known fix; ossuary doesn't track patched-in versions yet, so we
+        # emit the same blank-string sentinel rather than dropping the field.
+        "FixedVersion": "",
+        "Severity": severity,
+        "Title": cve_id,
+        "Description": summary,
+        "PrimaryURL": primary_url,
+        "References": references,
+    }
+    if sev_score is not None:
+        vuln["CVSS"] = {
+            "ossuary": {
+                "V3Score": sev_score,
+            },
+        }
+    # VendorSeverity is Trivy's per-source severity map. We surface the
+    # ossuary bucket here so a consumer that keys off VendorSeverity (rather
+    # than the flat Severity field) still gets the live tier.
+    vuln["VendorSeverity"] = {"ossuary": _TRIVY_SEVERITY_ORDER.index(severity)}
+
+    # CustomAdvisoryData is Trivy's open vendor-extension slot — the same
+    # role `properties` plays on the grype-json / cyclonedx exports. The
+    # live KEV / EPSS / source / exploit signals ride here so consumers that
+    # key off the live signal find them in a predictable place.
+    custom: dict = {"kev": bool(finding.get("kev"))}
+    epss = finding.get("epss_score")
+    if isinstance(epss, (int, float)):
+        custom["epss_score"] = epss
+    if finding.get("source"):
+        custom["source"] = finding["source"]
+    if finding.get("exploit"):
+        custom["exploit"] = True
+    if finding.get("matched_at"):
+        custom["matched_at"] = finding["matched_at"]
+    vuln["CustomAdvisoryData"] = custom
+    return vuln
+
+
+def _trivy_json_result(asset: dict, svc: dict) -> dict:
+    """Build one Trivy ``Results[]`` entry for a discovered service.
+
+    A Trivy ``Result`` is a per-target group of vulnerabilities. ossuary's
+    equivalent is the discovered service (each fingerprinted host:port
+    becomes one Result), matching how ``trivy-table`` already groups its
+    output. ``Target`` is the same human-readable label the table uses; a
+    service with no findings emits the Result entry without a
+    ``Vulnerabilities`` field (Trivy's own convention for an empty target).
+    """
+    ip = asset["ip"]
+    host = asset.get("hostname")
+    host_label = f"{host} ({ip})" if host else ip
+    port = svc["port"]
+    protocol = svc["protocol"]
+    product = svc.get("product")
+    version = svc.get("version")
+    svc_detail = " ".join(p for p in (product, version) if p)
+    target_label = f"{host_label}:{port}/{protocol}" + (
+        f" ({svc_detail})" if svc_detail else ""
+    )
+
+    result: dict = {
+        "Target": target_label,
+        "Class": "lang-pkgs",
+        "Type": "generic",
+    }
+    vulns = [_trivy_json_vulnerability(f, svc) for f in svc["findings"]]
+    if vulns:
+        result["Vulnerabilities"] = vulns
+    return result
+
+
+def to_trivy_json(state: dict) -> str:
+    """Serialise the engagement state as a Trivy ``-f json`` document.
+
+    Emits the byte-recognisable Trivy JSON shape every Trivy-aware downstream
+    consumer reads — the Trivy GitHub Action, DefectDojo's Trivy Scan parser,
+    AccuKnox / Wiz / Trivy-aware CI converters, and ``trivy convert``. One
+    ``Results[]`` entry per discovered service (component-centric, like the
+    SBOM exports and ``trivy-table`` — a service with no findings still
+    appears as a Result entry without a ``Vulnerabilities`` field), one
+    ``Vulnerabilities[]`` entry per matched CVE.
+
+    Like every other dump format this reads off ``build_state``, so the
+    document honours ``--tag``, the actionability filters (``--kev-only`` /
+    ``--min-epss`` / ``--min-severity``), ``--since`` / ``--until``,
+    ``--sort-by-priority`` and ``--vex`` suppression identically. An empty
+    engagement still yields a valid document with an empty ``Results``
+    array.
+    """
+    results: list[dict] = []
+    for asset in state["assets"]:
+        for svc in asset["services"]:
+            results.append(_trivy_json_result(asset, svc))
+
+    document = {
+        "SchemaVersion": _TRIVY_JSON_SCHEMA_VERSION,
+        # A fixed sentinel keeps the document byte-stable across emissions;
+        # Trivy itself stamps a real timestamp, but downstream parsers
+        # don't require it to be live.
+        "CreatedAt": "1970-01-01T00:00:00Z",
+        "ArtifactName": "ossuary-engagement",
+        # Trivy's ArtifactType taxonomy (container_image / filesystem /
+        # repository / vm / kubernetes) has no first-class network slot;
+        # `filesystem` is the closest match and matches how `directory`
+        # stands in for "no real type" on the source-type slots in our
+        # Grype / Syft exports.
+        "ArtifactType": "filesystem",
+        "Metadata": {
+            "ImageConfig": {},
+            "Tool": {
+                "Name": "ossuary",
+                "Version": __version__,
+            },
+        },
+        "Results": results,
+    }
+    return json.dumps(document, indent=2, sort_keys=False)
+
+
+# --------------------------------------------------------------------------
 # Grype JSON export (`--format grype-json`)
 # --------------------------------------------------------------------------
 #
@@ -2316,7 +2527,14 @@ def dump(
     text-table report — one per-target section per discovered service, with
     Trivy's familiar Unicode-box-drawn table and ``Total: N (UNKNOWN: a, ...)``
     summary line, byte-recognisable in a workflow already tuned for Trivy
-    output), or ``grype-json`` (the Anchore-ecosystem counterpart — Grype's
+    output), or ``trivy-json`` (Trivy's ``-f json`` machine artifact — the
+    JSON shape Trivy's downstream consumers parse, as opposed to the
+    terminal-table shape ``trivy-table`` emits — a ``Results[]`` array of
+    one entry per discovered service, each carrying a
+    ``Vulnerabilities[]`` list of Trivy-recognised per-finding entries,
+    byte-recognisable to the Trivy GitHub Action, DefectDojo's Trivy Scan
+    parser, ``trivy convert`` and the wider Trivy-aware CI ecosystem),
+    or ``grype-json`` (the Anchore-ecosystem counterpart — Grype's
     own ``-o json`` shape: a top-level ``matches`` array carrying one
     ``vulnerability`` + ``artifact`` + ``matchDetails`` block per finding,
     byte-recognisable to every Grype consumer — the Grype GitHub Action,
@@ -2384,6 +2602,8 @@ def dump(
         return to_cdx_vex(state)
     if fmt == "trivy-table":
         return to_trivy_table(state)
+    if fmt == "trivy-json":
+        return to_trivy_json(state)
     if fmt == "grype-json":
         return to_grype_json(state)
     if fmt == "dependency-check":

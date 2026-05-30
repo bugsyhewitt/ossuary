@@ -2231,6 +2231,218 @@ def test_dump_grype_json_unscored_non_kev_is_negligible_when_zero(db_path):
         conn.close()
     doc = json.loads(dump.dump(db_path, "grype-json"))
     assert doc["matches"][0]["vulnerability"]["severity"] == "Negligible"
+
+
+# --------------------------------------------------------------------------
+# Trivy JSON export (`--format trivy-json`)
+# --------------------------------------------------------------------------
+#
+# Trivy's `--format json` is the machine artifact its downstream consumers
+# (the Trivy GitHub Action, DefectDojo's Trivy Scan parser, `trivy convert`,
+# the wider Trivy-aware CI ecosystem) parse — the JSON counterpart to the
+# human-readable `trivy-table` terminal output. These tests pin the
+# byte-recognisable wire shape so a downstream Trivy consumer can parse
+# ossuary's emission without code changes.
+
+
+def test_dump_trivy_json_is_listed_as_supported_format():
+    assert "trivy-json" in dump.SUPPORTED_FORMATS
+
+
+def test_dump_trivy_json_empty_db_emits_well_formed_document(db_path):
+    db.init_db(db_path).close()
+    out = dump.dump(db_path, "trivy-json")
+    doc = json.loads(out)
+    # Every top-level slot Trivy consumers iterate is present.
+    assert doc["SchemaVersion"] == 2
+    assert doc["ArtifactName"] == "ossuary-engagement"
+    assert doc["ArtifactType"] == "filesystem"
+    assert doc["Results"] == []
+    from ossuary import __version__
+    assert doc["Metadata"]["Tool"]["Name"] == "ossuary"
+    assert doc["Metadata"]["Tool"]["Version"] == __version__
+
+
+def test_dump_trivy_json_emits_one_result_per_service(db_path):
+    _seed_mixed_findings(db_path)  # two services on one asset
+    doc = json.loads(dump.dump(db_path, "trivy-json"))
+    assert len(doc["Results"]) == 2
+    targets = {r["Target"] for r in doc["Results"]}
+    # The Result Target mirrors the trivy-table header label.
+    assert any("10.10.0.5" in t and "80/tcp" in t for t in targets)
+    assert any("10.10.0.5" in t and "22/tcp" in t for t in targets)
+
+
+def test_dump_trivy_json_vulnerability_shape(db_path):
+    _seed_one_finding(db_path)
+    doc = json.loads(dump.dump(db_path, "trivy-json"))
+    assert len(doc["Results"]) == 1
+    result = doc["Results"][0]
+    assert result["Class"] == "lang-pkgs"
+    assert result["Type"] == "generic"
+    vulns = result["Vulnerabilities"]
+    assert len(vulns) == 1
+    v = vulns[0]
+    # The Trivy-recognised per-finding fields downstream parsers key off.
+    assert v["VulnerabilityID"] == "CVE-2021-23017"
+    assert v["PkgName"] == "nginx"
+    assert v["InstalledVersion"] == "1.18.0"
+    assert v["FixedVersion"] == ""
+    assert v["Severity"] == "HIGH"  # CVSS 7.7 → HIGH
+    assert v["Title"] == "CVE-2021-23017"
+    assert v["Description"] == "off-by-one"
+    assert v["PrimaryURL"] == "https://nvd.nist.gov/vuln/detail/CVE-2021-23017"
+    assert v["PrimaryURL"] in v["References"]
+
+
+def test_dump_trivy_json_severity_buckets_use_trivy_uppercase(db_path):
+    """Numeric tiering maps to Trivy's own upper-case label vocabulary."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "h", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-CRIT", "x", "9.8")
+        db.upsert_finding(conn, sid, "CVE-HI",   "x", "7.5")
+        db.upsert_finding(conn, sid, "CVE-MED",  "x", "5.0")
+        db.upsert_finding(conn, sid, "CVE-LO",   "x", "2.0")
+        db.upsert_finding(conn, sid, "CVE-UNK",  "x", "")
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "trivy-json"))
+    vulns = doc["Results"][0]["Vulnerabilities"]
+    by_id = {v["VulnerabilityID"]: v["Severity"] for v in vulns}
+    assert by_id == {
+        "CVE-CRIT": "CRITICAL",
+        "CVE-HI": "HIGH",
+        "CVE-MED": "MEDIUM",
+        "CVE-LO": "LOW",
+        "CVE-UNK": "UNKNOWN",
+    }
+
+
+def test_dump_trivy_json_kev_rides_as_cisa_reference(db_path):
+    """KEV (confirmed-exploited) surfaces as a CISA-KEV URL in References."""
+    _seed_mixed_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "trivy-json"))
+    vulns = [v for r in doc["Results"] for v in r.get("Vulnerabilities", [])]
+    hot = next(v for v in vulns if v["VulnerabilityID"] == "CVE-HOT")
+    cold = next(v for v in vulns if v["VulnerabilityID"] == "CVE-COLD")
+    assert any("cisa.gov" in ref for ref in hot["References"])
+    assert hot["CustomAdvisoryData"]["kev"] is True
+    # Non-KEV finding: no CISA reference, no kev=true.
+    assert not any("cisa.gov" in ref for ref in cold["References"])
+    assert cold["CustomAdvisoryData"]["kev"] is False
+
+
+def test_dump_trivy_json_epss_rides_as_custom_advisory_data(db_path):
+    _seed_mixed_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "trivy-json"))
+    vulns = [v for r in doc["Results"] for v in r.get("Vulnerabilities", [])]
+    hot = next(v for v in vulns if v["VulnerabilityID"] == "CVE-HOT")
+    assert hot["CustomAdvisoryData"]["epss_score"] == 0.94
+    # A finding with no EPSS yields no epss_score key (rather than null).
+    mid = next(v for v in vulns if v["VulnerabilityID"] == "CVE-MID")
+    assert "epss_score" not in mid["CustomAdvisoryData"]
+
+
+def test_dump_trivy_json_cvss_emitted_only_when_numeric(db_path):
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "h", "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, sid, "CVE-SCORED", "x", "7.7")
+        db.upsert_finding(conn, sid, "CVE-BLANK",  "x", "")
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "trivy-json"))
+    vulns = doc["Results"][0]["Vulnerabilities"]
+    scored = next(v for v in vulns if v["VulnerabilityID"] == "CVE-SCORED")
+    blank = next(v for v in vulns if v["VulnerabilityID"] == "CVE-BLANK")
+    assert scored["CVSS"]["ossuary"]["V3Score"] == 7.7
+    assert "CVSS" not in blank
+
+
+def test_dump_trivy_json_service_with_no_findings_still_emits_result(db_path):
+    """trivy-json is component-centric (matching trivy-table / SBOM exports)."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.9", None, "up")
+        db.upsert_service(conn, aid, 22, "tcp", "ssh", "OpenSSH", "8.2", None)
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "trivy-json"))
+    assert len(doc["Results"]) == 1
+    # Trivy itself omits the Vulnerabilities field on an empty target.
+    assert "Vulnerabilities" not in doc["Results"][0]
+
+
+def test_dump_trivy_json_actionability_filters_apply(db_path):
+    _seed_mixed_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "trivy-json", kev_only=True))
+    vulns = [v for r in doc["Results"] for v in r.get("Vulnerabilities", [])]
+    ids = {v["VulnerabilityID"] for v in vulns}
+    assert ids == {"CVE-HOT"}
+
+
+def test_dump_trivy_json_sort_by_priority_orders_vulns(db_path):
+    _seed_one_service_many_findings(db_path)
+    doc = json.loads(dump.dump(db_path, "trivy-json", sort_by_priority=True))
+    vulns = doc["Results"][0]["Vulnerabilities"]
+    ids = [v["VulnerabilityID"] for v in vulns]
+    assert ids == [
+        "CVE-2020-KEVHI",
+        "CVE-2020-KEVLO",
+        "CVE-2020-WARM",
+        "CVE-2020-COLD",
+    ]
+
+
+def test_dump_trivy_json_tag_filter_scopes_results(db_path):
+    conn = db.init_db(db_path)
+    try:
+        a1 = db.upsert_asset(conn, "10.10.0.5", "h1", "up")
+        s1 = db.upsert_service(conn, a1, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s1, "CVE-IN", "x", "7.0")
+        a2 = db.upsert_asset(conn, "10.10.0.6", "h2", "up")
+        s2 = db.upsert_service(conn, a2, 80, "tcp", "http", "nginx", "1.0", None)
+        db.upsert_finding(conn, s2, "CVE-OUT", "x", "7.0")
+        conn.commit()
+    finally:
+        conn.close()
+    tags.add_tag(db_path, "10.10.0.5", "prod")
+    doc = json.loads(dump.dump(db_path, "trivy-json", tag="prod"))
+    vulns = [v for r in doc["Results"] for v in r.get("Vulnerabilities", [])]
+    ids = {v["VulnerabilityID"] for v in vulns}
+    assert ids == {"CVE-IN"}
+
+
+def test_dump_trivy_json_output_is_byte_stable(db_path):
+    """Two emissions on the same DB produce byte-identical output."""
+    _seed_mixed_findings(db_path)
+    first = dump.dump(db_path, "trivy-json")
+    second = dump.dump(db_path, "trivy-json")
+    assert first == second
+
+
+def test_dump_trivy_json_pkg_name_falls_back_to_service_name(db_path):
+    """A service with no product falls back to its nmap service name."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "h", "up")
+        sid = db.upsert_service(conn, aid, 22, "tcp", "ssh", None, None, None)
+        db.upsert_finding(conn, sid, "CVE-SSH", "x", "7.0")
+        conn.commit()
+    finally:
+        conn.close()
+    doc = json.loads(dump.dump(db_path, "trivy-json"))
+    v = doc["Results"][0]["Vulnerabilities"][0]
+    assert v["PkgName"] == "ssh"
+    assert v["InstalledVersion"] == ""
+
+
 # OWASP Dependency-Check JSON report export (`--format dependency-check`)
 # --------------------------------------------------------------------------
 
