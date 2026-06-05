@@ -363,6 +363,7 @@ def build_state(
     until: str | None = None,
     sort_by_priority: bool = False,
     vex: VexSuppressions | None = None,
+    top_n: int | None = None,
 ) -> dict:
     """Assemble the full engagement state as a nested dict.
 
@@ -386,6 +387,13 @@ def build_state(
     KEV-first, then by descending EPSS, descending numeric severity, and finally
     CVE id — the same triage order `match-cves` prints — so the highest-signal
     findings lead. When unset, findings keep their alphabetical-by-CVE-id order.
+
+    When `top_n` is set, only the N highest-priority findings (ranked globally
+    across the whole engagement by KEV, EPSS, severity, CVE id) are included in
+    the output. Services and assets left with no surviving findings after the
+    truncation are pruned. Composes with all other filters — `top_n` is applied
+    after the other filters, so e.g. ``--kev-only --limit 5`` returns the 5
+    highest-priority KEV findings.
 
     `vex`, when given, is a parsed VEX suppression index (see `ossuary.vex`).
     Findings whose CVE has been ruled `not_affected` / `fixed` for the finding's
@@ -486,6 +494,46 @@ def build_state(
                 "services": services_out,
             }
         )
+    if top_n is not None:
+        # Gather every finding across all assets/services together with its
+        # location key, rank globally by priority, then keep only the top N.
+        # Services and assets left empty after the cut are pruned, matching the
+        # behaviour of the other per-finding filters.
+        ranked: list[tuple[tuple, str, str, str]] = []
+        for asset_rec in assets_out:
+            for svc_rec in asset_rec["services"]:
+                svc_key = str(svc_rec["port"]) + "/" + svc_rec["protocol"]
+                for finding in svc_rec["findings"]:
+                    ranked.append((
+                        _priority_key(finding),
+                        asset_rec["ip"],
+                        svc_key,
+                        finding.get("cve_id", ""),
+                    ))
+        ranked.sort(key=lambda t: t[0])
+        # Build a set of (ip, svc_key, cve_id) triples for the top N entries.
+        # Using id() on individual finding dicts would be fragile across copies,
+        # so the triple is the stable identity: a CVE only appears once per
+        # service_id in the DB so this is unique.
+        kept_ids: set[tuple[str, str, str]] = {
+            (ip, svc_key, cve_id)
+            for _, ip, svc_key, cve_id in ranked[:top_n]
+        }
+        # Rebuild assets_out keeping only the kept findings.
+        pruned_assets: list[dict] = []
+        for asset_rec in assets_out:
+            pruned_services: list[dict] = []
+            for svc_rec in asset_rec["services"]:
+                svc_key = str(svc_rec["port"]) + "/" + svc_rec["protocol"]
+                pruned_findings = [
+                    f for f in svc_rec["findings"]
+                    if (asset_rec["ip"], svc_key, f.get("cve_id", "")) in kept_ids
+                ]
+                if pruned_findings:
+                    pruned_services.append({**svc_rec, "findings": pruned_findings})
+            if pruned_services:
+                pruned_assets.append({**asset_rec, "services": pruned_services})
+        assets_out = pruned_assets
     return {"assets": assets_out}
 
 
@@ -2674,6 +2722,7 @@ def dump(
     until: str | None = None,
     sort_by_priority: bool = False,
     vex_path: str | Path | None = None,
+    limit: int | None = None,
 ) -> str:
     """Return the engagement state as a serialised string in the given format.
 
@@ -2726,6 +2775,10 @@ def dump(
     CVE has been ruled `not_affected` / `fixed` (for their location) are
     suppressed from the export — triage-cleared findings are hidden without being
     deleted from the DB. It composes with `tag` and the other filters.
+    `limit`, when set, truncates the export to the N highest-priority findings
+    (ranked globally by KEV, EPSS, severity, CVE id) — useful for "show me the
+    top 10 most critical findings across the engagement". Applied after all other
+    filters; services and assets left with no surviving findings are pruned.
     """
     if fmt not in SUPPORTED_FORMATS:
         supported = ", ".join(SUPPORTED_FORMATS)
@@ -2745,6 +2798,7 @@ def dump(
             until=until,
             sort_by_priority=sort_by_priority,
             vex=suppressions,
+            top_n=limit,
         )
     finally:
         conn.close()

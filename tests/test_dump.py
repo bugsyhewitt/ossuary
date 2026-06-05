@@ -2976,3 +2976,146 @@ def test_dump_junit_filters_apply(db_path):
 def test_dump_junit_is_in_supported_formats():
     """junit is listed in SUPPORTED_FORMATS."""
     assert "junit" in dump.SUPPORTED_FORMATS
+
+
+# ---------------------------------------------------------------------------
+# dump --limit N (top-N global finding cap)
+# ---------------------------------------------------------------------------
+
+def _seed_multi_host_findings(db_path):
+    """Three assets, five findings spanning the KEV/EPSS/severity spectrum.
+
+    host-a port-80:  CVE-HOT (kev=1, epss=0.94, sev=9.8)
+                     CVE-COLD (kev=0, epss=0.02, sev=3.1)
+    host-b port-443: CVE-MID (kev=0, epss=0.30, sev=6.5)
+    host-c port-22:  CVE-LOW1 (kev=0, epss=None, sev=2.0)
+                     CVE-LOW2 (kev=0, epss=None, sev=2.1)
+
+    Global priority order (highest first):
+      1. CVE-HOT    (kev beats all)
+      2. CVE-MID    (epss=0.30 > CVE-COLD's 0.02, sev irrelevant once EPSS wins)
+      3. CVE-COLD   (epss=0.02)
+      4. CVE-LOW2   (no epss, sev 2.1 > 2.0)
+      5. CVE-LOW1   (no epss, sev 2.0)
+    """
+    conn = db.init_db(db_path)
+    try:
+        aid_a = db.upsert_asset(conn, "10.0.0.1", "host-a", "up")
+        s80 = db.upsert_service(conn, aid_a, 80, "tcp", "http", "nginx", "1.18", None)
+        db.upsert_finding(conn, s80, "CVE-HOT", "actively exploited", "9.8", epss_score=0.94, kev=1)
+        db.upsert_finding(conn, s80, "CVE-COLD", "theoretical", "3.1", epss_score=0.02, kev=0)
+
+        aid_b = db.upsert_asset(conn, "10.0.0.2", "host-b", "up")
+        s443 = db.upsert_service(conn, aid_b, 443, "tcp", "https", "apache", "2.4", None)
+        db.upsert_finding(conn, s443, "CVE-MID", "moderate", "6.5", epss_score=0.30, kev=0)
+
+        aid_c = db.upsert_asset(conn, "10.0.0.3", "host-c", "up")
+        s22 = db.upsert_service(conn, aid_c, 22, "tcp", "ssh", "openssh", "8.2", None)
+        db.upsert_finding(conn, s22, "CVE-LOW1", "minor a", "2.0", epss_score=None, kev=0)
+        db.upsert_finding(conn, s22, "CVE-LOW2", "minor b", "2.1", epss_score=None, kev=0)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_dump_limit_one_returns_kev_finding(db_path):
+    """--limit 1 returns the single highest-priority (KEV) finding."""
+    _seed_multi_host_findings(db_path)
+    state = json.loads(dump.dump(db_path, "json", limit=1))
+    cves = _cve_ids(state)
+    assert cves == {"CVE-HOT"}
+
+
+def test_dump_limit_two_returns_top_two(db_path):
+    """--limit 2 returns KEV finding and the next-highest EPSS finding."""
+    _seed_multi_host_findings(db_path)
+    state = json.loads(dump.dump(db_path, "json", limit=2))
+    cves = _cve_ids(state)
+    assert cves == {"CVE-HOT", "CVE-MID"}
+
+
+def test_dump_limit_equals_total_returns_all(db_path):
+    """--limit N where N == total finding count is a no-op."""
+    _seed_multi_host_findings(db_path)
+    state_full = json.loads(dump.dump(db_path, "json"))
+    state_limited = json.loads(dump.dump(db_path, "json", limit=5))
+    assert _cve_ids(state_full) == _cve_ids(state_limited)
+
+
+def test_dump_limit_exceeds_total_returns_all(db_path):
+    """--limit N where N > total finding count returns all findings."""
+    _seed_multi_host_findings(db_path)
+    state_full = json.loads(dump.dump(db_path, "json"))
+    state_limited = json.loads(dump.dump(db_path, "json", limit=999))
+    assert _cve_ids(state_full) == _cve_ids(state_limited)
+
+
+def test_dump_limit_prunes_empty_assets(db_path):
+    """Assets with no surviving findings after --limit are absent from output."""
+    _seed_multi_host_findings(db_path)
+    # limit=1 keeps only CVE-HOT on host-a; host-b and host-c should be pruned
+    state = json.loads(dump.dump(db_path, "json", limit=1))
+    ips = {a["ip"] for a in state["assets"]}
+    assert ips == {"10.0.0.1"}
+
+
+def test_dump_limit_prunes_empty_services(db_path):
+    """Services with no surviving findings after --limit are absent from output."""
+    _seed_multi_host_findings(db_path)
+    # limit=2: CVE-HOT (host-a:80) + CVE-MID (host-b:443); host-a:80 keeps one, s22 absent
+    state = json.loads(dump.dump(db_path, "json", limit=2))
+    host_a = next(a for a in state["assets"] if a["ip"] == "10.0.0.1")
+    ports = {s["port"] for s in host_a["services"]}
+    assert 80 in ports  # CVE-HOT lives here
+    # CVE-COLD was on port 80 too but not in top 2; service still present for CVE-HOT
+    host_a_findings = {f["cve_id"] for s in host_a["services"] for f in s["findings"]}
+    assert "CVE-COLD" not in host_a_findings
+
+
+def test_dump_limit_none_is_no_op(db_path):
+    """Passing limit=None (the default) returns the complete dataset."""
+    _seed_multi_host_findings(db_path)
+    state_default = json.loads(dump.dump(db_path, "json"))
+    state_none = json.loads(dump.dump(db_path, "json", limit=None))
+    assert _cve_ids(state_default) == _cve_ids(state_none)
+    assert len(state_default["assets"]) == len(state_none["assets"])
+
+
+def test_dump_limit_composes_with_kev_only(db_path):
+    """--limit composes with --kev-only: cap applies after the KEV filter."""
+    _seed_multi_host_findings(db_path)
+    # kev_only first leaves only CVE-HOT; limit=1 should still return just that
+    state = json.loads(dump.dump(db_path, "json", kev_only=True, limit=1))
+    assert _cve_ids(state) == {"CVE-HOT"}
+
+
+def test_dump_limit_composes_with_min_epss(db_path):
+    """--limit composes with --min-epss: cap applied after EPSS filter."""
+    _seed_multi_host_findings(db_path)
+    # min_epss=0.1 keeps HOT(0.94) and MID(0.30), drops COLD(0.02) and the LOWs
+    # limit=1 should then return just the top of those two: CVE-HOT
+    state = json.loads(dump.dump(db_path, "json", min_epss=0.1, limit=1))
+    assert _cve_ids(state) == {"CVE-HOT"}
+
+
+def test_dump_limit_works_across_all_formats(db_path):
+    """--limit is respected for non-JSON formats (CSV, markdown, SARIF)."""
+    _seed_multi_host_findings(db_path)
+    # With limit=1 only CVE-HOT survives; check that each format reflects this
+    for fmt in ("csv", "markdown", "sarif"):
+        out = dump.dump(db_path, fmt, limit=1)
+        assert "CVE-HOT" in out, f"CVE-HOT missing from {fmt} output"
+        assert "CVE-COLD" not in out, f"CVE-COLD unexpectedly in {fmt} output"
+        assert "CVE-MID" not in out, f"CVE-MID unexpectedly in {fmt} output"
+
+
+def test_dump_limit_build_state_top_n_parameter(db_path):
+    """build_state top_n parameter applies the same cap as dump() limit."""
+    _seed_multi_host_findings(db_path)
+    conn = db.connect(db_path)
+    try:
+        from ossuary.dump import build_state
+        state = build_state(conn, top_n=1)
+    finally:
+        conn.close()
+    assert _cve_ids(state) == {"CVE-HOT"}
