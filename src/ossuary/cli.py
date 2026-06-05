@@ -344,6 +344,19 @@ def build_parser() -> argparse.ArgumentParser:
             "findings whose ip / ip:proto/port / CPE matches a listed product"
         ),
     )
+    p_dump.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "truncate the export to the N highest-priority findings, ranked "
+            "globally across the engagement by KEV flag, then descending EPSS, "
+            "descending severity, and CVE id. Composes with all other filters: "
+            "e.g. --kev-only --limit 5 returns the 5 highest-priority KEV "
+            "findings. Services and assets with no surviving findings are pruned."
+        ),
+    )
 
     p_stats = sub.add_parser(
         "stats", help="print an at-a-glance engagement summary (counts + top hits)"
@@ -774,6 +787,7 @@ def _cmd_dump(args: argparse.Namespace) -> int:
             until=args.until,
             sort_by_priority=args.sort_by_priority,
             vex_path=args.vex,
+            limit=args.limit,
         )
     )
     return 0
