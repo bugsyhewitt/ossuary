@@ -665,6 +665,19 @@ ossuary dump --db engagement-acme.db --format syft              > acme-sbom.syft
   discovered-software inventory and CVE matches are a separate
   document (run `grype` against this SBOM, or use the `grype-json`
   export, to add them).
+- **`junit`** — a **JUnit XML test-results** document — the CI
+  lingua franca natively rendered by GitHub Actions, Jenkins, GitLab
+  CI, CircleCI, Azure Pipelines, TeamCity, and every other CI system
+  that annotates builds with pass/failure test results. One
+  `<testsuite>` per discovered service (named by its
+  `ip:port/protocol` location), one `<testcase>` / `<failure>` per
+  matched CVE. The `failure` element's `type` attribute carries the
+  CVSS severity tier (`CRITICAL` / `HIGH` / `MEDIUM` / `LOW` /
+  `UNKNOWN`) so a CI gate expression like "fail the build if any
+  failure type == CRITICAL" works out of the box without a custom
+  parser. A service with no findings emits a single passing
+  `<testcase name="no-findings">` so CI reads it as a clean pass
+  rather than an empty (invalid) suite.
 
 The `json`, `csv`, and `markdown` formats cover the same fields; CSV and
 Markdown flatten the JSON nesting into these columns: `ip, hostname,
@@ -717,7 +730,7 @@ Semantics:
 
 The flags **compose** (a finding must clear every threshold given) and combine
 with `--tag` (e.g. `--tag in-scope --kev-only`). They apply identically to
-`json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, `trivy-table`, `trivy-json`, `grype-json`, `dependency-check`, and `syft`. When a filter is active, services and assets left
+`json`, `csv`, `markdown`, `html`, `sarif`, `jira`, `cyclonedx`, `spdx`, `vex`, `cdx-vex`, `trivy-table`, `trivy-json`, `grype-json`, `dependency-check`, `syft`, and `junit`. When a filter is active, services and assets left
 with no surviving findings are pruned, so the output collapses to a clean list
 of actionable hits. With no filter flags, `dump` returns the full inventory
 exactly as before (services with no findings still appear).

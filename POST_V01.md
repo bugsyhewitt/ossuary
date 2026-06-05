@@ -642,6 +642,51 @@ offline-tested.
 
 ---
 
+## Rank 21 — JUnit XML CI test-results export (`dump --format junit`)  ✅ IMPLEMENTED
+
+> Shipped: `dump` gains `--format junit`, a sixteenth export format alongside
+> json / csv / markdown / html / sarif / jira / cyclonedx / spdx / vex /
+> cdx-vex / trivy-table / trivy-json / grype-json / dependency-check / syft.
+> It emits a JUnit XML `<testsuites>` document — one `<testsuite>` per
+> discovered service (named by its `ip:port/protocol` location), one
+> `<testcase>` / `<failure>` per matched CVE. The `failure` element's `type`
+> attribute carries the CVSS severity tier (`CRITICAL` / `HIGH` / `MEDIUM` /
+> `LOW` / `UNKNOWN`) so a CI gate expression like "fail if any failure
+> type == CRITICAL" works out of the box. A service with no findings emits
+> a single passing `<testcase name="no-findings">` so CI reads it as a clean
+> pass rather than an empty (invalid) suite. Ingestible by the GitHub Actions
+> test-results renderer, Jenkins' JUnit plugin, GitLab CI's built-in
+> test-report viewer, CircleCI, Azure Pipelines, TeamCity, and every other
+> CI system that annotates builds with test results — so a hunter can publish
+> findings as CI failures with no custom parser. Rendering happens off the
+> same `dump.build_state`, so the document respects `--tag`, the R8
+> actionability filters, R9 `--sort-by-priority`, and `--vex` suppression
+> identically to every other format. An empty engagement still yields a valid
+> document with an empty `<testsuites>` wrapper. Pure-Python (no new
+> dependencies, no schema change, no network calls), fully offline-tested.
+> +14 tests.
+
+**What:** The dump-format lineage covers the two de-facto-standard vulnerability
+report shapes (SARIF for GitHub code scanning; Trivy / Grype JSON for Trivy /
+Anchore pipelines) and the major SBOM standards (CycloneDX, SPDX, Syft). The
+missing piece for the CI integration story is **JUnit XML** — the format every
+CI system renders natively as build annotations. A hunter who wants to gate a
+CI build on "no new CRITICAL CVEs" today must write a custom parser from sarif
+or json; with a junit emitter they get that gate by pointing the CI's built-in
+JUnit test-results step at `ossuary dump --format junit`.
+
+**Why now:** JUnit is the CI lingua franca — GitHub Actions, Jenkins, GitLab CI,
+CircleCI, Azure Pipelines, TeamCity all render it natively. The mapping
+(service → testsuite, CVE finding → failing testcase) is natural and clean.
+The implementation is a thin presentation layer over the existing `build_state`,
+so it inherits every filter, priority ordering, VEX suppression, and tag scope
+control for free.
+
+**Effort:** Small. A pure-Python XML builder (no stdlib xml.etree — hand-built
+for compactness), no new dependencies, no schema change, fully offline-tested.
+
+---
+
 ## Not-recommended directions (and why)
 
 | Idea | Why to skip |
