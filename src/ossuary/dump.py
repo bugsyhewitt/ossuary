@@ -10,6 +10,22 @@ findings) to one of four shapes:
                    findings still emit a row so no inventory is lost.
   * ``markdown`` — the same flat table as a GitHub-Flavoured-Markdown pipe
                    table, ready to paste into a HackerOne / Bugcrowd report.
+  * ``junit``    — a JUnit XML report (the ``<testsuites>`` / ``<testsuite>``
+                   / ``<testcase>`` shape every CI system reads natively):
+                   one ``<testsuite>`` per discovered service (named by its
+                   host:port/protocol location), one ``<testcase>`` per
+                   matched CVE, each carrying a ``<failure>`` element whose
+                   ``message`` is the CVE id and ``type`` is the CVSS severity
+                   tier. The document is ingestible by the GitHub Actions
+                   test-results renderer, Jenkins' JUnit plugin, GitLab CI's
+                   built-in test-report viewer, and every other CI system that
+                   annotates pull requests or builds with test results — so a
+                   hunter can publish findings as CI failures with no custom
+                   parser. A service with no findings emits a single passing
+                   ``<testcase>`` (``no-findings``) so the suite is never
+                   empty and CI considers it a clean pass. Like every other
+                   format it reads off ``build_state``, so it honours the same
+                   filters and priority order.
   * ``html``     — a single self-contained HTML document (inline CSS, no
                    external assets) grouping findings under each asset and
                    service, with KEV badges and severity-tier colour coding —
@@ -179,6 +195,7 @@ SUPPORTED_FORMATS = (
     "grype-json",
     "dependency-check",
     "syft",
+    "junit",
 )
 
 # Columns for the flat (CSV / Markdown) exports, in emission order. These join
@@ -2496,6 +2513,155 @@ def to_dependency_check(state: dict) -> str:
     return json.dumps(report, indent=2, sort_keys=False)
 
 
+# --------------------------------------------------------------------------
+# JUnit XML export (`--format junit`)
+# --------------------------------------------------------------------------
+#
+# JUnit XML is the CI-lingua-franca test-result interchange format: every major
+# CI system (GitHub Actions, Jenkins, GitLab CI, CircleCI, Azure Pipelines,
+# Travis CI, TeamCity, …) has a built-in renderer that consumes it natively and
+# annotates builds / pull requests with pass / failure summaries and per-case
+# drill-down. Emitting ossuary's findings as JUnit XML lets a hunter publish
+# them as CI failures — CVE found on a service = test failure, all clear = pass
+# — with no custom parser or post-processing step.
+#
+# The mapping is:
+#   <testsuites name="ossuary-engagement" tests=N failures=F>
+#     per service →
+#     <testsuite name="ip:port/protocol (product version)" tests=M failures=M|0>
+#       per finding →
+#       <testcase name="CVE-id" classname="ip:port/protocol">
+#         <failure message="CVE-id: summary" type="SEVERITY_TIER" />
+#       </testcase>
+#       (no findings → one passing <testcase name="no-findings" />)
+#     </testsuite>
+#   </testsuites>
+#
+# Severity tiers map to the same buckets the Trivy export uses (CRITICAL /
+# HIGH / MEDIUM / LOW / UNKNOWN) so a hunter's existing severity-based CI
+# gate logic keeps working without changes to the filter expression.
+#
+# The XML is hand-built (no stdlib xml.etree.ElementTree involved) to keep
+# the output compact and human-readable while staying schema-valid. Attribute
+# values are XML-escaped so a CVE summary containing `<`, `>`, `&`, or `"`
+# doesn't break the document.
+
+
+def _xml_escape_attr(value: str) -> str:
+    """Escape a string for use as an XML attribute value (double-quoted)."""
+    return (
+        value
+        .replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _junit_failure_message(finding: dict) -> str:
+    """Build the ``failure`` element's ``message`` attribute text.
+
+    Carries the CVE id, the CVSS severity score (when present), EPSS
+    exploit-probability (when present), whether the finding is in the CISA KEV
+    catalog, and the free-text summary — everything a developer needs to triage
+    the failure from the CI annotation without leaving the build UI.
+    """
+    cve_id = finding.get("cve_id") or "UNKNOWN"
+    parts = [cve_id]
+    sev = finding.get("severity")
+    if sev not in (None, ""):
+        parts.append(f"severity={sev}")
+    epss = finding.get("epss_score")
+    if isinstance(epss, (int, float)):
+        parts.append(f"epss={epss:.2f}")
+    if finding.get("kev"):
+        parts.append("KEV")
+    summary = finding.get("summary") or ""
+    if summary:
+        parts.append(summary)
+    return " — ".join(parts)
+
+
+def to_junit(state: dict) -> str:
+    """Serialise the engagement state as a JUnit XML test-results document.
+
+    Emits a ``<testsuites>`` document with one ``<testsuite>`` per discovered
+    service and one ``<testcase>``/``<failure>`` per matched CVE — the shape
+    every CI system (GitHub Actions, Jenkins, GitLab CI, CircleCI, Azure
+    Pipelines, …) renders natively as build annotations. A service with no
+    findings emits a single passing ``<testcase name="no-findings">`` so the
+    suite is never empty and CI considers the service clean.
+
+    The ``failure`` element's ``type`` attribute carries the CVSS severity tier
+    (``CRITICAL`` / ``HIGH`` / ``MEDIUM`` / ``LOW`` / ``UNKNOWN``) so a CI gate
+    expression like "fail if any failure type == CRITICAL" works out of the box.
+
+    Like every other dump format this reads off ``build_state``, so the
+    document honours ``--tag``, the actionability filters (``--kev-only``
+    / ``--min-epss`` / ``--min-severity``), ``--since`` / ``--until``,
+    ``--sort-by-priority`` and ``--vex`` suppression identically. An empty
+    engagement still yields a valid document with an empty ``<testsuites>``
+    wrapper.
+    """
+    total_tests = 0
+    total_failures = 0
+    suite_lines: list[str] = []
+
+    for asset in state["assets"]:
+        ip = asset["ip"]
+        host = asset.get("hostname")
+        for svc in asset["services"]:
+            port = svc["port"]
+            protocol = svc["protocol"]
+            product = svc.get("product")
+            version = svc.get("version")
+            svc_detail = " ".join(p for p in (product, version) if p)
+            suite_name = f"{ip}:{port}/{protocol}" + (
+                f" ({svc_detail})" if svc_detail else ""
+            )
+            classname = f"{ip}:{port}/{protocol}"
+            findings = svc["findings"]
+            n_failures = len(findings)
+            n_tests = max(n_failures, 1)  # at least 1 (the no-findings case)
+
+            total_tests += n_tests
+            total_failures += n_failures
+
+            suite_lines.append(
+                f'  <testsuite name="{_xml_escape_attr(suite_name)}"'
+                f' tests="{n_tests}" failures="{n_failures}">'
+            )
+            if not findings:
+                suite_lines.append(
+                    f'    <testcase name="no-findings"'
+                    f' classname="{_xml_escape_attr(classname)}" />'
+                )
+            else:
+                for f in findings:
+                    cve_id = f.get("cve_id") or "UNKNOWN"
+                    sev_tier = _trivy_severity(f.get("severity"))
+                    msg = _junit_failure_message(f)
+                    suite_lines.append(
+                        f'    <testcase name="{_xml_escape_attr(cve_id)}"'
+                        f' classname="{_xml_escape_attr(classname)}">'
+                    )
+                    suite_lines.append(
+                        f'      <failure message="{_xml_escape_attr(msg)}"'
+                        f' type="{sev_tier}" />'
+                    )
+                    suite_lines.append("    </testcase>")
+            suite_lines.append("  </testsuite>")
+
+    lines: list[str] = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<testsuites name="ossuary-engagement"'
+        f' tests="{total_tests}" failures="{total_failures}">',
+        *suite_lines,
+        "</testsuites>",
+    ]
+    return "\n".join(lines)
+
+
 def dump(
     db_path: str | Path,
     fmt: str = "json",
@@ -2610,6 +2776,8 @@ def dump(
         return to_dependency_check(state)
     if fmt == "syft":
         return to_syft(state)
+    if fmt == "junit":
+        return to_junit(state)
     return json.dumps(state, indent=2, sort_keys=False)
 
 

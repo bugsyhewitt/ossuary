@@ -2815,3 +2815,164 @@ def test_dump_syft_artifact_id_is_stable_per_host_port_proto(db_path):
     _seed_one_finding(db_path)
     doc = json.loads(dump.dump(db_path, "syft"))
     assert doc["artifacts"][0]["id"] == "10.10.0.5-80-tcp"
+
+
+# --------------------------------------------------------------------------
+# JUnit XML export (POST_V01 Rank 21)
+# --------------------------------------------------------------------------
+
+
+def test_dump_junit_is_valid_xml_header(db_path):
+    """JUnit output starts with an XML declaration and a <testsuites> root."""
+    _seed_one_finding(db_path)
+    out = dump.dump(db_path, "junit")
+    assert out.startswith('<?xml version="1.0" encoding="UTF-8"?>')
+    assert "<testsuites" in out
+    assert "</testsuites>" in out
+
+
+def test_dump_junit_one_testsuite_per_service(db_path):
+    """Each discovered service produces exactly one <testsuite> element."""
+    _seed_mixed_findings(db_path)
+    out = dump.dump(db_path, "junit")
+    assert out.count("<testsuite ") == 2
+
+
+def test_dump_junit_one_testcase_per_finding(db_path):
+    """Each matched CVE produces exactly one <testcase> element with a failure."""
+    _seed_one_finding(db_path)
+    out = dump.dump(db_path, "junit")
+    assert out.count("<testcase ") == 1
+    assert out.count("<failure ") == 1
+    assert "CVE-2021-23017" in out
+
+
+def test_dump_junit_service_no_findings_emits_passing_testcase(db_path):
+    """A service with no findings emits a single passing <testcase name='no-findings'>."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", "host-a", "up")
+        db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.18.0", None)
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = dump.dump(db_path, "junit")
+    assert 'name="no-findings"' in out
+    # A passing testcase has no <failure> child.
+    assert "<failure " not in out
+
+
+def test_dump_junit_empty_db_is_valid(db_path):
+    """An empty engagement yields a valid <testsuites> document with no suites."""
+    db.init_db(db_path).close()
+    out = dump.dump(db_path, "junit")
+    assert "<testsuites" in out
+    assert "<testsuite " not in out
+    assert 'tests="0"' in out
+    assert 'failures="0"' in out
+
+
+def test_dump_junit_failure_type_is_severity_tier(db_path):
+    """The failure type attribute carries the CVSS severity tier (CRITICAL/HIGH/etc.)."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", None, "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.18.0", None)
+        db.upsert_finding(conn, sid, "CVE-CRIT", "critical finding", "9.5")
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = dump.dump(db_path, "junit")
+    assert 'type="CRITICAL"' in out
+
+
+def test_dump_junit_failure_type_high(db_path):
+    """Severity 7.0-8.9 maps to HIGH tier in the failure type attribute."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", None, "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.18.0", None)
+        db.upsert_finding(conn, sid, "CVE-HIGH", "high finding", "7.7")
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = dump.dump(db_path, "junit")
+    assert 'type="HIGH"' in out
+
+
+def test_dump_junit_failure_message_includes_cve_and_summary(db_path):
+    """The failure message attribute contains the CVE id and summary text."""
+    _seed_one_finding(db_path)
+    out = dump.dump(db_path, "junit")
+    assert "CVE-2021-23017" in out
+    assert "off-by-one" in out
+
+
+def test_dump_junit_failure_message_includes_kev_marker(db_path):
+    """A KEV finding's failure message carries a KEV marker."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", None, "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.18.0", None)
+        db.upsert_finding(conn, sid, "CVE-KEV", "actively exploited", "9.8",
+                          epss_score=0.94, kev=1)
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = dump.dump(db_path, "junit")
+    assert "KEV" in out
+
+
+def test_dump_junit_testsuite_name_includes_host_and_port(db_path):
+    """The testsuite name attribute includes the host IP and service port."""
+    _seed_one_finding(db_path)
+    out = dump.dump(db_path, "junit")
+    assert "10.10.0.5" in out
+    assert "80" in out
+
+
+def test_dump_junit_total_tests_and_failures_counts(db_path):
+    """The testsuites tests= and failures= attributes count across all suites."""
+    _seed_mixed_findings(db_path)
+    out = dump.dump(db_path, "junit")
+    # 3 findings total across 2 services; each finding = 1 test + 1 failure
+    assert 'failures="3"' in out
+    assert 'tests="3"' in out
+
+
+def test_dump_junit_xml_attribute_escaping(db_path):
+    """Special XML characters in a summary are escaped in the failure message."""
+    conn = db.init_db(db_path)
+    try:
+        aid = db.upsert_asset(conn, "10.10.0.5", None, "up")
+        sid = db.upsert_service(conn, aid, 80, "tcp", "http", "nginx", "1.18.0", None)
+        db.upsert_finding(conn, sid, "CVE-ESCAPE",
+                          'summary with <tag> & "quotes"', "7.0")
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = dump.dump(db_path, "junit")
+    # Raw < and & must not appear unescaped in attribute values.
+    # The escaped versions must be present.
+    assert "&lt;tag&gt;" in out or "&lt;" in out
+    assert "&amp;" in out
+
+
+def test_dump_junit_filters_apply(db_path):
+    """Actionability filters (kev_only) trim findings in the JUnit output."""
+    _seed_mixed_findings(db_path)
+    full_out = dump.dump(db_path, "junit")
+    kev_out = dump.dump(db_path, "junit", kev_only=True)
+    full_count = full_out.count("<failure ")
+    kev_count = kev_out.count("<failure ")
+    assert kev_count < full_count
+
+
+def test_dump_junit_is_in_supported_formats():
+    """junit is listed in SUPPORTED_FORMATS."""
+    assert "junit" in dump.SUPPORTED_FORMATS

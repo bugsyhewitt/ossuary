@@ -217,6 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
             "grype-json",
             "dependency-check",
             "syft",
+            "junit",
         ],
         help=(
             "output format: json (nested), csv or markdown (flat, one finding "
@@ -262,7 +263,14 @@ def build_parser() -> argparse.ArgumentParser:
             "the Syft GitHub Action, Grype, Anchore Enterprise, Harbor, "
             "DefectDojo's Anchore / Syft parsers, dependency-track-Syft — "
             "component-centric like cyclonedx / spdx, so services with no "
-            "findings still appear)"
+            "findings still appear), "
+            "or junit (JUnit XML — one <testsuite> per discovered service, one "
+            "<testcase>/<failure> per matched CVE, ingestible by GitHub Actions "
+            "test-results, Jenkins JUnit plugin, GitLab CI test-report viewer, "
+            "and every CI system that annotates builds with test results; the "
+            "failure type attribute carries the CVSS severity tier so a CI gate "
+            "expression like 'fail if any failure type == CRITICAL' works "
+            "out of the box)"
         ),
     )
     p_dump.add_argument(
