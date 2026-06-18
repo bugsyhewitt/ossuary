@@ -41,3 +41,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "ship_gate: v0.1 release ship-gate (slow; runs build + fresh venv install + end-to-end)",
+]
