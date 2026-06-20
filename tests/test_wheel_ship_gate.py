@@ -71,8 +71,8 @@ def test_wheel_builds_cleanly(tmp_path):
         [sys.executable, "-m", "build", "--wheel", "--sdist", "--outdir", str(out)],
         cwd=str(REPO_ROOT),
     )
-    wheels = list(out.glob("ossuary-0.1.0-*.whl"))
-    sdists = list(out.glob("ossuary-0.1.0.tar.gz"))
+    wheels = list(out.glob("ossuary-1.0.0-*.whl"))
+    sdists = list(out.glob("ossuary-1.0.0.tar.gz"))
     assert wheels, f"wheel not built; got: {sorted(p.name for p in out.iterdir())}"
     assert sdists, f"sdist not built; got: {sorted(p.name for p in out.iterdir())}"
     test_wheel_builds_cleanly._wheel = wheels[0]
@@ -90,19 +90,19 @@ def test_wheel_installs_into_fresh_venv(tmp_path):
     _run([str(pip), "install", "--quiet", str(wheel), "--no-deps"])
     _run([str(pip), "install", "--quiet", *_RUNTIME_DEPS])
     version = _run([str(venv_dir / "bin" / "ossuary"), "--version"]).stdout.strip()
-    assert version == "ossuary 0.1.0", f"unexpected version output: {version!r}"
+    assert version == "ossuary 1.0.0", f"unexpected version output: {version!r}"
     test_wheel_installs_into_fresh_venv._venv_dir = venv_dir
 
 
 @pytest.mark.ship_gate
 def test_wheel_version_importable_in_fresh_venv():
-    """`import ossuary; assert ossuary.__version__ == '0.1.0'` in fresh venv."""
+    """`import ossuary; assert ossuary.__version__ == '1.0.0'` in fresh venv."""
     venv_dir = getattr(test_wheel_installs_into_fresh_venv, "_venv_dir", None)
     if venv_dir is None:
         pytest.skip("preceding test did not install a wheel")
     py = venv_dir / "bin" / "python"
     _run(
-        [str(py), "-c", "import ossuary; assert ossuary.__version__ == '0.1.0'"]
+        [str(py), "-c", "import ossuary; assert ossuary.__version__ == '1.0.0'"]
     )
 
 
@@ -137,4 +137,18 @@ def test_installed_wheel_profiles_subcommand():
     assert not missing, (
         f"profiles subcommand missing expected names: {missing}; "
         f"got {sorted(listed)}"
+    )
+
+
+@pytest.mark.ship_gate
+def test_changelog_exists_with_v1_0_0_entry():
+    """Repo-root CHANGELOG.md must contain a top-level `## [1.0.0] - 2026-06-20`
+    Keep-a-Changelog v1.1.0 section so the v1.0 release contract is on disk and
+    future releases that forget the CHANGELOG fail this ship-gate.
+    """
+    changelog = REPO_ROOT / "CHANGELOG.md"
+    assert changelog.is_file(), f"CHANGELOG.md not found at {changelog}"
+    text = changelog.read_text(encoding="utf-8")
+    assert "## [1.0.0] - 2026-06-20" in text, (
+        f"CHANGELOG.md missing v1.0.0 entry; first 200 chars: {text[:200]!r}"
     )
