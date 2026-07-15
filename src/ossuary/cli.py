@@ -201,24 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_dump.add_argument(
         "--format",
         default="json",
-        choices=[
-            "json",
-            "csv",
-            "markdown",
-            "html",
-            "sarif",
-            "jira",
-            "cyclonedx",
-            "spdx",
-            "vex",
-            "cdx-vex",
-            "trivy-table",
-            "trivy-json",
-            "grype-json",
-            "dependency-check",
-            "syft",
-            "junit",
-        ],
+        choices=list(dump_mod.SUPPORTED_FORMATS),
         help=(
             "output format: json (nested), csv or markdown (flat, one finding "
             "per row), html (self-contained report grouped per asset), sarif "
@@ -251,8 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
             "artifact + matchDetails per finding, byte-recognisable to the "
             "Grype GitHub Action, Anchore Enterprise, Harbor, DefectDojo's "
             "Grype parser, so an engagement's findings drop into either the "
-            "Trivy or the Grype CI pipeline without learning a new layout)"
-            "in a workflow already tuned for Trivy output), or "
+            "Trivy or the Grype CI pipeline without learning a new layout), or "
             "dependency-check (an OWASP Dependency-Check JSON report — one "
             "'dependency' per discovered service and one 'vulnerability' per "
             "matched CVE, ingestible by DefectDojo's Dependency Check Scan "
