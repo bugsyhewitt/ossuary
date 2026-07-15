@@ -590,6 +590,21 @@ def _cell(value) -> str:
     return "" if value is None else str(value)
 
 
+def _svc_detail(svc: dict) -> str:
+    """Return a concise ``"<product> <version>"`` label for a service.
+
+    Either field may be absent; the present ones are joined with a space. An
+    empty string is returned when neither is known (callers fall back to the
+    bare ``proto/port`` identifier in that case).
+    """
+    return " ".join(p for p in (svc.get("product"), svc.get("version")) if p)
+
+
+def _host_label(ip: str, host: str | None) -> str:
+    """Return ``"ip (hostname)"`` when the hostname is known, else just the IP."""
+    return f"{ip} ({host})" if host else ip
+
+
 def to_csv(state: dict) -> str:
     """Serialise the engagement state as CSV with a header row."""
     buf = io.StringIO()
@@ -801,14 +816,14 @@ def _sarif_results_and_rules(state: dict) -> tuple[list[dict], list[dict]]:
     for asset in state["assets"]:
         ip = asset["ip"]
         host = asset.get("hostname")
-        host_label = f"{ip} ({host})" if host else ip
+        host_label = _host_label(ip, host)
         for svc in asset["services"]:
             port = svc["port"]
             protocol = svc["protocol"]
             location_uri = f"{ip}:{protocol}/{port}"
             product = svc.get("product")
             version = svc.get("version")
-            svc_detail = " ".join(p for p in (product, version) if p)
+            svc_detail = _svc_detail(svc)
             for f in svc["findings"]:
                 cve_id = f.get("cve_id") or "UNKNOWN"
                 summary = f.get("summary") or ""
@@ -967,14 +982,14 @@ def _jira_rows(state: dict) -> list[dict]:
     for asset in state["assets"]:
         ip = asset["ip"]
         host = asset.get("hostname")
-        host_label = f"{ip} ({host})" if host else ip
+        host_label = _host_label(ip, host)
         asset_tags = list(asset.get("tags") or [])
         for svc in asset["services"]:
             port = svc["port"]
             protocol = svc["protocol"]
             product = svc.get("product")
             version = svc.get("version")
-            svc_detail = " ".join(p for p in (product, version) if p)
+            svc_detail = _svc_detail(svc)
             component = svc_detail or f"{protocol}/{port}"
             for f in svc["findings"]:
                 cve_id = f.get("cve_id") or "UNKNOWN"
@@ -1129,7 +1144,7 @@ def _cyclonedx_components_and_vulns(
             purl = _purl(svc.get("product"), svc.get("version"))
             if purl:
                 component["purl"] = purl
-            host_label = f"{ip} ({host})" if host else ip
+            host_label = _host_label(ip, host)
             component["properties"] = [
                 {"name": "ossuary:host", "value": host_label},
                 {"name": "ossuary:port", "value": f"{protocol}/{port}"},
@@ -1322,7 +1337,7 @@ def _spdx_packages_and_relationships(
             }
             if svc.get("version"):
                 package["versionInfo"] = str(svc["version"])
-            host_label = f"{ip} ({host})" if host else ip
+            host_label = _host_label(ip, host)
             package["comment"] = (
                 f"discovered service on {host_label} {protocol}/{port}"
             )
@@ -1651,7 +1666,7 @@ def _trivy_targets(state: dict) -> list[dict]:
             protocol = svc["protocol"]
             product = svc.get("product")
             version = svc.get("version")
-            svc_detail = " ".join(p for p in (product, version) if p)
+            svc_detail = _svc_detail(svc)
             target_label = f"{host_label}:{port}/{protocol}" + (
                 f" ({svc_detail})" if svc_detail else ""
             )
@@ -1905,7 +1920,7 @@ def _trivy_json_result(asset: dict, svc: dict) -> dict:
     protocol = svc["protocol"]
     product = svc.get("product")
     version = svc.get("version")
-    svc_detail = " ".join(p for p in (product, version) if p)
+    svc_detail = _svc_detail(svc)
     target_label = f"{host_label}:{port}/{protocol}" + (
         f" ({svc_detail})" if svc_detail else ""
     )
@@ -2317,25 +2332,9 @@ def to_grype_json(state: dict) -> str:
 # a CycloneDX/SARIF-style ``properties`` map on each vulnerability,
 # preserving the data without breaking parsers that ignore unknown fields.
 
-# Dependency-Check buckets numeric CVSS into the same upper-case tiers Trivy
-# uses (CRITICAL / HIGH / MEDIUM / LOW / UNKNOWN). Mirror the same tiering
-# the rest of the module uses so a hunter reads one consistent severity
-# taxonomy across every surface.
-def _depcheck_severity(value) -> str:
-    """Map a finding's severity to a Dependency-Check upper-case label."""
-    sev = _parse_severity(value)
-    if sev is None:
-        return "UNKNOWN"
-    if sev >= 9.0:
-        return "CRITICAL"
-    if sev >= 7.0:
-        return "HIGH"
-    if sev >= 4.0:
-        return "MEDIUM"
-    if sev > 0.0:
-        return "LOW"
-    return "UNKNOWN"
-
+# Dependency-Check uses the same upper-case CVSS tiers as Trivy (CRITICAL /
+# HIGH / MEDIUM / LOW / UNKNOWN); re-use _trivy_severity rather than
+# duplicating the identical ladder here.
 
 def _depcheck_dependency(asset: dict, svc: dict) -> dict:
     """Build one Dependency-Check ``dependency`` entry for a discovered service.
@@ -2360,8 +2359,8 @@ def _depcheck_dependency(asset: dict, svc: dict) -> dict:
     name = svc.get("name")
 
     location = f"{ip}:{protocol}/{port}"
-    host_label = f"{ip} ({host})" if host else ip
-    svc_detail = " ".join(p for p in (product, version) if p)
+    host_label = _host_label(ip, host)
+    svc_detail = _svc_detail(svc)
     description = (
         f"Network service on {host_label} at {protocol}/{port}"
         + (f" ({svc_detail})" if svc_detail else "")
@@ -2451,7 +2450,7 @@ def _depcheck_vulnerability(finding: dict, cpe) -> dict:
     cve_id = finding.get("cve_id") or "UNKNOWN"
     summary = finding.get("summary") or ""
     sev = _parse_severity(finding.get("severity"))
-    severity_label = _depcheck_severity(finding.get("severity"))
+    severity_label = _trivy_severity(finding.get("severity"))
     source_name = (finding.get("source") or "OSV").upper()
 
     vuln: dict = {
@@ -2663,7 +2662,7 @@ def to_junit(state: dict) -> str:
             protocol = svc["protocol"]
             product = svc.get("product")
             version = svc.get("version")
-            svc_detail = " ".join(p for p in (product, version) if p)
+            svc_detail = _svc_detail(svc)
             suite_name = f"{ip}:{port}/{protocol}" + (
                 f" ({svc_detail})" if svc_detail else ""
             )
@@ -2802,37 +2801,7 @@ def dump(
         )
     finally:
         conn.close()
-    if fmt == "csv":
-        return to_csv(state)
-    if fmt == "markdown":
-        return to_markdown(state)
-    if fmt == "html":
-        return to_html(state)
-    if fmt == "sarif":
-        return to_sarif(state)
-    if fmt == "jira":
-        return to_jira(state)
-    if fmt == "cyclonedx":
-        return to_cyclonedx(state)
-    if fmt == "spdx":
-        return to_spdx(state)
-    if fmt == "vex":
-        return to_vex(state)
-    if fmt == "cdx-vex":
-        return to_cdx_vex(state)
-    if fmt == "trivy-table":
-        return to_trivy_table(state)
-    if fmt == "trivy-json":
-        return to_trivy_json(state)
-    if fmt == "grype-json":
-        return to_grype_json(state)
-    if fmt == "dependency-check":
-        return to_dependency_check(state)
-    if fmt == "syft":
-        return to_syft(state)
-    if fmt == "junit":
-        return to_junit(state)
-    return json.dumps(state, indent=2, sort_keys=False)
+    return _FORMAT_DISPATCH[fmt](state)
 
 
 # --------------------------------------------------------------------------
@@ -2878,13 +2847,6 @@ def _syft_artifact_id(ip: str, protocol, port) -> str:
     return f"{ip}-{port}-{protocol}"
 
 
-def _syft_purl(product: str | None, version: str | None) -> str | None:
-    if not product:
-        return None
-    if version:
-        return f"pkg:generic/{product}@{version}"
-    return f"pkg:generic/{product}"
-
 
 def _syft_artifact(asset: dict, service: dict) -> dict:
     """Render one discovered service as a Syft ``artifacts[]`` entry.
@@ -2917,7 +2879,7 @@ def _syft_artifact(asset: dict, service: dict) -> dict:
         "licenses": [],
         "language": "",
         "cpes": [str(cpe)] if cpe else [],
-        "purl": _syft_purl(product, version) or "",
+        "purl": _grype_purl(product, version) or "",
         "metadataType": "",
         "metadata": None,
     }
@@ -2999,3 +2961,36 @@ def to_syft(state: dict) -> str:
         },
     }
     return json.dumps(document, indent=2, sort_keys=False)
+
+
+# --------------------------------------------------------------------------
+# Format dispatch table
+# --------------------------------------------------------------------------
+# Single source of truth mapping format name → serialiser. dump() indexes
+# into this dict; the if/elif chain it replaces added a new branch per
+# format. Adding a format now requires only: a new to_<fmt>() function and
+# one entry here (plus a SUPPORTED_FORMATS entry for validation).
+
+def _to_json(state: dict) -> str:
+    """Serialise the engagement state as the native nested JSON format."""
+    return json.dumps(state, indent=2, sort_keys=False)
+
+
+_FORMAT_DISPATCH: dict = {
+    "json": _to_json,
+    "csv": to_csv,
+    "markdown": to_markdown,
+    "html": to_html,
+    "sarif": to_sarif,
+    "jira": to_jira,
+    "cyclonedx": to_cyclonedx,
+    "spdx": to_spdx,
+    "vex": to_vex,
+    "cdx-vex": to_cdx_vex,
+    "trivy-table": to_trivy_table,
+    "trivy-json": to_trivy_json,
+    "grype-json": to_grype_json,
+    "dependency-check": to_dependency_check,
+    "syft": to_syft,
+    "junit": to_junit,
+}
