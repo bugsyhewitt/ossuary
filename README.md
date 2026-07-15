@@ -1,5 +1,9 @@
 # ossuary
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/bugsyhewitt/bugsyhewitt.github.io/main/public/cards/ossuary.jpg" alt="ossuary" width="680">
+</p>
+
 **A SQLite-backed local network asset inventory and cruise scanner for solo bug bounty hunters.**
 
 ossuary is the *state-tracking layer* for a bug bounty engagement. Other tools
