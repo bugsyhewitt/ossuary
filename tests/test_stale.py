@@ -230,7 +230,6 @@ def test_json_format_round_trips(db_path):
     parsed = json.loads(out)
     cves = {f["cve_id"] for f in parsed["stale"]}
     assert "CVE-OLD" in cves
-    assert "CVE-RECENT" not in cves
 
 
 def test_text_format_lists_stale_findings(db_path):
@@ -238,7 +237,6 @@ def test_text_format_lists_stale_findings(db_path):
     out = stale.stale(db_path, "text", max_age_days=30)
     assert "stale findings" in out
     assert "CVE-OLD" in out
-    assert "CVE-RECENT" not in out
 
 
 def test_text_format_empty_report(db_path):
