@@ -131,7 +131,10 @@ _ASSETS_MIGRATIONS = (
 # profile fingerprinted the service, letting cruise flag profile mismatches when
 # a service is re-fingerprinted under a different profile than before.
 _SERVICES_MIGRATIONS = (
-    ("scan_profile", "ALTER TABLE services ADD COLUMN scan_profile TEXT NOT NULL DEFAULT 'default'"),
+    (
+        "scan_profile",
+        "ALTER TABLE services ADD COLUMN scan_profile TEXT NOT NULL DEFAULT 'default'",
+    ),
 )
 
 

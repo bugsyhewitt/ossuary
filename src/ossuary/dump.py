@@ -987,8 +987,6 @@ def _jira_rows(state: dict) -> list[dict]:
         for svc in asset["services"]:
             port = svc["port"]
             protocol = svc["protocol"]
-            product = svc.get("product")
-            version = svc.get("version")
             svc_detail = _svc_detail(svc)
             component = svc_detail or f"{protocol}/{port}"
             for f in svc["findings"]:
@@ -1918,8 +1916,6 @@ def _trivy_json_result(asset: dict, svc: dict) -> dict:
     host_label = f"{host} ({ip})" if host else ip
     port = svc["port"]
     protocol = svc["protocol"]
-    product = svc.get("product")
-    version = svc.get("version")
     svc_detail = _svc_detail(svc)
     target_label = f"{host_label}:{port}/{protocol}" + (
         f" ({svc_detail})" if svc_detail else ""
@@ -2656,12 +2652,9 @@ def to_junit(state: dict) -> str:
 
     for asset in state["assets"]:
         ip = asset["ip"]
-        host = asset.get("hostname")
         for svc in asset["services"]:
             port = svc["port"]
             protocol = svc["protocol"]
-            product = svc.get("product")
-            version = svc.get("version")
             svc_detail = _svc_detail(svc)
             suite_name = f"{ip}:{port}/{protocol}" + (
                 f" ({svc_detail})" if svc_detail else ""
