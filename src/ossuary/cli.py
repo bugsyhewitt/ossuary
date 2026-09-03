@@ -8,7 +8,8 @@ Subcommands (v0.1):
     match-cves   query OSV.dev for service versions -> findings table
     cruise       re-fingerprint, diff against last state, report changes
     watch        run cruise on an interval, emitting a diff summary each pass
-    dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/CycloneDX/SPDX/VEX/Trivy-table/Dependency-Check
+    dump         export engagement state as JSON/CSV/Markdown/HTML/SARIF/Jira/
+                 CycloneDX/SPDX/VEX/Trivy-table/Dependency-Check
     web          list the recorded web-probe inventory (read companion to probe)
     stats        print a top-of-funnel engagement summary (counts + top hits)
     stale        flag findings not re-confirmed within N days (age staleness)
@@ -25,11 +26,19 @@ import argparse
 import json
 import sys
 
-from . import __version__, cruise as cruise_mod, cves, db, discover as discover_mod
-from . import dump as dump_mod, fingerprint as fingerprint_mod, probe as probe_mod
-from . import findingdiff as findingdiff_mod, profiles as profiles_mod
-from . import stale as stale_mod, stats as stats_mod, tags as tags_mod
-from . import watch as watch_mod, web as web_mod
+from . import __version__, cves, db
+from . import cruise as cruise_mod
+from . import discover as discover_mod
+from . import dump as dump_mod
+from . import findingdiff as findingdiff_mod
+from . import fingerprint as fingerprint_mod
+from . import probe as probe_mod
+from . import profiles as profiles_mod
+from . import stale as stale_mod
+from . import stats as stats_mod
+from . import tags as tags_mod
+from . import watch as watch_mod
+from . import web as web_mod
 
 
 def _add_db_arg(parser: argparse.ArgumentParser) -> None:
