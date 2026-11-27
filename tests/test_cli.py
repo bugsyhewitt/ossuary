@@ -861,3 +861,426 @@ def test_cli_stats_filter_header_records_scope(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "severity>=7" in out.splitlines()[0]
+
+
+# ---------------------------------------------------------------------------
+# Additional CLI coverage — flags and subcommands not in the tests above
+# ---------------------------------------------------------------------------
+
+
+def _seed_findings_db(tmp_path):
+    """init + one asset + one service + two findings; returns db path."""
+    import sqlite3
+
+    db_file = str(tmp_path / "eng.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("INSERT INTO assets (id, ip, state) VALUES (1, '10.10.0.5', 'up')")
+        conn.execute(
+            "INSERT INTO services (id, asset_id, port, protocol, name, product, version) "
+            "VALUES (1, 1, 80, 'tcp', 'http', 'nginx', '1.18.0')"
+        )
+        conn.execute(
+            "INSERT INTO findings (service_id, cve_id, summary, severity, epss_score, kev) "
+            "VALUES (1, 'CVE-HOT', 'exploited', '9.8', 0.94, 1)"
+        )
+        conn.execute(
+            "INSERT INTO findings (service_id, cve_id, summary, severity, epss_score, kev) "
+            "VALUES (1, 'CVE-COLD', 'low risk', '3.1', 0.02, 0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_file
+
+
+def test_cli_dump_limit_flag(tmp_path, capsys):
+    db_file = _seed_findings_db(tmp_path)
+    capsys.readouterr()
+    rc = cli.main(["dump", "--db", db_file, "--limit", "1", "--sort-by-priority"])
+    assert rc == 0
+    state = json.loads(capsys.readouterr().out)
+    cves = [
+        f["cve_id"]
+        for a in state["assets"]
+        for s in a["services"]
+        for f in s["findings"]
+    ]
+    assert len(cves) == 1
+    assert cves[0] == "CVE-HOT"
+
+
+def test_cli_dump_min_severity_filter(tmp_path, capsys):
+    db_file = _seed_findings_db(tmp_path)
+    capsys.readouterr()
+    rc = cli.main(["dump", "--db", db_file, "--min-severity", "7.0"])
+    assert rc == 0
+    state = json.loads(capsys.readouterr().out)
+    cves = [
+        f["cve_id"]
+        for a in state["assets"]
+        for s in a["services"]
+        for f in s["findings"]
+    ]
+    assert "CVE-HOT" in cves
+    assert "CVE-COLD" not in cves
+
+
+def test_cli_dump_min_epss_filter(tmp_path, capsys):
+    db_file = _seed_findings_db(tmp_path)
+    capsys.readouterr()
+    rc = cli.main(["dump", "--db", db_file, "--min-epss", "0.5"])
+    assert rc == 0
+    state = json.loads(capsys.readouterr().out)
+    cves = [
+        f["cve_id"]
+        for a in state["assets"]
+        for s in a["services"]
+        for f in s["findings"]
+    ]
+    assert cves == ["CVE-HOT"]
+
+
+def test_cli_dump_grype_json_format(tmp_path, capsys):
+    db_file = _seed_findings_db(tmp_path)
+    capsys.readouterr()
+    rc = cli.main(["dump", "--db", db_file, "--format", "grype-json"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert "matches" in doc
+    ids = [m["vulnerability"]["id"] for m in doc["matches"]]
+    assert "CVE-HOT" in ids
+
+
+def test_cli_dump_vex_format(tmp_path, capsys):
+    db_file = _seed_findings_db(tmp_path)
+    capsys.readouterr()
+    rc = cli.main(["dump", "--db", db_file, "--format", "vex"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert "@context" in doc
+    assert "statements" in doc
+    cve_names = [s["vulnerability"]["name"] for s in doc["statements"]]
+    assert "CVE-HOT" in cve_names
+
+
+def test_cli_dump_trivy_json_format(tmp_path, capsys):
+    db_file = _seed_findings_db(tmp_path)
+    capsys.readouterr()
+    rc = cli.main(["dump", "--db", db_file, "--format", "trivy-json"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["SchemaVersion"] == 2
+    assert "Results" in doc
+
+
+def test_cli_dump_syft_format(tmp_path, capsys):
+    db_file = _seed_findings_db(tmp_path)
+    capsys.readouterr()
+    rc = cli.main(["dump", "--db", db_file, "--format", "syft"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert "artifacts" in doc
+    assert any(a["name"] == "nginx" for a in doc["artifacts"])
+
+
+def test_cli_dump_junit_format(tmp_path, capsys):
+    db_file = _seed_findings_db(tmp_path)
+    capsys.readouterr()
+    rc = cli.main(["dump", "--db", db_file, "--format", "junit"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "<testsuites" in out or "<testsuite" in out
+    assert "CVE-HOT" in out
+
+
+def test_cli_profiles_subcommand_lists_all_profiles(capsys):
+    rc = cli.main(["profiles"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    for profile in ("default", "stealth", "aggressive", "web"):
+        assert profile in out
+
+
+def test_cli_discover_with_stealth_profile(tmp_path, monkeypatch, capsys):
+    db_file = str(tmp_path / "eng.db")
+    tfile = tmp_path / "targets.txt"
+    tfile.write_text("10.10.0.5\n")
+    cli.main(["init", "--db", db_file])
+
+    seen_args: list[str] = []
+
+    def fake_scan_hosts(targets, arguments="-sn"):
+        seen_args.append(arguments)
+        return host_discovery_result(up_ips=["10.10.0.5"])
+
+    monkeypatch.setattr(discover, "scan_hosts", fake_scan_hosts)
+    capsys.readouterr()
+    rc = cli.main(["discover", "--db", db_file, "--targets", str(tfile), "--profile", "stealth"])
+    assert rc == 0
+    # stealth profile uses -T2 / -Pn flags
+    assert any("-T2" in a for a in seen_args)
+
+
+def test_cli_fingerprint_with_web_profile(tmp_path, monkeypatch, capsys):
+    db_file = str(tmp_path / "eng.db")
+    tfile = tmp_path / "targets.txt"
+    tfile.write_text("10.10.0.5\n")
+    cli.main(["init", "--db", db_file])
+
+    monkeypatch.setattr(
+        discover, "scan_hosts",
+        lambda targets, arguments="-sn": host_discovery_result(up_ips=["10.10.0.5"]),
+    )
+    cli.main(["discover", "--db", db_file, "--targets", str(tfile)])
+
+    seen_args: list[str] = []
+
+    def fake_scan_services(ip, arguments="-sV"):
+        seen_args.append(arguments)
+        return service_scan_result(
+            ip, [{"port": 80, "name": "http", "product": "nginx", "version": "1.18.0"}]
+        )
+
+    monkeypatch.setattr(fingerprint, "scan_services", fake_scan_services)
+    capsys.readouterr()
+    rc = cli.main(["fingerprint", "--db", db_file, "--profile", "web"])
+    assert rc == 0
+    # web profile restricts to web ports
+    assert any("80,443" in a for a in seen_args)
+
+
+def test_cli_stale_command_no_stale_findings(tmp_path, capsys):
+    db_file = str(tmp_path / "eng.db")
+    cli.main(["init", "--db", db_file])
+    capsys.readouterr()
+    rc = cli.main(["stale", "--db", db_file])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "count: 0" in out
+
+
+def test_cli_stale_command_json_format(tmp_path, capsys):
+    import sqlite3
+
+    db_file = str(tmp_path / "eng.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("INSERT INTO assets (id, ip, state) VALUES (1, '10.10.0.5', 'up')")
+        conn.execute(
+            "INSERT INTO services (id, asset_id, port, protocol, name, product, version) "
+            "VALUES (1, 1, 80, 'tcp', 'http', 'nginx', '1.18.0')"
+        )
+        conn.execute(
+            "INSERT INTO findings (service_id, cve_id, summary, severity, matched_at) "
+            "VALUES (1, 'CVE-OLD', 'old finding', '7.0', '2020-01-01 00:00:00')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+    rc = cli.main(["stale", "--db", db_file, "--format", "json"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["count"] >= 1
+    assert any(f["cve_id"] == "CVE-OLD" for f in doc["stale"])
+
+
+def test_cli_diff_command_compares_two_dbs(tmp_path, capsys):
+    import sqlite3
+
+    def make_db(path, cves):
+        cli.main(["init", "--db", str(path)])
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute("INSERT INTO assets (id, ip, state) VALUES (1, '10.10.0.5', 'up')")
+            conn.execute(
+                "INSERT INTO services (id, asset_id, port, protocol, name, product, version) "
+                "VALUES (1, 1, 80, 'tcp', 'http', 'nginx', '1.18.0')"
+            )
+            for cve in cves:
+                conn.execute(
+                    "INSERT INTO findings (service_id, cve_id, summary, severity) "
+                    "VALUES (1, ?, 'x', '7.0')",
+                    (cve,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    baseline = tmp_path / "baseline.db"
+    current = tmp_path / "current.db"
+    make_db(baseline, ["CVE-PERSISTING", "CVE-RESOLVED"])
+    make_db(current, ["CVE-PERSISTING", "CVE-NEW"])
+
+    capsys.readouterr()
+    rc = cli.main([
+        "diff", "--db", str(baseline), "--against", str(current), "--format", "json"
+    ])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    new_ids = [f["cve_id"] for f in doc["new"]]
+    resolved_ids = [f["cve_id"] for f in doc["resolved"]]
+    assert "CVE-NEW" in new_ids
+    assert "CVE-RESOLVED" in resolved_ids
+
+
+def test_cli_probe_command_runs(tmp_path, monkeypatch, capsys):
+    from ossuary import probe as probe_mod
+
+    db_file = str(tmp_path / "eng.db")
+    cli.main(["init", "--db", db_file])
+
+    import sqlite3
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("INSERT INTO assets (id, ip, state) VALUES (1, '10.10.0.5', 'up')")
+        conn.execute(
+            "INSERT INTO services (id, asset_id, port, protocol, name, product, version) "
+            "VALUES (1, 1, 80, 'tcp', 'http', 'nginx', '1.18.0')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    from ossuary.probe import ProbeResult
+
+    monkeypatch.setattr(
+        probe_mod,
+        "http_probe",
+        lambda host, port, protocol, timeout=10.0: ProbeResult(
+            protocol=protocol,
+            status_code=200,
+            server="nginx/1.18.0",
+            title="Test",
+            redirect_chain=[],
+            tech_fingerprints=["nginx"],
+        ),
+    )
+    capsys.readouterr()
+    rc = cli.main(["probe", "--db", db_file])
+    assert rc == 0
+    assert "probed" in capsys.readouterr().out
+
+
+def test_cli_probe_invalid_ports_returns_error(tmp_path, capsys):
+    db_file = str(tmp_path / "eng.db")
+    cli.main(["init", "--db", db_file])
+    capsys.readouterr()
+    rc = cli.main(["probe", "--db", db_file, "--ports", "abc"])
+    assert rc == 1
+    assert "invalid" in capsys.readouterr().err
+
+
+def test_cli_web_command_text_output(tmp_path, capsys):
+    import sqlite3
+
+    db_file = str(tmp_path / "eng.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute(
+            "INSERT INTO assets (id, ip, hostname, state) "
+            "VALUES (1, '10.10.0.5', 'portal.acme', 'up')"
+        )
+        conn.execute(
+            "INSERT INTO web_probes (asset_id, port, protocol, status_code, server, "
+            "tech_fingerprints) VALUES (1, 443, 'https', 200, 'nginx/1.24.0', '[\"nginx\"]')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+    rc = cli.main(["web", "--db", db_file])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "portal.acme" in out or "10.10.0.5" in out
+
+
+def test_cli_web_command_json_format(tmp_path, capsys):
+    import sqlite3
+
+    db_file = str(tmp_path / "eng.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute(
+            "INSERT INTO assets (id, ip, state) VALUES (1, '10.10.0.5', 'up')"
+        )
+        conn.execute(
+            "INSERT INTO web_probes (asset_id, port, protocol, status_code, server, "
+            "tech_fingerprints) VALUES (1, 80, 'http', 200, 'nginx/1.18.0', '[\"nginx\"]')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+    rc = cli.main(["web", "--db", db_file, "--format", "json"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    rows = doc["probes"]
+    assert isinstance(rows, list)
+    assert rows[0]["server"] == "nginx/1.18.0"
+
+
+def test_cli_web_tech_filter(tmp_path, capsys):
+    import sqlite3
+
+    db_file = str(tmp_path / "eng.db")
+    cli.main(["init", "--db", db_file])
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("INSERT INTO assets (id, ip, state) VALUES (1, '10.10.0.5', 'up')")
+        conn.execute("INSERT INTO assets (id, ip, state) VALUES (2, '10.10.0.6', 'up')")
+        conn.execute(
+            "INSERT INTO web_probes (asset_id, port, protocol, status_code, server, "
+            "tech_fingerprints) VALUES (1, 80, 'http', 200, 'nginx/1.18.0', '[\"nginx\"]')"
+        )
+        conn.execute(
+            "INSERT INTO web_probes (asset_id, port, protocol, status_code, server, "
+            "tech_fingerprints) VALUES (2, 80, 'http', 200, 'Apache/2.4.49', '[\"apache\"]')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+    rc = cli.main(["web", "--db", db_file, "--tech", "nginx", "--format", "json"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    rows = doc["probes"]
+    assert all("nginx" in r["tech_fingerprints"] for r in rows)
+
+
+def test_cli_watch_once_runs_one_pass_and_exits(tmp_path, monkeypatch, capsys):
+    db_file = str(tmp_path / "eng.db")
+    cli.main(["init", "--db", db_file])
+
+    monkeypatch.setattr(
+        discover, "scan_hosts",
+        lambda targets, arguments="-sn": host_discovery_result(up_ips=[]),
+    )
+    monkeypatch.setattr(
+        fingerprint, "scan_services",
+        lambda ip, arguments="-sV": service_scan_result(ip, []),
+    )
+    capsys.readouterr()
+    rc = cli.main(["watch", "--db", db_file, "--once"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "cruise" in out
+    assert "1 cruise pass" in out or "stopped after 1" in out
+
+
+def test_cli_dump_cdx_vex_format(tmp_path, capsys):
+    db_file = _seed_findings_db(tmp_path)
+    capsys.readouterr()
+    rc = cli.main(["dump", "--db", db_file, "--format", "cdx-vex"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["bomFormat"] == "CycloneDX"
+    vulns = doc.get("vulnerabilities", [])
+    assert any(v["id"] == "CVE-HOT" for v in vulns)
+    # CycloneDX VEX has analysis.state
+    assert all(v.get("analysis", {}).get("state") == "in_triage" for v in vulns)
